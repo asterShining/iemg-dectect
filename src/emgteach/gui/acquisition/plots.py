@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Sequence
+from itertools import islice
 from typing import ClassVar, cast
 
 import numpy as np
@@ -39,8 +40,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from emgteach.devices import BACKEND_ARDUINO, BACKEND_BITALINO, device_class
+from emgteach.devices import (
+    BACKEND_ARDUINO,
+    BACKEND_BITALINO,
+    BACKEND_LHE7904_UART,
+    device_class,
+)
 from emgteach.dsp import process_offline
+from emgteach.gui.acquisition.cycle_estimator import estimate_sine_frequency
 from emgteach.gui.widgets.help_button import add_help
 from emgteach.i18n import tr
 from emgteach.io import list_edf_channels, list_edf_emg_channels, read_edf_mne
@@ -70,6 +77,9 @@ __all__ = [
 # Number of samples in the ring buffer (= 30 s at 1000 Hz)
 # The visible window can be smaller thanks to the time-zoom control.
 MAX_POINTS = 30_000
+MIN_WINDOW_S = 0.01
+MIN_AMPLITUDE_MV = 1e-6
+MIN_ACC_SPAN = 1e-6
 # Maximum number of event markers drawn live at once (a reusable pool of
 # lines per plot; more than enough for a 30 s window).
 MAX_MARKER_LINES = 40
@@ -181,6 +191,21 @@ class LivePlots(QGroupBox):
     ) -> None:
         super().__init__(tr("Real-time EMG signal"), parent)
         self._fs = fs
+        self._max_points = 30 * fs
+        self._syncing_x = False
+        self._review_duration = 0.0
+        self._view_seconds = 5.0
+        self._is_lhe7904 = False
+        self._fit_first_raw = False
+        self._manual_envelope = False
+        self._cycle_auto_active = False
+        self._cycle_auto_preference = False
+        self._auto_last_samples = 0
+        self._auto_candidate: float | None = None
+        self._auto_last_valid_s = 0.0
+        self._auto_frequency: float | None = None
+        self._auto_amplitude_samples = 0
+        self._auto_has_amplitude = False
         #: One colour per channel the interface offers, the same in every
         #: plot (blue = channel 1, red = channel 2); as many curves as colours.
         self._colours = colours
@@ -202,12 +227,12 @@ class LivePlots(QGroupBox):
         # Every channel the interface offers is allocated; only the active
         # ones are filled.
         self._buf_raw = [
-            deque([0.0] * MAX_POINTS, maxlen=MAX_POINTS) for _ in range(self._n_max)
+            deque([0.0] * self._max_points, maxlen=self._max_points) for _ in range(self._n_max)
         ]
         self._buf_env = [
-            deque([0.0] * MAX_POINTS, maxlen=MAX_POINTS) for _ in range(self._n_max)
+            deque([0.0] * self._max_points, maxlen=self._max_points) for _ in range(self._n_max)
         ]
-        self._buf_acc = deque([0.0] * MAX_POINTS, maxlen=MAX_POINTS)
+        self._buf_acc = deque([0.0] * self._max_points, maxlen=self._max_points)
         # The live ACC plot has a stable ±1 g range (the accelerometer signal
         # uses the full normalised range); the ▲▼ buttons magnify around the
         # trace's current level. >1 zooms in.
@@ -291,6 +316,29 @@ class LivePlots(QGroupBox):
         self._btn_tiempo_reducir.setFixedSize(32, 26)
         self._btn_tiempo_reducir.clicked.connect(self._on_tiempo_reducir)
         row_tiempo.addWidget(self._btn_tiempo_reducir)
+
+        self._btn_window_50ms = QPushButton("50 ms")
+        self._btn_window_100ms = QPushButton("100 ms")
+        for button, seconds in ((self._btn_window_50ms, 0.05),
+                                (self._btn_window_100ms, 0.1)):
+            button.setFixedHeight(26)
+            button.clicked.connect(lambda checked=False, value=seconds: self.set_time_window(value))
+            row_tiempo.addWidget(button)
+        self._btn_cycle_auto = QPushButton("Auto")
+        self._btn_cycle_auto.setCheckable(True)
+        self._btn_cycle_auto.setToolTip(tr(
+            "Follow about five sine cycles and fit the raw amplitude. "
+            "For periodic viewing only, not a precision frequency measurement. "
+            "Manual navigation turns Auto off. Single channel only."
+        ))
+        self._btn_cycle_auto.toggled.connect(self._set_cycle_auto)
+        row_tiempo.addWidget(self._btn_cycle_auto)
+        self._lbl_cycle_auto = QLabel("")
+        row_tiempo.addWidget(self._lbl_cycle_auto)
+        self._btn_fit_amplitude = QPushButton(tr("Fit amplitude"))
+        self._btn_fit_amplitude.setFixedHeight(26)
+        self._btn_fit_amplitude.clicked.connect(self.fit_amplitude)
+        row_tiempo.addWidget(self._btn_fit_amplitude)
 
         # Written from the window that is actually set, not from the size of
         # the buffer. It opened saying "30 s visible" over a five-second
@@ -533,8 +581,12 @@ class LivePlots(QGroupBox):
 
 
 
-        # Update the combo so it reflects the initial n_visible
-        self._sync_combo_zoom()
+        for plot in self.plot_widgets():
+            plot.getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
+            plot.getViewBox().sigRangeChangedManually.connect(self._manual_cycle_navigation)
+
+        # Establish the initial clock before layout can auto-fit an empty plot.
+        self._set_shared_x(0.0, self._n_visible / self._fs)
 
     # ------------------------------------------------------------------
     # What the tab tells the plots
@@ -550,6 +602,9 @@ class LivePlots(QGroupBox):
 
     def set_channels(self, n_channels: int) -> None:
         """How many channels are active: their curves are shown, the rest hidden."""
+        self._btn_cycle_auto.setEnabled(n_channels == 1)
+        if n_channels != 1:
+            self._set_cycle_auto(False, remember=False)
         for c in range(self._n_max):
             visible = c < n_channels
             self._curves_raw[c].setVisible(visible)
@@ -572,7 +627,8 @@ class LivePlots(QGroupBox):
 
     def set_scale_controls_visible(self, visible: bool) -> None:
         """The ▲▼ sidebar and «Reset scales»: the fine controls of the tab."""
-        self._btn_reset_escala.setVisible(visible)
+        self._btn_reset_escala.setVisible(visible or self._is_lhe7904)
+        self._btn_fit_amplitude.setVisible(visible or self._is_lhe7904)
         self._sidebar.setVisible(visible)
 
     def append(self, raw: list, env: list) -> None:
@@ -602,26 +658,60 @@ class LivePlots(QGroupBox):
         self._reset_buffers()
         self._marker_events.clear()
         self._total_samples = 0
+        self._fit_first_raw = self._is_lhe7904
+        self._manual_envelope = False
+        self._reset_cycle_tracking()
         for pool in self._marker_lines:
             for line in pool:
                 line.hide()
+
+    def set_sample_frequency(self, fs: int) -> None:
+        """Set the next recording's clock and retain the visible duration.
+
+        Call between recordings: samples and markers from the previous clock
+        cannot share a time axis with the new one, so they are cleared.
+        """
+        if fs <= 0 or int(fs) != fs:
+            raise ValueError("Sampling frequency must be a positive integer.")
+        fs = int(fs)
+        if fs == self._fs:
+            return
+        visible_s = min(30.0, self._n_visible / self._fs)
+        self._fs = fs
+        self._max_points = 30 * fs
+        self._n_visible = max(1, round(visible_s * fs))
+        self._buf_raw = [
+            deque(maxlen=self._max_points) for _ in range(self._n_max)
+        ]
+        self._buf_env = [
+            deque(maxlen=self._max_points) for _ in range(self._n_max)
+        ]
+        self._buf_acc = deque(maxlen=self._max_points)
+        self.clear()
+        self._sync_combo_zoom()
+        self._update_ventana_label()
+        self.redraw()
 
     def plot_widgets(self) -> list[pg.PlotWidget]:
         """The three plots: raw, envelope and accelerometer."""
         return [self._plot_raw, self._plot_env, self._plot_acc]
 
     def start_live(self) -> None:
+        self._set_cycle_auto(self._cycle_auto_preference, remember=False)
         self._render_timer.start()
 
     def stop_live(self) -> None:
         self._render_timer.stop()
+        self._set_cycle_auto(False, remember=False)
 
     def redraw(self) -> None:
         """Draw now, whether or not new samples arrived."""
         self._new_data = True
         self._refresh_plots(force=True)
 
-    def follow_device(self, index: int, *, recording: bool) -> None:
+    def follow_device(
+        self, index: int, *, recording: bool, sensor_gain: float | None = None,
+    ) -> None:
         """Draw the raw plot to the device's own full scale.
 
         The profile's ±3.3 mV predates the gain correction: a BITalino cannot
@@ -633,9 +723,17 @@ class LivePlots(QGroupBox):
         than kept as a second copy here; and of the class, not an instance,
         because no device exists yet when the type is chosen.
         """
-        backend = BACKEND_BITALINO if index == 0 else BACKEND_ARDUINO
+        changed_device = self._is_lhe7904 != (index == 2)
+        self._is_lhe7904 = index == 2
+        self._fit_first_raw = self._is_lhe7904
+        if changed_device:
+            self._set_cycle_auto(self._is_lhe7904)
+        if self._is_lhe7904:
+            self._btn_fit_amplitude.show()
+            self._btn_reset_escala.show()
+        backend = (BACKEND_BITALINO, BACKEND_ARDUINO, BACKEND_LHE7904_UART)[index]
         try:
-            amp = device_class(backend).full_scale_mv()
+            amp = device_class(backend).full_scale_mv(sensor_gain=sensor_gain)
         except Exception:  # pragma: no cover — a backend registered as a function
             amp = self._profile().ylim_raw[1]
         self._y_ranges_init[0] = (-amp, amp)
@@ -737,9 +835,9 @@ class LivePlots(QGroupBox):
         for bufs in (self._buf_raw, self._buf_env):
             for buf in bufs:
                 buf.clear()
-                buf.extend([0.0] * MAX_POINTS)
+                buf.extend([0.0] * self._max_points)
         self._buf_acc.clear()
-        self._buf_acc.extend([0.0] * MAX_POINTS)
+        self._buf_acc.extend([0.0] * self._max_points)
         self._plot_acc.setYRange(-1.0, 1.0, padding=0)
 
     def _refresh_plots(self, force: bool = False) -> None:
@@ -776,13 +874,14 @@ class LivePlots(QGroupBox):
             # off, which is the very thing that stranded the live view inside
             # the session's axis in the first place. The explicit range is only
             # what the empty tab shows; the first samples to arrive refit it.
-            ventana = min(self._n_visible, MAX_POINTS) / self._fs
-            for pw in (self._plot_raw, self._plot_env):
-                pw.setXRange(0.0, ventana, padding=0)
-                pw.enableAutoRange(axis="x")
+            ventana = min(self._n_visible, self._max_points) / self._fs
+            self._set_shared_x(0.0, ventana)
+            for pw in self.plot_widgets():
+                pw.disableAutoRange(axis="x")
             return
 
-        n = min(self._n_visible, MAX_POINTS)
+        self._update_cycle_window()
+        n = min(self._n_visible, self._max_points)
         # X axis in seconds of the recording, not of the window: the
         # numbers advance with it. Drawn from zero, a recording two
         # minutes long read 0…5 s for as long as it lasted, and the
@@ -813,6 +912,10 @@ class LivePlots(QGroupBox):
             self._curve_acc.setData(t, arr_acc)
 
         self._seguir_la_senal(float(t[-1]))
+        self._update_cycle_amplitude()
+        if self._fit_first_raw:
+            self._fit_amplitude(raw_only=True)
+            self._fit_first_raw = False
 
         # Reposition the marker lines. Each event already carries the
         # second of the recording it happened at, which is now the axis's
@@ -833,30 +936,18 @@ class LivePlots(QGroupBox):
                     line.hide()
 
     def _seguir_la_senal(self, fin: float) -> None:
-        """Slide a zoomed live plot so that its right edge is the last sample.
+        """Keep the shared live window at the latest sample.
 
-        The live view has no X range of its own: it relies on pyqtgraph's
-        auto-range to follow the sliding window. A wheel zoom turns that
-        auto-range off (``scaleBy`` ends in ``setXRange``), and until 3.9.0
-        the axis then stayed where it was while the signal, whose seconds
-        advance, ran out of sight to the right, until «A» was pressed. The
-        width the wheel chose is kept — it is how many seconds are on
-        screen — and the window slides with the last sample, as an
-        oscilloscope's does; «A» gives the whole window back. A plot still
-        on auto-range is left to it.
+        Manual navigation chooses its width; the plot's A button restores
+        the whole requested live buffer window.
         """
-        plots = [self._plot_raw, self._plot_env]
-        if self._acc_enabled:
-            plots.append(self._plot_acc)
-        for pw in plots:
-            vb = pw.getViewBox()
-            if vb.autoRangeEnabled()[0]:
-                continue
-            x0, x1 = vb.viewRange()[0]
-            ancho = x1 - x0
-            if ancho <= 0 or abs(x1 - fin) < 0.5 / self._fs:
-                continue
-            vb.setXRange(fin - ancho, fin, padding=0)
+        vb = self._plot_raw.getViewBox()
+        if vb.autoRangeEnabled()[0]:
+            left, right = vb.viewRange()[0]
+            self._set_shared_x(left, right)
+        else:
+            width = vb.viewRange()[0][1] - vb.viewRange()[0][0]
+            self._set_shared_x(fin - width, fin)
 
     #: One colour per kind of stretch. Muted on purpose — these sit *behind*
     #: the trace, and a shading that competes with the signal defeats the
@@ -926,7 +1017,10 @@ class LivePlots(QGroupBox):
         """The review itself, once the file is read (show_recording)."""
         self.leave_review()
         self._revisando = True
+        self._set_cycle_auto(False, remember=False)
+        self._btn_cycle_auto.setEnabled(self._n_channels == 1)
         self._revision_ruta = edf_path
+        self._review_duration = len(señales[0]["emg_raw"]) / fs
 
         n = len(señales[0]["emg_raw"])
         t = np.arange(n) / fs
@@ -979,7 +1073,7 @@ class LivePlots(QGroupBox):
         for pw in (self._plot_raw, self._plot_env):
             pw.setDownsampling(auto=True, mode="peak")
             pw.setClipToView(True)
-            pw.setXRange(0.0, duracion, padding=0.01)
+        self._set_shared_x(0.0, duracion)
         if not apilado and pico_raw > 0:
             self._plot_raw.setYRange(-1.15 * pico_raw, 1.15 * pico_raw, padding=0)
         if pico_env > 0:
@@ -1061,6 +1155,7 @@ class LivePlots(QGroupBox):
                 "editor will propose, from where it starts to where the muscle "
                 "is back at rest."))
         self._con_barra = bool(contractions)
+        self._set_cycle_auto(self._cycle_auto_preference, remember=False)
 
     def reviewing(self, edf_path: str) -> bool:
         """Whether *edf_path* is the recording on review now."""
@@ -1154,8 +1249,11 @@ class LivePlots(QGroupBox):
         self._leyenda.setVisible(False)
         if not self._revisando:
             return
+        self._set_cycle_auto(False, remember=False)
         self._revisando = False
-        for pw in (self._plot_raw, self._plot_env):
+        self._btn_cycle_auto.setEnabled(self._n_channels == 1)
+        self._review_duration = 0.0
+        for pw in self.plot_widgets():
             pw.setDownsampling(auto=False)
             pw.setClipToView(False)
             # Setting an explicit X range to show the session *turns auto-range
@@ -1167,7 +1265,9 @@ class LivePlots(QGroupBox):
             pw.enableAutoRange(axis="x")
         self._plot_raw.setTitle(tr("Raw EMG signal (mV)"))
         self._plot_env.setTitle(tr("Envelope (mV)"))
-        self.reset_all_scales()
+        self.reset_y_scales()
+        self._n_visible = 5 * self._fs
+        self._manual_envelope = False
         self._refresh_lane_label_texts()   # back to the label boxes' names
         self._new_data = True
         self._refresh_plots(force=True)
@@ -1190,7 +1290,7 @@ class LivePlots(QGroupBox):
         if self._acc_zoom <= 1.0:
             self._plot_acc.setYRange(-1.0, 1.0, padding=0)
             return
-        n = min(self._n_visible, MAX_POINTS)
+        n = min(self._n_visible, self._max_points)
         arr = np.array(list(self._buf_acc))[-n:]
         centre = float(np.mean(arr)) if arr.size else 0.0
         half = 1.0 / self._acc_zoom
@@ -1208,6 +1308,8 @@ class LivePlots(QGroupBox):
         In stacked mode (raw plot with 2 channels) it scales the data gain
         while keeping the lanes fixed; otherwise it scales the ViewBox.
         """
+        if idx == 0:
+            self._set_cycle_auto(False)
         factor = 1.5
 
         if self._is_stacked(idx):
@@ -1282,6 +1384,8 @@ class LivePlots(QGroupBox):
         away, never below the base scale (the calibrated one, times the ▲▼
         zoom).
         """
+        if self._manual_envelope:
+            return
         ini_bajo, ini_alto = self._y_ranges_init[1]
         base = ini_alto * self._y_accum[1]
         objetivo = max(base, float(pico) * ENV_SIGUE_MARGEN)
@@ -1322,67 +1426,266 @@ class LivePlots(QGroupBox):
 
         self.reset_y_scales()
 
-    @Slot()
-    def _on_tiempo_ampliar(self) -> None:
-        """◀▶ — double the visible window (less detail, more context)."""
-        nueva = min(self._n_visible * 2, MAX_POINTS)
-        nueva = max(nueva, int(0.5 * self._fs))
-        self._n_visible = nueva
+    def _reset_cycle_tracking(self) -> None:
+        self._auto_last_samples = self._total_samples
+        self._auto_amplitude_samples = self._total_samples
+        self._auto_has_amplitude = False
+        self._auto_candidate = None
+        self._auto_frequency = None
+        self._auto_last_valid_s = self._total_samples / self._fs
+        if self._cycle_auto_active:
+            self._lbl_cycle_auto.setText(tr("Detecting cycles…"))
+
+    def _set_cycle_auto(self, enabled: bool, *, remember: bool = True) -> None:
+        if remember:
+            self._cycle_auto_preference = bool(enabled)
+        active = bool(enabled) and self._n_channels == 1
+        changed = active != self._cycle_auto_active
+        self._cycle_auto_active = active
+        self._btn_cycle_auto.blockSignals(True)
+        self._btn_cycle_auto.setChecked(active)
+        self._btn_cycle_auto.blockSignals(False)
+        if changed:
+            self._reset_cycle_tracking()
+        if active:
+            self._fit_first_raw = False
+            if self._revisando:
+                self._apply_review_cycle_auto()
+                return
+            if changed:
+                self._n_visible = 5 * self._fs
+                end = (self._total_samples - 1) / self._fs if self._total_samples else 5.0
+                self._set_shared_x(end - 5.0, end)
+            self._lbl_cycle_auto.setText(tr("Detecting cycles…"))
+        else:
+            self._lbl_cycle_auto.setText("")
+
+    def _apply_review_cycle_auto(self) -> None:
+        """Inspect original review samples, never the downsampled display curve."""
+        x, raw = self._curves_raw[0].getOriginalDataset()
+        if x is None or raw is None or len(x) < 2:
+            self._lbl_cycle_auto.setText(tr("No stable cycle"))
+            return
+        left, right = self._plot_raw.getViewBox().viewRange()[0]
+        centre = (left + right) / 2
+        start = max(0.0, min(centre - 1.0, self._review_duration - 2.0))
+        begin, end = np.searchsorted(x, [start, start + 2.0])
+        period = float(x[1] - x[0])
+        frequency = estimate_sine_frequency(raw[begin:end], 1.0 / period) if period > 0 else None
+        self._auto_frequency = frequency
+        if frequency is None:
+            self._set_shared_x(0.0, self._review_duration)
+            self._lbl_cycle_auto.setText(tr("No stable cycle"))
+        else:
+            width = min(self._review_duration, max(MIN_WINDOW_S, 5.0 / frequency))
+            self._set_shared_x(centre - width / 2, centre + width / 2)
+            self._lbl_cycle_auto.setText(f"≈ {frequency:.1f} Hz")
+        self._fit_amplitude()
+
+    def _manual_cycle_navigation(self, axes) -> None:
+        if any(axes):
+            self._set_cycle_auto(False)
+
+    def _update_cycle_window(self) -> None:
+        if not self._cycle_auto_active:
+            return
+        elapsed = (self._total_samples - self._auto_last_samples) / self._fs
+        if elapsed < 0.25:
+            return
+        self._auto_last_samples = self._total_samples
+        count = min(self._total_samples, 2 * self._fs)
+        buffer = self._buf_raw[0]
+        samples = np.fromiter(islice(buffer, len(buffer) - count, None), dtype=float)
+        frequency = estimate_sine_frequency(samples, self._fs)
+        now = self._total_samples / self._fs
+        if frequency is not None:
+            previous = self._auto_candidate
+            self._auto_candidate = frequency
+            if previous is not None and abs(frequency - previous) <= previous * 0.05:
+                self._auto_last_valid_s = now
+                self._auto_frequency = frequency
+                width = min(5.0, max(MIN_WINDOW_S, 5.0 / frequency))
+                if abs(width - self._view_seconds) > self._view_seconds * 0.1:
+                    self._n_visible = max(1, round(width * self._fs))
+                    end = (self._total_samples - 1) / self._fs
+                    self._set_shared_x(end - width, end)
+                self._lbl_cycle_auto.setText(f"≈ {frequency:.1f} Hz")
+            else:
+                self._lbl_cycle_auto.setText(tr("Detecting cycles…"))
+        else:
+            self._auto_candidate = None
+            self._lbl_cycle_auto.setText(tr("Detecting cycles…"))
+        if now - self._auto_last_valid_s >= 2.0:
+            self._auto_frequency = None
+            self._n_visible = 5 * self._fs
+            end = (self._total_samples - 1) / self._fs
+            self._set_shared_x(end - 5.0, end)
+
+    def _update_cycle_amplitude(self) -> None:
+        if not self._cycle_auto_active:
+            return
+        x, y = self._curves_raw[0].getData()
+        if x is None or y is None:
+            return
+        left, right = self._plot_raw.getViewBox().viewRange()[0]
+        visible = y[(x >= left) & (x <= right) & np.isfinite(y)]
+        if not visible.size:
+            return
+        target = max(MIN_AMPLITUDE_MV, float(np.max(np.abs(visible))) * 1.15)
+        low, high = self._plot_raw.getViewBox().viewRange()[1]
+        current = max(abs(low), abs(high))
+        elapsed = max(0, self._total_samples - self._auto_amplitude_samples) / self._fs
+        self._auto_amplitude_samples = self._total_samples
+        if target >= current or not self._auto_has_amplitude:
+            half = target
+        else:
+            half = target + (current - target) * np.exp(-elapsed)
+        self._auto_has_amplitude = True
+        self._plot_raw.setYRange(-half, half, padding=0)
+
+    def _set_shared_x(self, left: float, right: float) -> None:
+        """Apply one time interval to every plot, without recursive signals."""
+        if self._revisando and self._review_duration > 0:
+            width = min(max(MIN_WINDOW_S, right - left), self._review_duration)
+            left = min(max(0.0, left), self._review_duration - width)
+            right = left + width
+        self._syncing_x = True
+        try:
+            for plot in self.plot_widgets():
+                vb = plot.getViewBox()
+                current = vb.viewRange()[0]
+                if np.allclose(current, (left, right), rtol=0, atol=1e-10):
+                    continue
+                vb.setXRange(left, right, padding=0)
+        finally:
+            self._syncing_x = False
+        self._view_seconds = right - left
         self._sync_combo_zoom()
         self._update_ventana_label()
-        self._refresh_plots(force=True)
+
+    def _on_x_range_changed(self, viewbox, limits) -> None:
+        if self._syncing_x:
+            return
+        left, right = map(float, limits)
+        if not self._revisando:
+            width = min(30.0, max(MIN_WINDOW_S, right - left))
+            centre = (left + right) / 2
+            left, right = centre - width / 2, centre + width / 2
+        self._set_shared_x(left, right)
+
+    def set_time_window(self, seconds: float) -> None:
+        """Zoom around the review centre, or follow the latest live sample."""
+        if not np.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Time window must be finite and positive.")
+        self._set_cycle_auto(False)
+        if self._revisando:
+            left, right = self._plot_raw.getViewBox().viewRange()[0]
+            width = min(max(MIN_WINDOW_S, seconds), self._review_duration)
+            centre = (left + right) / 2
+            self._set_shared_x(centre - width / 2, centre + width / 2)
+        else:
+            width = min(30.0, max(MIN_WINDOW_S, seconds))
+            self._n_visible = max(1, round(width * self._fs))
+            end = (self._total_samples - 1) / self._fs if self._total_samples else width
+            self._set_shared_x(end - width, end)
+            self._refresh_plots(force=True)
+
+    def fit_amplitude(self) -> None:
+        """Fit finite signal samples in the visible time interval, with 15% headroom."""
+        self._set_cycle_auto(False)
+        self._fit_first_raw = False
+        self._fit_amplitude()
+
+    def _fit_amplitude(self, *, raw_only: bool = False) -> None:
+        left, right = self._plot_raw.getViewBox().viewRange()[0]
+
+        def visible(curves):
+            chunks = []
+            for curve in curves:
+                x, y = curve.getData()
+                if x is not None and y is not None:
+                    mask = (x >= left) & (x <= right) & np.isfinite(y)
+                    if mask.any():
+                        chunks.append(y[mask])
+            return np.concatenate(chunks) if chunks else np.empty(0)
+
+        raw = visible(self._curves_raw[:self._n_channels])
+        if raw.size:
+            if self._is_stacked(0):
+                # Keep lane baselines and change only the per-lane display gain.
+                peaks = []
+                for c, curve in enumerate(self._curves_raw[:self._n_channels]):
+                    values = visible([curve])
+                    if values.size:
+                        peaks.append(float(np.max(np.abs(values - self._lane_baseline(0, c)))))
+                peak = max(peaks, default=0.0)
+                if peak > 0:
+                    old_gain = self._y_gain[0]
+                    self._y_gain[0] = old_gain * self._lane_half(0) / (peak * 1.15)
+                    for c, curve in enumerate(self._curves_raw[:self._n_channels]):
+                        x, y = curve.getData()
+                        if x is not None:
+                            base = self._lane_baseline(0, c)
+                            curve.setData(x, base + (y - base) * self._y_gain[0] / old_gain)
+                    self._set_calib_ticks(0)
+            else:
+                half = max(MIN_AMPLITUDE_MV, float(np.max(np.abs(raw))) * 1.15)
+                self._plot_raw.setYRange(-half, half, padding=0)
+        if raw_only:
+            return
+        envelope = visible(self._curves_env[:self._n_channels])
+        if envelope.size:
+            top = max(MIN_AMPLITUDE_MV, float(np.max(envelope)) * 1.15)
+            self._plot_env.setYRange(0.0, top, padding=0)
+            self._manual_envelope = True
+        if self._acc_enabled:
+            acceleration = visible([self._curve_acc])
+            if acceleration.size:
+                lo, hi = float(np.min(acceleration)), float(np.max(acceleration))
+                centre = (lo + hi) / 2
+                half = max(MIN_ACC_SPAN / 2, (hi - lo) * 0.575)
+                self._plot_acc.setYRange(centre - half, centre + half, padding=0)
+
+    @Slot()
+    def _on_tiempo_ampliar(self) -> None:
+        self.set_time_window(self._view_seconds * 2)
 
     @Slot()
     def _on_tiempo_reducir(self) -> None:
-        """▶◀ — halve the visible window (more detail)."""
-        nueva = max(self._n_visible // 2, int(0.5 * self._fs))
-        self._n_visible = nueva
-        self._sync_combo_zoom()
-        self._update_ventana_label()
-        self._refresh_plots(force=True)
+        self.set_time_window(self._view_seconds / 2)
 
     @Slot(int)
     def _on_combo_zoom_changed(self, index: int) -> None:
-        factor = _ZOOM_FACTORS[index]
-        nueva = MAX_POINTS // factor
-        nueva = max(nueva, int(0.5 * self._fs))
-        self._n_visible = nueva
-        self._update_ventana_label()
-        self._refresh_plots(force=True)
+        duration = self._review_duration if self._revisando else 30.0
+        self.set_time_window(duration / _ZOOM_FACTORS[index])
 
     def _sync_combo_zoom(self) -> None:
-        """Update the combo so it reflects the current n_visible."""
-        if MAX_POINTS <= 0:
-            return
-        factor_actual = MAX_POINTS / self._n_visible
-        best_idx, best_diff = 0, float("inf")
-        for i, f in enumerate(_ZOOM_FACTORS):
-            d = abs(factor_actual - f)
-            if d < best_diff:
-                best_diff, best_idx = d, i
+        duration = self._review_duration if self._revisando else 30.0
+        factor_actual = duration / max(MIN_WINDOW_S, self._view_seconds)
+        best_idx = min(range(len(_ZOOM_FACTORS)),
+                       key=lambda i: abs(_ZOOM_FACTORS[i] - factor_actual))
         self._combo_zoom.blockSignals(True)
         self._combo_zoom.setCurrentIndex(best_idx)
         self._combo_zoom.blockSignals(False)
-
-        # Disable factors whose resulting window would be < 0.5 s
         model = cast(QStandardItemModel, self._combo_zoom.model())
-        for i, f in enumerate(_ZOOM_FACTORS):
-            n = MAX_POINTS // f
+        for i, factor in enumerate(_ZOOM_FACTORS):
             item = model.item(i)
             if item:
-                enabled = n >= int(0.5 * self._fs)
-                item.setEnabled(enabled)
+                item.setEnabled(duration / factor >= MIN_WINDOW_S)
 
     def _update_ventana_label(self) -> None:
-        segundos = self._n_visible / self._fs
-        if segundos >= 1.0:
-            self._lbl_ventana_info.setText(f"{segundos:.1f} {tr('s visible')}")
+        seconds = self._view_seconds
+        if seconds >= 1:
+            self._lbl_ventana_info.setText(f"{seconds:.1f} {tr('s visible')}")
         else:
-            self._lbl_ventana_info.setText(f"{segundos * 1000:.0f} {tr('ms visible')}")
+            self._lbl_ventana_info.setText(f"{seconds * 1000:.0f} {tr('ms visible')}")
 
-    def reset_all_scales(self) -> None:
-        """Full reset: Y ranges + time window back to the initial state."""
-        self.reset_y_scales()
-        self._n_visible = 5 * self._fs
-        self._sync_combo_zoom()
-        self._update_ventana_label()
+    def reset_all_scales(self, *, preserve_auto: bool = False) -> None:
+        """Fit visible amplitudes and restore five seconds or the full review."""
+        auto_preference = self._cycle_auto_preference
+        self.set_time_window(self._review_duration if self._revisando else 5.0)
+        if not self._revisando:
+            self._manual_envelope = False
+        self.fit_amplitude()
+        if preserve_auto:
+            self._set_cycle_auto(auto_preference)

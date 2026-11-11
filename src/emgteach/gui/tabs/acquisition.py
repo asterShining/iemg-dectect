@@ -68,6 +68,7 @@ from emgteach.charts import COLOUR_1, COLOUR_2
 from emgteach.devices import (
     BACKEND_ARDUINO,
     BACKEND_BITALINO,
+    BACKEND_LHE7904_UART,
     create_device,
 )
 from emgteach.difusion import PORTS_FILE
@@ -528,6 +529,9 @@ class AcquisitionTab(QWidget):
         self._settings = settings
         self._worker: AcquisitionWorker | None = None
         self._profile = EMG_PROFILE
+        self._fs = FS
+        # Standalone tabs expose controls until the main window applies a mode.
+        self._advanced_scale_controls = True
 
         # Number of active channels (1 or 2), persisted in QSettings.
         saved_n = int(cast("int | str", self._settings.value("adquisicion/n_channels", 1)))
@@ -883,6 +887,9 @@ class AcquisitionTab(QWidget):
         self._conexion.logged.connect(self._log)
         self._conexion.warned.connect(self._err)
         self._conexion.device_type_changed.connect(self._seguir_el_dispositivo)
+        self._conexion.configuration_changed.connect(
+            lambda: self._seguir_el_dispositivo(self._conexion.device_index())
+        )
         self._conexion.link_lost.connect(self._desconectar)
         self._conexion.no_answer.connect(self._detener_grabacion)
         self._conexion.retry_requested.connect(self._reintentar_tras_aviso)
@@ -1313,7 +1320,7 @@ class AcquisitionTab(QWidget):
 
         # ── Plots + scale controls (gui/acquisition/plots.py) ──
         self._trazado = LivePlots(
-            fs=FS, colours=_CHANNEL_COLORS, colour_hex=_CHANNEL_COLOR_HEX,
+            fs=self._fs, colours=_CHANNEL_COLORS, colour_hex=_CHANNEL_COLOR_HEX,
             profile=lambda: self._profile,
             n_channels=lambda: self._n_channels,
             acc_enabled=lambda: self._acc_enabled,
@@ -1328,7 +1335,7 @@ class AcquisitionTab(QWidget):
         # Configure the plot mode (overlaid or stacked) according to the
         # persisted number of channels — with the raw range set to the saved
         # device's full scale first, which applies the stacking on its way.
-        self._trazado.follow_device(self._conexion.device_index(), recording=False)
+        self._seguir_el_dispositivo(self._conexion.device_index())
         # Apply the ACC-placement channel-count constraint to the initial state
         # (MMG placement forces a single muscle).
         self._apply_acc_placement_constraints()
@@ -1535,10 +1542,11 @@ class AcquisitionTab(QWidget):
         placed on the muscle, and restored otherwise.
         """
         mmg = self._acc_enabled and self._combo_acc_place.currentData() == "muscle"
-        if mmg and self._combo_n_channels.currentIndex() != 0:
+        lhe7904 = self._conexion.device_index() == 2
+        if (mmg or lhe7904) and self._combo_n_channels.currentIndex() != 0:
             self._combo_n_channels.setCurrentIndex(0)  # 1 channel
         self._combo_n_channels.setEnabled(
-            self._channel_controls_enabled and not mmg
+            self._channel_controls_enabled and not mmg and not lhe7904
         )
 
     @Slot(bool)
@@ -1721,16 +1729,22 @@ class AcquisitionTab(QWidget):
             device = create_device(
                 BACKEND_BITALINO,
                 port=self._conexion.address(),
-                fs=FS,
+                fs=self._fs,
                 channels=emg_channels,
                 acc=use_acc,
                 acc_channel=acc_ch,
+            )
+        elif self._conexion.device_index() == 2:
+            device = create_device(
+                BACKEND_LHE7904_UART,
+                port=self._conexion.serial_port(),
+                **self._conexion.lhe7904_options(),
             )
         else:
             device = create_device(
                 BACKEND_ARDUINO,
                 port=self._conexion.serial_port(),
-                fs=FS,
+                fs=self._fs,
                 n_channels=n,
             )
         self._settings.setValue("adquisicion/auto_detect", self._chk_auto.isChecked())
@@ -2708,7 +2722,7 @@ class AcquisitionTab(QWidget):
         return float(self._profile.mvc_peak_window_s)
 
     def _mvc_compute_muscle(self, c: int) -> None:
-        window = max(1, round(self._ventana_cvm_s() * FS))
+        window = max(1, round(self._ventana_cvm_s() * self._fs))
         ref = mvc_from_reps(
             self._mvc_capture[c], self._profile.mvc_percentile,
             window_samples=window,
@@ -3155,8 +3169,8 @@ class AcquisitionTab(QWidget):
         if not ref:
             return            # sin referencia no hay porcentaje de nada
         pct = np.asarray(env[c], dtype=float) / float(ref) * 100.0
-        minimo = max(1, round(MANIOBRA_MINIMA_S * FS))
-        salida = max(1, round(MANIOBRA_SALIDA_S * FS))
+        minimo = max(1, round(MANIOBRA_MINIMA_S * self._fs))
+        salida = max(1, round(MANIOBRA_SALIDA_S * self._fs))
         marcadas = 0
         self._man_sin_novedad_n += pct.size
         for v in pct:
@@ -3203,7 +3217,7 @@ class AcquisitionTab(QWidget):
         recording is continuous and the count that counts is the
         analysis's — it only moves a phase annotation.
         """
-        if self._man_sin_novedad_n >= MANIOBRA_SIN_NOVEDAD_S * FS:
+        if self._man_sin_novedad_n >= MANIOBRA_SIN_NOVEDAD_S * self._fs:
             # El límite, y **sin pedir reposo**: un límite atado al reposo no
             # es un límite. Si el reposo no llega —que es exactamente el
             # fallo que todo esto arregla—, los dos caminos se quedarían
@@ -3222,7 +3236,7 @@ class AcquisitionTab(QWidget):
             self._man_quieto_n = 0
             return
         self._man_quieto_n += int(pct.size)
-        if self._man_quieto_n >= MANIOBRA_REPOSO_S * FS:
+        if self._man_quieto_n >= MANIOBRA_REPOSO_S * self._fs:
             self._man_quieto_n = 0
             self._paso_siguiente()
 
@@ -3382,7 +3396,7 @@ class AcquisitionTab(QWidget):
         — so it is reported as a measurement and only warned about above
         ``mvc_crosstalk_pct``.
         """
-        window = max(1, round(self._profile.mvc_peak_window_s * FS))
+        window = max(1, round(self._profile.mvc_peak_window_s * self._fs))
         labels = self._active_labels()
 
         def name(i: int) -> str:
@@ -3913,7 +3927,7 @@ class AcquisitionTab(QWidget):
         """Set the MVC reference from the guided maximum contraction."""
         if not self._fv_mvc_buf:
             return
-        window = max(1, round(self._profile.mvc_peak_window_s * FS))
+        window = max(1, round(self._profile.mvc_peak_window_s * self._fs))
         ref = mvc_from_reps(
             [np.asarray(self._fv_mvc_buf, dtype=float)],
             self._profile.mvc_percentile, window_samples=window,
@@ -4098,7 +4112,20 @@ class AcquisitionTab(QWidget):
     def _seguir_el_dispositivo(self, index: int) -> None:
         """The device type changed: the raw plot takes its full scale
         (LivePlots.follow_device), redrawn at once unless a recording runs."""
-        self._trazado.follow_device(index, recording=self.is_recording())
+        if self.is_recording():
+            return
+        options = self._conexion.lhe7904_options() if index == 2 else {}
+        self._fs = int(options.get("fs", FS))
+        self._trazado.set_sample_frequency(self._fs)
+        self._trazado.follow_device(
+            index, recording=False, sensor_gain=options.get("pga_gain")
+        )
+        if index != 0:
+            self._chk_acc.setChecked(False)
+        self._set_channel_controls_enabled(self._channel_controls_enabled)
+        self._trazado.set_scale_controls_visible(
+            self._advanced_scale_controls or index == 2
+        )
 
     def _escalar_a_la_calibracion(self, channels: list[int]) -> None:
         """Fit the live plots to this subject once the MVC is known: the
@@ -4381,7 +4408,7 @@ class AcquisitionTab(QWidget):
         self._trazado.clear()
         self._list_markers.clear()
         self._reset_load_monitor()
-        self._trazado.reset_all_scales()
+        self._trazado.reset_all_scales(preserve_auto=True)
         self._local_log.clear()
         self._trazado.redraw()
 
@@ -4484,7 +4511,10 @@ class AcquisitionTab(QWidget):
         # explained and hidden is a puzzle. Its default is right for all
         # three practicals; the label says so.
         self._box_k.setVisible(True)
-        self._trazado.set_scale_controls_visible(advanced)
+        self._advanced_scale_controls = advanced
+        self._trazado.set_scale_controls_visible(
+            advanced or self._conexion.device_index() == 2
+        )
 
     def _apply_mode_channels(self, mode: str) -> None:
         """Make the recording match the mode: channel count and accelerometer.

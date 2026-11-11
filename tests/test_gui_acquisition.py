@@ -373,14 +373,16 @@ def test_a_new_session_leaves_the_plots_empty(qapp) -> None:
     izq, der = tab._trazado._plot_raw.getViewBox().viewRange()[0]
     assert der - izq == pytest.approx(tab._trazado._n_visible / 1000, abs=0.6)
 
-    # …and it can still follow the next recording. Setting an explicit range
-    # turns pyqtgraph's auto-range off, and an axis stuck at five seconds while
-    # the window is widened is the same "advancing over an empty canvas" the
-    # session review already had to fix once.
-    for pw in (tab._trazado._plot_raw, tab._trazado._plot_env):
-        assert pw.getViewBox().autoRangeEnabled()[0], (
-            "el auto-rango del eje X se ha quedado apagado"
-        )
+    # Shared explicit ranges must still follow the next recording's clock,
+    # rather than staying at the empty session's five-second interval.
+    block = np.zeros(10_000)
+    tab._trazado.append([block, block], [block, block])
+    tab._trazado.redraw()
+    qapp.processEvents()
+    raw_range = tab._trazado._plot_raw.getViewBox().viewRange()[0]
+    env_range = tab._trazado._plot_env.getViewBox().viewRange()[0]
+    assert raw_range[1] == pytest.approx(9.999, abs=0.01)
+    assert env_range == pytest.approx(raw_range)
     tab.cleanup()
 
 

@@ -110,6 +110,14 @@ class AcquisitionDevice(ABC):
         """``(min, max)`` physical range per channel for the EDF header."""
         return [(self.physical_min, self.physical_max)] * self.n_channels
 
+    def channel_digital_ranges(self) -> list[tuple[int, int]]:
+        """EDF digital limits per channel; preserve legacy 10-bit defaults.
+
+        Higher-resolution backends can use the full signed 16-bit EDF range.
+        This controls file quantization, not the wire representation.
+        """
+        return [(0, 1023)] * self.n_channels
+
     @abstractmethod
     def open(self) -> None:
         """Establish the connection. Raises on failure."""

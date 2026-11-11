@@ -26,18 +26,38 @@ References
 
 from __future__ import annotations
 
+import threading
 import unicodedata
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import numpy as np
 
 from emgteach.i18n import tr
+
+# EDFlib's native reader handles are shared process state. Concurrent reads of
+# the same file can invalidate another reader and silently return zero samples.
+# Serialize the complete open/read/close lifetime, including header-only reads.
+_EDF_READ_LOCK = threading.RLock()
+_ReadArgs = ParamSpec("_ReadArgs")
+_ReadResult = TypeVar("_ReadResult")
+
+
+def _serialized_edf_read(
+    read: Callable[_ReadArgs, _ReadResult],
+) -> Callable[_ReadArgs, _ReadResult]:
+    @wraps(read)
+    def serialized(*args: _ReadArgs.args, **kwargs: _ReadArgs.kwargs) -> _ReadResult:
+        with _EDF_READ_LOCK:
+            return read(*args, **kwargs)
+
+    return serialized
 
 
 def ascii_label(label: str, limit: int = 16) -> str:
@@ -698,6 +718,7 @@ def read_edf_mne(path: PathLike, channel_name: str) -> dict[str, Any]:
     }
 
 
+@_serialized_edf_read
 def read_edf_pyedflib(path: PathLike, channel_index: int = 0) -> dict[str, Any]:
     """Read one channel from an EDF+ file using ``pyedflib``'s highlevel API.
 
@@ -757,6 +778,7 @@ def read_edf_pyedflib(path: PathLike, channel_index: int = 0) -> dict[str, Any]:
     }
 
 
+@_serialized_edf_read
 def read_edf_markers(path: PathLike) -> list[tuple[float, str]]:
     """Return an EDF+ file's annotations as ``(seconds, text)``.
 
@@ -783,6 +805,7 @@ def read_edf_markers(path: PathLike) -> list[tuple[float, str]]:
     ]
 
 
+@_serialized_edf_read
 def list_edf_channels(path: PathLike) -> list[str]:
     """Return the channel labels of an EDF file (reads the header only).
 
@@ -812,6 +835,7 @@ def list_edf_channels(path: PathLike) -> list[str]:
         reader.close()
 
 
+@_serialized_edf_read
 def list_edf_emg_channels(path: PathLike) -> list[str]:
     """Return only the EMG channel labels of an EDF file.
 
@@ -843,6 +867,7 @@ def list_edf_emg_channels(path: PathLike) -> list[str]:
         reader.close()
 
 
+@_serialized_edf_read
 def find_edf_acc_channel(path: PathLike) -> tuple[str, str] | None:
     """Locate the accelerometer channel in an EDF and infer its placement.
 
@@ -881,6 +906,7 @@ def find_edf_acc_channel(path: PathLike) -> tuple[str, str] | None:
         reader.close()
 
 
+@_serialized_edf_read
 def assess_edf_channels(path: PathLike) -> list[tuple[str, str]]:
     """Per-EMG-channel quality verdict for a file, for a warning on load.
 
@@ -921,6 +947,7 @@ def assess_edf_channels(path: PathLike) -> list[tuple[str, str]]:
         reader.close()
 
 
+@_serialized_edf_read
 def read_edf_metadata(path: PathLike) -> RecordingMetadata:
     """Read the EDF+ identification header (student, protocol, ...).
 
@@ -955,6 +982,7 @@ def read_edf_metadata(path: PathLike) -> RecordingMetadata:
         reader.close()
 
 
+@_serialized_edf_read
 def edf_duration(path: PathLike) -> float:
     """Return the recording duration in seconds (reads the header only).
 

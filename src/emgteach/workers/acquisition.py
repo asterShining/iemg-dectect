@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -485,6 +486,12 @@ class AcquisitionWorker(QThread):
                     physical_min=device.physical_min,
                     physical_max=device.physical_max,
                 )
+            channels = [
+                replace(channel, digital_min=limits[0], digital_max=limits[1])
+                for channel, limits in zip(
+                    channels, device.channel_digital_ranges(), strict=True
+                )
+            ]
             try:
                 writer = BufferedEdfWriter(
                     edf_path, channels=channels, metadata=self._metadata

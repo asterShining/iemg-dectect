@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, cast
 
 from PySide6.QtCore import QSettings, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from emgteach.devices import BACKEND_ARDUINO, device_class
+from emgteach.devices import BACKEND_ARDUINO, BACKEND_LHE7904_UART, device_class
 from emgteach.devices.bitalino_sim import is_simulated_address
 from emgteach.i18n import tr
 from emgteach.station import ADDRESS_FILE, read_station_address
@@ -74,8 +75,10 @@ class ConnectionBox(QWidget):
     logged = Signal(str)
     #: A line for the event log, as an error.
     warned = Signal(str)
-    #: The device type was changed (0 BITalino, 1 Arduino).
+    #: The device type was changed (0 BITalino, 1 Arduino, 2 LHE7904).
     device_type_changed = Signal(int)
+    #: Sampling rate or frame configuration changed.
+    configuration_changed = Signal()
     #: The watchdog found the samples stopped: the tab disconnects.
     link_lost = Signal()
     #: No block within CONEXION_MAX_S: the tab stops the recording.
@@ -105,7 +108,9 @@ class ConnectionBox(QWidget):
         self._combo_device_type = QComboBox()
         self._combo_device_type.addItem("BITalino (Bluetooth)")
         self._combo_device_type.addItem("Arduino + MyoWare 2.0 (USB)")
+        self._combo_device_type.addItem("LHE7904 (UART, 1,000,000 baud)")
         saved_type = int(cast("int | str", self._settings.value("adquisicion/device_type", 0)))
+        saved_type = saved_type if saved_type in (0, 1, 2) else 0
         self._combo_device_type.setCurrentIndex(saved_type)
         self._combo_device_type.currentIndexChanged.connect(self._on_device_type_changed)
         # In the practicals that can only be done with the BITalino the
@@ -162,12 +167,49 @@ class ConnectionBox(QWidget):
         ard_inner.setContentsMargins(0, 0, 0, 0)
         ard_inner.setSpacing(4)
         self._combo_port = QComboBox()
+        self._combo_port.setEditable(saved_type == 2)
+        self._combo_port.currentTextChanged.connect(self._save_lhe7904_port)
         ard_inner.addWidget(self._combo_port)
         btn_refresh_ports = QPushButton(tr("Refresh"))
         btn_refresh_ports.setFixedWidth(84)
         btn_refresh_ports.setToolTip(tr("Refresh the list of available serial ports"))
         btn_refresh_ports.clicked.connect(self._refresh_ports)
         ard_inner.addWidget(btn_refresh_ports)
+
+        self._widget_lhe7904 = QWidget()
+        lhe_row = QHBoxLayout(self._widget_lhe7904)
+        lhe_row.setContentsMargins(0, 0, 0, 0)
+        lhe_row.setSpacing(4)
+        self._widget_lhe7904.setToolTip(tr(
+            "Match these settings to the LHE7904 firmware; they do not reconfigure the board. "
+            "500 Hz is below the EMG filter requirements; 8000 Hz and above exceed "
+            "the UART capacity at 1,000,000 baud."
+        ))
+        lhe_row.addWidget(QLabel("Hz"))
+        self._combo_lhe_fs = QComboBox()
+        for rate in (1000, 2000, 4000):
+            self._combo_lhe_fs.addItem(str(rate), rate)
+        rate = int(cast("int | str", settings.value("adquisicion/lhe7904/fs", 4000)))
+        rate_index = self._combo_lhe_fs.findData(rate)
+        self._combo_lhe_fs.setCurrentIndex(rate_index if rate_index >= 0 else 2)
+        lhe_row.addWidget(self._combo_lhe_fs)
+        self._chk_lhe_filtered = QCheckBox(tr("Firmware filter"))
+        self._chk_lhe_filtered.setChecked(
+            bool(settings.value("adquisicion/lhe7904/include_filtered", True, type=bool))
+        )
+        lhe_row.addWidget(self._chk_lhe_filtered)
+        lhe_row.addWidget(QLabel("PGA"))
+        self._combo_lhe_gain = QComboBox()
+        for gain in (1, 2, 3, 4, 6, 8, 12, 24):
+            self._combo_lhe_gain.addItem(str(gain), gain)
+        gain = int(cast("int | str", settings.value("adquisicion/lhe7904/pga_gain", 1)))
+        gain_index = self._combo_lhe_gain.findData(gain)
+        self._combo_lhe_gain.setCurrentIndex(max(0, gain_index))
+        lhe_row.addWidget(self._combo_lhe_gain)
+        self._combo_lhe_fs.currentIndexChanged.connect(self._save_lhe7904_options)
+        self._chk_lhe_filtered.toggled.connect(self._save_lhe7904_options)
+        self._combo_lhe_gain.currentIndexChanged.connect(self._save_lhe7904_options)
+        cfg_row1.addWidget(self._widget_lhe7904)
 
         # Container that switches between _widget_mac and _widget_arduino
         self._stack_conn = QWidget()
@@ -185,7 +227,8 @@ class ConnectionBox(QWidget):
 
         # Initial visibility of the connection area
         self._widget_mac.setVisible(saved_type == 0)
-        self._widget_arduino.setVisible(saved_type == 1)
+        self._widget_arduino.setVisible(saved_type != 0)
+        self._widget_lhe7904.setVisible(saved_type == 2)
         self._refresh_ports()
 
         # The Connect button and the LED are laid out by the tab, in its
@@ -233,7 +276,7 @@ class ConnectionBox(QWidget):
     # ------------------------------------------------------------------
 
     def device_index(self) -> int:
-        """0 for the BITalino, 1 for the Arduino."""
+        """0 for BITalino, 1 for Arduino, 2 for LHE7904."""
         return self._combo_device_type.currentIndex()
 
     def address(self) -> str:
@@ -241,8 +284,25 @@ class ConnectionBox(QWidget):
         return self._edit_mac.text().strip()
 
     def serial_port(self) -> str:
-        """The Arduino's serial port as chosen."""
+        """The serial device's port as chosen or typed."""
         return self._combo_port.currentText().strip()
+
+    def lhe7904_options(self) -> dict[str, int | bool]:
+        """The expected firmware settings, forwarded to the UART backend."""
+        return {
+            "fs": int(self._combo_lhe_fs.currentData()),
+            "include_filtered": self._chk_lhe_filtered.isChecked(),
+            "pga_gain": int(self._combo_lhe_gain.currentData()),
+        }
+
+    def _save_lhe7904_options(self) -> None:
+        for key, value in self.lhe7904_options().items():
+            self._settings.setValue(f"adquisicion/lhe7904/{key}", value)
+        self.configuration_changed.emit()
+
+    def _save_lhe7904_port(self, text: str) -> None:
+        if self.device_index() == 2:
+            self._settings.setValue("adquisicion/lhe7904/port", text.strip())
 
     def is_connected(self) -> bool:
         """The Connect button is down."""
@@ -301,21 +361,29 @@ class ConnectionBox(QWidget):
 
     @Slot(int)
     def _on_device_type_changed(self, index: int) -> None:
-        """Show the COM-port field (BITalino) or the COM-port selector (Arduino)."""
+        """Show the address or serial controls and the selected firmware settings."""
         self._widget_mac.setVisible(index == 0)
-        self._widget_arduino.setVisible(index == 1)
+        self._widget_arduino.setVisible(index != 0)
+        self._widget_lhe7904.setVisible(index == 2)
+        self._combo_port.setEditable(index == 2)
+        self._refresh_ports()
         self.device_type_changed.emit(index)
 
     @Slot()
     def _refresh_ports(self) -> None:
         """Repopulate the COM-port combo with those available on the system."""
-        ports = device_class(BACKEND_ARDUINO).list_ports()
-        saved_port = self._settings.value("adquisicion/port", "")
+        is_lhe7904 = self.device_index() == 2
+        backend = BACKEND_LHE7904_UART if is_lhe7904 else BACKEND_ARDUINO
+        ports = device_class(backend).list_ports()
+        key = "adquisicion/lhe7904/port" if is_lhe7904 else "adquisicion/port"
+        saved_port = str(self._settings.value(key, "") or "")
         self._combo_port.blockSignals(True)
         self._combo_port.clear()
         for p in ports:
             self._combo_port.addItem(p)
-        if saved_port in ports:
+        if is_lhe7904 and saved_port:
+            self._combo_port.setEditText(saved_port)
+        elif saved_port in ports:
             self._combo_port.setCurrentText(saved_port)
         elif ports:
             self._combo_port.setCurrentIndex(0)
@@ -365,21 +433,27 @@ class ConnectionBox(QWidget):
             # an explicit COM port are also accepted and resolved on open().
             desc = self._edit_mac.text().strip()
             self._settings.setValue("adquisicion/port", desc)
-        else:  # Arduino
+        else:  # Serial device
             desc = self._combo_port.currentText().strip()
             if not desc:
                 self.warned.emit(
+                    tr("Select a serial port for the LHE7904 before connecting.")
+                    if device_idx == 2 else
                     tr("Select a COM port for the Arduino before connecting.")
                 )
                 self.connect_button.setChecked(False)
                 return None
-            self._settings.setValue("adquisicion/port", desc)
+            port_key = (
+                "adquisicion/lhe7904/port" if device_idx == 2 else "adquisicion/port"
+            )
+            self._settings.setValue(port_key, desc)
         self._settings.setValue("adquisicion/device_type", device_idx)
 
         self.connect_button.setText(tr("Disconnect"))
         self._combo_device_type.setEnabled(False)
         self._widget_mac.setEnabled(False)
         self._widget_arduino.setEnabled(False)
+        self._widget_lhe7904.setEnabled(False)
         self._placa_reiniciar = False
         self._set_led("idle")
         return desc
@@ -391,6 +465,7 @@ class ConnectionBox(QWidget):
         self._combo_device_type.setEnabled(True)
         self._widget_mac.setEnabled(True)
         self._widget_arduino.setEnabled(True)
+        self._widget_lhe7904.setEnabled(True)
         self._sin_respuesta = False
         self._placa_reiniciar = False
         self._set_led("off")
@@ -511,6 +586,10 @@ class ConnectionBox(QWidget):
         self._set_led("off")
         self.no_answer.emit()      # the tab stops it; the status says the board did not answer
         texto = tr(
+            "No data arrived from the LHE7904 in {s:.0f} s, so nothing is being "
+            "recorded. Check the serial port, UART wiring and firmware sampling "
+            "rate and frame settings, then try again."
+        ).format(s=CONEXION_MAX_S) if self.device_index() == 2 else tr(
             "No data arrived from the board in {s:.0f} s, so nothing is being "
             "recorded. Check that the BITalino is switched on, switch it off "
             "and on again, and try again. If it happens again, close emgteach "

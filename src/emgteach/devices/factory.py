@@ -20,10 +20,12 @@ from collections.abc import Callable
 from emgteach.devices.arduino import ArduinoDevice
 from emgteach.devices.base import AcquisitionDevice
 from emgteach.devices.bitalino import BitalinoDevice
+from emgteach.devices.lhe7904_uart import LHE7904UartDevice
 
 __all__ = [
     "BACKEND_ARDUINO",
     "BACKEND_BITALINO",
+    "BACKEND_LHE7904_UART",
     "available_backends",
     "create_device",
     "device_class",
@@ -33,6 +35,7 @@ __all__ = [
 #: Stable backend identifiers for the built-in hardware.
 BACKEND_BITALINO = "bitalino"
 BACKEND_ARDUINO = "arduino"
+BACKEND_LHE7904_UART = "lhe7904_uart"
 
 #: A device builder: any callable returning an AcquisitionDevice.
 DeviceBuilder = Callable[..., AcquisitionDevice]
@@ -126,3 +129,5 @@ def device_class(backend_id: str) -> type[AcquisitionDevice]:
 # (pyserial) lazily inside open(), so no hardware library loads at import time.
 register_device(BACKEND_BITALINO, BitalinoDevice)
 register_device(BACKEND_ARDUINO, ArduinoDevice)
+
+register_device(BACKEND_LHE7904_UART, LHE7904UartDevice)
