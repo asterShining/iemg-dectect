@@ -1,0 +1,728 @@
+# Architecture Decision Record
+
+This file records the significant architectural decisions taken while
+evolving `emgteach`. Each entry lists the date, the options that were
+considered, the option chosen, and the reasoning. The most recent
+decisions appear first.
+
+The format is a lightweight ADR (Architecture Decision Record). It is
+intended to make the *why* behind the structure auditable, both for
+future maintainers and for the teaching context in which the package is
+used.
+
+---
+
+## 2026-10-24 — Guided sessions in the one-muscle practical: the foundations
+
+**Context.** Trials with other teachers: the practical students will do is
+mostly the one-muscle one, and the application left it raw — the exercises
+of the practical guide (steps of effort, a sustained contraction) were timed
+by the student with a stopwatch. ecgteach and eegteach run guided sessions:
+phases announced, timed, with a tone and a flash, marked in the file. The
+plan is `docs/PLAN-sesiones-contraccion-simple.md` (PR #136).
+
+**Options evaluated.** (a) Port ecgteach's and eegteach's
+`GuidedSessionDialog`, identical in both; (b) run the sessions with what
+emgteach already has: the session flow of the other two practicals (record →
+calibration → countdown → recording phase), the panel over the plots, the
+classroom broadcast, the phase marks.
+
+**Chosen: (b), with the sister applications' tone.** The dialog is a window
+over the window, and in this practical the student squeezes looking at the
+load bar it would cover; it writes its marks as translated text, where
+emgteach writes ASCII codes (`CAL`, `REC`); and it sends nothing to the
+phones. What is taken from them is the tone module, unchanged (`cue.py`, now
+the third identical copy, a candidate for the shared core), the flash at
+every change, and the box that remembers the tone, on by default.
+
+**The timing lives outside the tab.** The tab's other guided flows are state
+machines written inside it, which is why it has 5700 lines. This one is a
+Qt-free script (`sessions.py`: phases, marks, reader) and a clock
+(`gui/session_runner.py`) that says what happens; the tab only connects
+signals to what it already does.
+
+**Revised: the one-muscle practical now has a guided end.** The decision of
+11 October said it had none. With a guided session chosen the recording stops
+by itself when the session ends, as in the other two practicals; a free
+recording, which stays the norm and is what the chooser says when the tab
+opens, still records until the operator stops it.
+
+**Decided by Ángel on 24 October** (plan, §10): the tone box remembered and
+on by default; the gradation requires a calibrated MVC; the fatigue session
+is a maximal contraction of 30 s (cap 45 s), with an intermittent variant;
+the session of successive contractions is dropped.
+
+---
+
+## 2026-10-10 — 3.8.0: what ecgteach and eegteach found, ported piece by piece
+
+**Context.** ecgteach and eegteach began as copies of emgteach's acquisition
+code, and the bench of ecgteach 0.4.0 and eegteach 0.3.0 (5–6 October 2026)
+found faults in that shared code: the late phone without the report, the event
+log written only at the end, the default name without seconds, the file that
+disappears without a word, the dialog on a folder that is gone, and the board
+that has to be switched off and on.
+
+**Options evaluated.** (a) Copy the sister applications' files over
+emgteach's; (b) port each fix by hand, with its test, only where emgteach's
+code has the fault; (c) a shared package for the three applications.
+
+**Chosen: (b).** The files are no longer the same: `broadcast.py` alone
+carries emgteach's own frames (`load`, `calib`), demo and %MVC zones, and a
+copy would have taken them away. Each fix came with a test that failed on
+emgteach before it, and where emgteach already did the right thing (the marks'
+mirror, opened in write mode and synced mark by mark) nothing was touched.
+(c) is the right shape in the long run, and a refactor too large for a short
+release a month before the practicals. The release is kept short on purpose:
+what had been planned for 3.8.0 moves to 3.9.0.
+
+**Three differences from the sister applications.** The status that says to
+switch the board off and on is for the BITalino only: the Arduino is on a USB
+cable, and the bench saw the fault only on the Bluetooth link. The box that
+says a file could not be written is non-modal in the strict sense — shown,
+not opened as window-modal — so the window stays usable while the recording
+stops. And the check that the file is still in its folder was reproduced on
+emgteach before it was applied, as the brief asked: with the real writer and
+the folder deleted, the recording went on without a word.
+
+**Open risk.** The ports reproduce faults seen on the ecgteach and eegteach
+bench, not on emgteach's: the board-restart status in particular is said, not
+explained. The 3.8.0 bench is what confirms them on this application.
+
+**Decisions of 11 October 2026.** The board-restart status stays BITalino
+only, and the save box stays non-modal: a recording cut short by a medium
+that disappears is not a use case — nobody records onto a memory stick —
+and for such anomalous conditions (a stick taken out, a folder that goes, a
+process killed) the application has to say so and not corrupt what is
+already written; restarting it is an acceptable answer, and nothing more is
+spent on that front. The metrics («results») are resent to a late phone with
+the report. A file that cannot be created no longer reads as a board that did
+not answer (ported from ecgteach). The recording stops by itself at the end of
+the pair and kinematics guided sessions, as in the sister applications; the
+one-muscle practical has no guided end. The diagnostic's warning for a
+saturated or flat channel goes to 3.9.0 — «ready, with a warning» past 50 % of
+the samples at rest, not eegteach's 10 %, since in EMG a strong contraction
+saturates too. The PR is merged after its own bench, not after ecgteach's.
+
+---
+
+## 2026-09-29 — Classroom broadcast: ports 8080 and 8443, changeable in difusion.txt
+
+**Context.** The broadcast opened 8070 for the page and 8071 for the data,
+fixed in `broadcast.py`. Which ports a network lets through is decided by
+whoever runs it and varies from one building to another; a network that
+admits only the usual web ports leaves the phones without the page, and the
+application had no way to change that short of a new version.
+
+**Options evaluated.** (a) Other fixed defaults; (b) the ports in the
+application's settings; (c) other defaults, and the ports in a text file next
+to the application.
+
+**Chosen: (c).** Defaults 8080 for the page and 8443 for the data, ports that
+networks usually leave open for web traffic, and `difusion.txt` next to the
+application to change them, read by `emgteach.difusion`. The settings (b) are
+per user account and per PC, while the ports are the laboratory's, the same on
+every station: a file travels with the application, as `bitalino.txt` already
+does for the board's address. It is a separate file because the address is
+the station's and the ports are the laboratory's. This is laboratory
+configuration, not a workaround for one network: the next network may admit
+other ports, and they are changed in the file without a new version. A line
+that cannot be used puts back both defaults and is reported once; a busy port
+is named in the warning (`BroadcastServer.failed_port`). The same module,
+file name and format serve ecgteach and eegteach.
+
+**Open risk: 8443 is the usual HTTPS port, and the data connection is not
+encrypted** (`QWebSocketServer`, `NonSecureMode`). A network that filters by
+port number alone lets it through. A network that inspects the protocol on
+8443 would cut it. The symptom tells it apart from a closed port:
+
+- **protocol cut on 8443:** the page loads on the phone, but stays at
+  «connecting…» or «reconnecting…» with no data; on the computer the follower
+  count stays at 0, and after 90 s (`ESPERA_SEGUIDORES_MS`) the «nobody has
+  joined» warning appears;
+- **port closed, or phones that cannot reach the computer:** the page does not
+  load at all.
+
+In the first case another data port is tried in `difusion.txt`. Encrypting the
+connection is not done in this version.
+
+---
+
+## 2026-09-27 — BITalino frames: resynchronise after a bad CRC, confirmed by the next frame
+
+**Context.** The pyserial backend (2026-06-28) decoded frames in fixed steps
+and raised «connection lost» at the first frame whose 4-bit CRC failed, so one
+corrupted byte cost the whole recording. ecgteach, forked from this backend,
+already resynchronises.
+
+**Options evaluated.** (a) Keep aborting; (b) port ecgteach's resynchronisation
+as it is; (c) port it and confirm each resynchronised frame with the next one.
+
+**Chosen: (c).** After a failed CRC the stream is scanned forward one byte at a
+time; every byte discarded counts as a CRC error, and 256 bytes in a row with
+no valid frame give the link up (about 80 single-channel frames: far more than
+a glitch, far less than a session). A window straddling two frames passes a
+4-bit CRC by chance one time in sixteen, and with (b) its sample reached the
+output. Here that is not harmless: the MVC calibration takes a maximum, and a
+garbage sample can reach full scale. So after discarding, a frame that
+validates is accepted only when the next frame also validates and carries the
+next sequence number; a chance pass of both is about one in 4096. The cost is
+reading one frame ahead while resynchronising, a millisecond at 1 kHz. The
+4-bit sequence number also counts the frames the link dropped (`lost_frames`);
+it wraps every 16, so a gap of exactly 16 is invisible and long dropouts are
+under-counted.
+
+**Frame resolution follows the slot, not the input.** ecgteach scales A5/A6 at
+6 bits whatever else is enabled. PLUX's documentation places the 6 bits on two
+of the six inputs when all of them are used at once: the core datasheet gives
+«4 in (10-bit) + 2 in (6-bit)»
+(https://support.pluxbiosignals.com/wp-content/uploads/2021/11/bitalino-core-datasheet.pdf),
+and the support page «How many channels does BITalino (r)evolution have?»
+(https://support.pluxbiosignals.com/knowledge-base/how-many-channels-does-bitalino-have/)
+says that when the channels are all used simultaneously, four operate at 10
+bits and the other two at 6. That those 6 bits are the fifth and sixth frame
+slots, which exist only with more than four inputs enabled, is our reading of
+the frame format (`_frame_size`, `_extract_channel`), not a statement of
+PLUX's. Scaling by the input would read an accelerometer on A5 next to one EMG
+input 16 times too large, so `adc_max_for_slot` decides by the position in the
+frame. The application never enables more than three inputs, so no recording
+changes either way.
+
+**Lost frames are marked.** When the sequence number shows a gap, the
+acquisition worker writes a line in the event log and an EDF+ annotation at the
+time the gap was noticed, once per gap. The sample counter counts what
+arrived, so after a gap every later time in the file is short by the frames
+that never came; without the annotation nothing in the file would say so.
+
+**Released as 3.7.1**, not 3.8.0: a bug fix, with no change to any interface,
+to the EDF format or to any calculation, and it has to reach the November
+practicals. 3.7.0 stays the version the article describes.
+
+---
+
+## 2026-06-28 — BITalino backend rewritten on pyserial (supersedes 2026-06-17 Decision 3)
+
+**Context.** Even bundled `--no-deps`, the external pure-Python `bitalino`
+module only reaches the COM-port path when the *address looks like a COM port*;
+given a MAC address it still does `import bluetooth` (PyBluez) and fails with
+`No module named 'bluetooth'`. The device field defaulted to a MAC, so the
+common case walked straight into the dead PyBluez path, and the module also
+emitted a confusing "bluetooth wrapper failed to import" line even in COM mode.
+PyBluez itself is abandoned (2020) and uninstallable on modern Python (3.13+).
+
+**Options evaluated.** (a) Keep the external `bitalino` module and only steer
+users to a COM port; (b) migrate to `bleak`; (c) implement the BITalino wire
+protocol directly over `pyserial`.
+
+* `bleak` was rejected: it is **BLE-only**, while the BITalino *(revolution)*
+  is **Bluetooth Classic (SPP/RFCOMM)**. bleak cannot reach the device at all.
+* Steering users to a COM port keeps a fragile external dependency, the
+  `--no-deps` install dance, and the misleading import warning.
+
+**Chosen: implement the protocol directly over `pyserial` (option c).**
+`src/emgteach/devices/bitalino.py` now opens the Windows Bluetooth **virtual
+COM port** and speaks the BITalino protocol itself (version, set-rate, start
+live mode, CRC-checked frame decode, stop→idle). Consequences:
+
+* No PyBluez, no external `bitalino` package, no BLE stack. The `[bitalino]`
+  optional extra and the `bitalino` PyInstaller hidden-import are removed;
+  `pyserial` (already a hard dependency for Arduino) is the only transport.
+* Importable and freezable on every supported Python, including 3.13/3.14.
+* The public `AcquisitionDevice` API and the watchdog contract are unchanged;
+  `force_close` now closes the serial port to release a stuck read.
+
+**Addressing — keep the MAC as the stable, zero-config identifier.** COM
+numbers differ per PC, which is why the lab worked by MAC. Although the *RFCOMM
+transport* by MAC is gone with PyBluez, the MAC itself is still usable: on
+Windows it appears inside each Bluetooth COM port's `hwid`, so `open()` resolves
+a MAC to whatever `COMx` the local machine assigned and connects over pyserial.
+The device field therefore accepts, in order of preference:
+
+* a **MAC** (default, e.g. `98:D3:91:FE:44:E4`) — same on every PC, resolved to
+  the local COM port via `hwid` (deterministic, no port probing);
+* an explicit **`COMx`** — used verbatim, as an override;
+* **empty / `auto`** — autodetect by probing the Bluetooth serial ports and
+  handshaking for the BITalino version string.
+
+A failed resolution raises an actionable bilingual message (MAC not paired / no
+BITalino found). Because a Bluetooth SPP port is released by Windows a moment
+after close, the serial open retries with a short backoff (covers the
+autodetect probe→reopen and quick reconnects; observed `WinError 1168`). The
+persistence key moved from `adquisicion/mac` to `adquisicion/port` (it now holds
+any of the three address forms). Empirically verified against the lab BITalino
+(`98:D3:91:FE:44:E4`): MAC and autodetect both resolve to `COM3` and stream at
+1 kHz.
+
+**Scope note.** This does not address running the *source* on Python 3.14:
+the pinned scientific stack (`numpy==1.26.4`, `scipy==1.13.1`,
+`pyedflib==0.1.42`, PySide6) still targets 3.10–3.12, and the frozen
+executable ships its own 3.12 interpreter regardless of the host Python.
+
+---
+
+## 2026-06-17 — Standalone Windows build (PyInstaller)
+
+For a critical-testing phase the application must run on any Windows 10/11 PC
+**without** a Python installation. The packaging recipe lives under
+`packaging/` and is reproducible; the artefacts (`build/`, `dist/`,
+`*.exe`) stay git-ignored.
+
+### Decision 1 — Tool: PyInstaller, one-file, windowed
+
+**Options evaluated.** PyInstaller vs Nuitka vs cx_Freeze; one-file vs
+one-folder; windowed vs console.
+
+**Chosen: PyInstaller, one-file, windowed.** PyInstaller was already
+anticipated (the `build` extra pins `PyInstaller>=6.0`) and has mature
+PySide6 support. One-file (`dist/emgteach.exe`, ~132 MB) is the simplest
+thing to hand to a tester (email/USB, double-click); the few-second
+first-launch self-extraction is acceptable. Windowed (no console) keeps the
+experience clean; in-app errors already surface through the logger widget.
+The build is on the verified **Python 3.12** venv. UPX is **off** (it can
+corrupt Qt/numpy DLLs).
+
+### Decision 2 — Frozen entry point with a headless self-test
+
+A thin launcher (`packaging/run_emgteach.py`) delegates to
+`emgteach.__main__.main`, and adds a `--selftest` mode that imports the full
+runtime surface and builds the main window off-screen. Because the build is
+windowed (no stdout), the outcome is written to `emgteach_selftest.log` next
+to the executable. This turns "did the freeze drop a module?" into an
+observable exit code, validated post-build before shipping.
+
+### Decision 3 — BITalino bundled via the COM-port path, no PyBluez
+
+**Context.** Including the BITalino backend was requested. Its usual Bluetooth
+path needs `PyBluez-bitalino`, whose C extension requires Microsoft C++ Build
+Tools and does not work on Python 3.12 — impractical to freeze.
+
+**Chosen: bundle the pure-Python `bitalino` module only** (installed with
+`--no-deps`, so PyBluez is never pulled). The `bitalino` library connects over
+the **Windows Bluetooth virtual COM port** (`COMx`) using `pyserial`, with no
+PyBluez involved, and works on Python 3.12. The acquisition tab's device field
+now accepts and documents a `COMx` port (placeholder + tooltip + validation
+message, all bilingual); entering a MAC instead yields the library's own clear
+"connect using the Virtual COM Port" message rather than a crash. A
+PyBluez-based MAC build would force a separate Python 3.11 + C-toolchain setup
+and is out of scope for the test executable.
+
+### Scope note
+
+macOS / Linux builds must be produced on those OSes (PyInstaller does not
+cross-compile). The executable is unsigned; SmartScreen may warn. Code-signing
+and size trimming (Qt module pruning) are deferred.
+
+---
+
+## 2026-06-13 — Muscle-load analysis (Jonsson APDF) in the MVC tab
+
+### Decision 1 — Implement Jonsson's APDF method, offline first
+
+**Context.** A faithful equivalent of PluxBioSignals' "Muscle Load Analysis"
+add-on was requested. That add-on applies **Jonsson's Amplitude Probability
+Distribution Analysis (APDA / APDF)** — a published, public-domain method
+(Jonsson 1978/1982), not a proprietary algorithm.
+
+**Options evaluated.** Placement: (a) extend the existing MVC tab; (b) a new
+dedicated "Muscle load" tab; (c) a selectable panel in the Analysis tab.
+Scope: offline post-processing first vs. online (real-time) from the start.
+
+**Chosen: extend the MVC tab, offline first.** The MVC tab already computes
+`emg_norm` (the % MVC envelope), which is exactly the input to the APDF, so
+the offline analysis reuses almost everything (one new core function, one new
+plot panel, one summary line). The online / real-time variant (warning and
+danger zones during acquisition) is deferred to a second phase.
+
+### Decision 2 — Method lives in a Qt-free core module
+
+`src/emgteach/apda.py` (`compute_apdf`, `LoadLevel`, `ApdfResult`) implements
+the method with numpy only, mirroring `dsp.py` / `mvc.py`, and is unit-tested
+in isolation (`tests/test_apda.py`). The three Jonsson levels are the
+**static** (P10), **median** (P50) and **peak** (P90) of the % MVC
+distribution.
+
+### Decision 3 — Recommended limits live in the SignalProfile
+
+The static / median / peak recommended maxima (% MVC) are profile attributes
+(`apda_static_limit`=5, `apda_median_limit`=14, `apda_peak_limit`=70),
+following the Hito-1 extension-point pattern, so they are configurable per
+modality without touching the worker or GUI. The defaults follow common
+ergonomic guidance derived from Jonsson; they are starting values to be
+tuned, **not** clinical thresholds.
+
+### Scope note — whole recording, no real-time zones yet
+
+The offline APDF is computed over the **whole recording** (muscle load is a
+task-level statistic), independent of the display-window navigator. The
+real-time "warning / danger" zones of the Plux add-on belong to the deferred
+online phase.
+
+### Decision 4 — MVC-tab redesign + dedicated MVC PDF report
+
+After validation, the MVC tab was reorganised: the muscle-load APDF moved out
+of the time-series subplot stack onto its **own (roughly square) canvas** with
+a **structured data panel** beside it; the old horizontal summary box was
+dropped; the display-window navigator was made **Analysis-style** (at the
+bottom, a minimap bar that fills the width plus a compact two-row control
+cluster, no box title and no reset button); and the whole visualisation area
+**scrolls vertically**. A dedicated one-click PDF report (`build_mvc_report`
+in `reports.py`, mirroring `build_session_report`) renders the panels + APDF
+and a metrics table with the load levels against their limits.
+
+### Decision 5 — Reports plot the on-screen window by default
+
+A whole-recording report is unreadable for a long session, so both report
+builders take an optional ``time_range`` (passed to the panel renderers) that
+restricts the time-domain panels. It defaults to the **currently visible
+window**: the Analysis graph-picker dialog exposes editable start/duration
+fields pre-filled with that window, and the one-click MVC report uses the
+window directly.
+
+### Decision 6 — Online muscle-load monitor (live MVC), GUI-side
+
+The real-time phase of the Plux "Muscle Load" add-on. The acquisition worker
+already emits the per-channel envelope on ``data_ready``, so the live monitor
+is computed **GUI-side** — no change to the worker or the buffer-then-flush EDF
+writer. A quick in-app **MVC calibration** (a few seconds of maximum
+contraction → 95th-percentile reference per channel) feeds an ``OnlineLoad``
+accumulator (``emgteach.apda``), and a compact panel shows a per-channel
+**load bar** with tiredness (warning) / fatigue (danger) zones plus the running
+static / median / peak. Thresholds (``apda_warning_limit`` /
+``apda_danger_limit``) and the calibration's shape (``mvc_bursts``,
+``mvc_burst_s``: three brief maximal efforts, 1.5 s each) live in
+the ``SignalProfile``. Calibration happens during recording (envelope only
+streams then); the calibration contraction is part of the EDF, which is
+acceptable for the teaching use case.
+
+---
+
+## 2026-06-11 — Hito 3: PDF session reports (+ visual polish)
+
+### Decision 1 — PDF engine: reportlab
+
+**Options evaluated.** reportlab (a document-layout engine) versus
+matplotlib's `backend_pdf`.
+
+**Chosen: reportlab.** It produces a genuinely document-like report
+(header, metrics/config tables, per-page footer) with the matplotlib
+signal figure embedded as an in-memory PNG. It is **pure Python** (no C
+extension, installs cleanly on any interpreter — a welcome contrast to
+the PyBluez build saga), so adding it as a dependency is low-risk.
+`backend_pdf` would have avoided a new dependency but makes headers and
+tables awkward.
+
+### Decision 2 — Simple textual header, no institutional logo
+
+Per the maintainer's preference, the report header is just a title
+("Informe de registro y análisis de EMG") plus the generation date and
+the relevant session data (optional student name/code, source file). No
+UCM logo image is embedded; a logo can be added later if wanted.
+
+### Decision 3 — One-click auto-save next to the EDF
+
+The "Generar informe PDF" button (Analysis tab, enabled after an
+analysis) writes the PDF **without a save dialog**, next to the source
+EDF as `<stem>_informe_<timestamp>.pdf`, matching the acceptance
+criterion ("con un click ... se guarda ... con nombre informativo"). The
+full path is logged.
+
+### Known limitation — device not stored in the EDF
+
+The report's configuration section lists the filters, sampling rate and
+channel (the `AnalysisWorker` now returns its `config`), but the
+**acquisition device is not recorded in the EDF**, so it shows as "no
+almacenado en el EDF". Writing the device into the EDF header (and the
+buffer-then-flush writer) is deferred so as not to touch the verified
+`io.py` write path; it is a clean follow-up.
+
+### Visual polish delivered alongside (same day)
+
+- Mouse-wheel zoom on the Analysis and MVC matplotlib plots (the
+  acquisition pyqtgraph plots already had it).
+- Event markers are now drawn **live** as vertical lines on the
+  acquisition plots (manual and automatic), not only as text — this was
+  the missing visual feedback; the marker data path itself was correct.
+- The single-channel default label reverted from "Canal 1" to **"EMG"**
+  (with a one-time settings migration), restoring the classic channel
+  name; two channels default to "EMG"/"EMG 2".
+
+### Outcome
+
+The report core (`src/emgteach/reports.py`, Qt-free, reportlab +
+matplotlib-Agg) and its Analysis-tab button are covered by tests
+(valid non-empty PDF, with/without markers/config, no-fatigue case) and
+an end-to-end GUI smoke. Suite at 119 tests, all passing; `ruff` clean.
+
+---
+
+## 2026-06-11 — Hito 2: annotation system
+
+Most of the annotation system was already in place before this work
+(manual markers with a labelled button + ``M`` shortcut, EDF+ annotation
+persistence, reader extraction of markers, and marker display/navigation
+in the analysis tab). The remaining piece was **automatic
+contraction-onset detection**, plus closing the end-to-end acceptance
+criterion.
+
+### Decision 1 — Onset threshold: baseline mean + k·SD
+
+**Context.** Surface-EMG onset detection needs a threshold on the
+amplitude (envelope). The threshold definition must be robust across
+subjects and hardware (BITalino ±3.3 V vs Arduino+MyoWare 5 V).
+
+**Options evaluated.**
+
+- **A — Baseline + k·SD (chosen).** Threshold = mean + ``k``·SD of the
+  initial resting window. ``k`` configurable (default 3).
+- **B — Fraction of the maximum** envelope (e.g. 15 % of peak).
+- **C — Absolute threshold in mV.**
+
+**Chosen: A.** It is the classical single-threshold EMG onset rule, it
+auto-adapts to each recording and hardware (no gain dependence), and it
+matches the teaching protocol of "rest, then contract" (the rest window
+calibrates the baseline). The sensitivity ``k`` is the single
+user-facing knob.
+
+### Decision 2 — Detection runs in real time during acquisition
+
+Chosen over an offline-only detector. The acceptance criterion requires
+that auto-detected onsets are *saved in the EDF* and visible on reload,
+so detection runs live in the acquisition worker (one detector per
+channel on the envelope) and records onsets as automatic markers
+("Inicio (auto)") through the same path as manual markers. An offline
+"detect onsets on a loaded EDF" button was deferred to Phase 2.
+
+### Decision 3 — Minimum-duration debounce (found during testing)
+
+The first implementation fired on single-sample noise excursions above
+threshold. Real onset detectors require the signal to *stay* above the
+threshold for a minimum duration. A ``min_duration_s`` parameter
+(default 50 ms) was added: an onset is declared only after the envelope
+has been continuously above threshold for that long, timed at the
+crossing, with a refractory period before the next onset. This removed
+the false positives. The four onset parameters (``onset_k``,
+``onset_baseline_s``, ``onset_refractory_s``, ``onset_min_duration_s``)
+live in ``SignalProfile``, following the single-source pattern of the
+filter parameters.
+
+### Outcome
+
+Delivered as four commits on branch `feature/annotations` (off `main`):
+the onset detector core + profile fields; worker integration (automatic
+markers); acquisition-tab controls (enable + sensitivity ``k``); and
+end-to-end verification. The suite grew from 105 to 115 tests, all
+passing; ``ruff`` clean. The acceptance criterion is covered by tests:
+a session with a manual marker *and* an automatic onset round-trips to
+the EDF, and both MNE and pyedflib recover the annotations on reload.
+The buffer-then-flush writer in ``io.py`` was not modified.
+
+---
+
+## 2026-06-11 — Dual-channel acquisition (agonist/antagonist)
+
+Requested before Hito 2: record two EMG channels simultaneously so that
+agonist/antagonist muscle pairs can be studied. Built on top of the
+Hito 1 branch (it reuses `SignalProfile` and the device factory).
+Strategic note: the Arduino + MyoWare backend is the priority for the
+student lab (cheaper, more boards per budget) even though it is
+single-channel today, so the architecture is generic over N channels
+rather than BITalino-specific.
+
+### Decision 1 — Device contract: `read()` returns `(n_samples, n_channels)`
+
+**Context.** Every layer assumed a single channel: `read()` returned a
+1-D array; the worker ran one filter chain and wrote three EDF channels.
+
+**Options evaluated.**
+
+- **A — `read()` always returns 2-D `(n_samples, n_channels)` (chosen)**,
+  with an `n_channels` property (default 1) on the ABC.
+- **B — Keep 1-D for one channel, 2-D for many.** Branchy worker code.
+
+**Chosen: A.** A single, uniform shape keeps the worker loop simple
+(iterate columns) and the contract honest. All implementers and tests
+are in-tree, so the breakage was contained. `BitalinoDevice` returns its
+requested analogue columns; `ArduinoDevice` gained an `n_channels`
+argument and de-interleaves frame-interleaved samples.
+
+### Decision 2 — EDF schema: store only the raw signal per sensor
+
+**Context.** EDF+ channel labels are limited to **16 ASCII characters**.
+The previous schema stored three channels per signal
+(`<label>`, `<label>_Filtered`, `<label>_Envelope`); with descriptive
+multi-sensor labels (e.g. `Antagonista_Filtered` = 20 chars) the derived
+labels overflow and are silently truncated. Separately, the app never
+reads the stored filtered/envelope channels back — analysis recomputes
+them from the raw channel via `process_offline`.
+
+**Options evaluated.**
+
+- **A — One raw channel per sensor (chosen).** Derived signals are
+  recomputed on analysis.
+- **B — Three channels per sensor** with compact suffixes and truncation
+  of long labels.
+- **C — Hybrid:** three channels for the single-sensor case, raw-only for
+  extra sensors.
+
+**Chosen: A (raw-only).** The raw signal is the scientifically
+meaningful datum; the filtered signal and envelope are deterministic
+functions of it. Storing only raw sidesteps the label-length limit,
+halves-or-better the file size, and loses nothing the application uses.
+This does change the single-channel EDF (previously three channels), a
+trade-off the maintainer accepted explicitly.
+
+### Decision 3 — Live view layout: overlaid channels (option A)
+
+The three real-time plots (raw, filtered, envelope) overlay one curve
+per channel in a consistent per-channel colour (blue = channel 1,
+red = channel 2) with a colour legend, rather than one column of plots
+per channel. Chosen for compactness and because direct superposition is
+the most didactic way to compare agonist/antagonist activation.
+
+### Decision 4 — Arduino firmware: write it now, versioned, 1–2 channels
+
+The repository previously tracked **no** Arduino firmware. A new
+`firmware/emgteach_arduino/` sketch (configurable `N_CHANNELS`, matching
+the existing wire protocol, frame-interleaved samples) is committed and
+shipped in the sdist, so the MyoWare 2-channel path is ready to flash
+once a second sensor is wired to `A1`. It is **not** validated by CI (no
+hardware in the loop) and must be verified on a real board before use.
+
+### Out of scope (unchanged here)
+
+- Side-by-side dual analysis and the dual-view polish remain for Phase 2.
+- The Arduino EDF physical-range correction (5 V vs ±3.3 V) is still a
+  separate, behaviour-changing decision (see the Hito 1 entry).
+
+### Outcome
+
+Delivered as five commits on branch `feature/dual-channel` (off the
+Hito 1 branch): N-channel data layer; Arduino firmware + sdist;
+dual live acquisition view; Analysis/MVC channel selection. The suite
+grew from 97 to 105 tests, all passing; `ruff` clean; the GUI boots
+offscreen and a simulated two-channel feed renders both channels. The
+buffer-then-flush writer in `io.py` was not modified.
+
+---
+
+## 2026-06-11 — Hito 1: architectural refactor
+
+Phase 1 of the planned work. The goal is a more mature architecture
+*without* changing user-visible behaviour, in preparation for the
+annotation system (Hito 2) and PDF reports (Hito 3).
+
+### Decision 1 — Scope of the refactor: surgical (no file moves)
+
+**Context.** On inspection, the package is already cleanly stratified
+into a Qt-free analytic core (`devices/`, `dsp.py`, `fatigue.py`,
+`mvc.py`, `io.py`), a Qt bridge (`workers/`) and a presentation layer
+(`gui/`). The README already documents this split. The layer separation
+requested for Hito 1 is therefore largely *already done*.
+
+**Options evaluated.**
+
+- **A — Surgical (chosen).** Keep the current file layout. Add only the
+  missing extension points (a `SignalProfile` domain object and a device
+  factory) and remove duplication. No module moves.
+- **B — Hybrid.** Surgical plus a new `core/` subpackage to group the new
+  abstractions; existing analytic modules stay in place.
+- **C — Full reorganization.** Move every module into explicit
+  `acquisition/ processing/ persistence/ presentation/` packages.
+
+**Chosen: A (surgical).**
+
+**Reasoning.** The existing separation is good and, critically, the
+buffer-then-flush EDF writer (`io.py`) and its 73-test safety net have
+been *empirically verified*. Mass file moves (option C) would generate
+import churn across the whole codebase and the test suite for a mostly
+cosmetic gain, raising the risk of silently disturbing the verified
+write path. The real, missing architectural value is in extension points
+and de-duplication, which option A delivers with localized, easily
+verified changes.
+
+### Decision 2 — Biopotential extension point: a `SignalProfile` object
+
+**Context.** The `AcquisitionDevice` ABC is already an extension point
+for new *hardware*, but there is no extension point for new *signal
+modalities* (ECG, EEG, EOG). The parameters that define *what a signal
+is* — filter band (20–450 Hz), mains notch (50 Hz), envelope cut-off
+(5 Hz), RMS window, segment parameters, channel schema
+(`EMG`/`EMG_Filtered`/`EMG_Envelope`), physical ranges — were hardcoded
+and duplicated across the three worker classes and the GUI tabs.
+
+**Options evaluated.**
+
+- **A — A single `SignalProfile` dataclass (chosen)** bundling
+  acquisition, filtering, analysis, channel-schema and display
+  parameters, with a module-level `EMG_PROFILE` default.
+- **B — Several separate config objects** (`AcquisitionConfig`,
+  `ProcessingConfig`, `ChannelSchema`, `DisplayConfig`).
+
+**Chosen: A (single `SignalProfile`).**
+
+**Reasoning.** For a teaching package with a small, fixed number of
+modalities, one cohesive, frozen, immutable object is easier to read,
+pass around and reason about than four interacting objects. Adding a new
+biopotential type becomes "define one new `SignalProfile`", which is the
+explicit goal of Hito 1. `EMG_PROFILE` reproduces the exact values used
+today, so the refactor is behaviour-preserving by construction.
+
+### Decision 3 — Legacy EDF helpers: deprecate, do not remove
+
+**Context.** `io.create_edf_writer` and `io.write_edf_block` are part of
+the public API (`__init__.py`) since v0.1.0, but are not used anywhere in
+the package or the test suite — only the original prototype used them.
+They implement the *unsafe* per-block write that the buffer-then-flush
+pattern (Agis-Torres, 2026) was designed to replace.
+
+**Options evaluated.**
+
+- **A — Deprecate (chosen).** Keep them, emit a `DeprecationWarning`, and
+  point the docstring to `BufferedEdfWriter`.
+- **B — Leave them unchanged.**
+- **C — Remove them.**
+
+**Chosen: A (deprecate).**
+
+**Reasoning.** Removal (C) would be a breaking change to an already
+published, citable release. Leaving them silent (B) keeps an unsafe path
+discoverable without any warning. Deprecation (A) preserves backward
+compatibility while actively steering users towards the safe writer,
+which is consistent with the methodological contribution of the
+buffered-write paper.
+
+### Out of scope for Hito 1 (flagged, not changed)
+
+These are real improvements but change *behaviour*, not structure, so
+they are deferred to an explicit decision rather than folded silently
+into the refactor:
+
+- Exposing all DSP filter parameters in the acquisition GUI (currently
+  the acquisition tab does not forward any filter settings to the
+  worker). This is a feature, not a refactor.
+- Correcting the EDF physical range for the Arduino + MyoWare backend
+  (5 V) versus the BITalino default (±3.3 V). This changes the
+  digital↔physical mapping of saved files and should be a conscious,
+  separately verified change.
+
+### Outcome
+
+Delivered as five commits on branch ``refactor/hito-1-arquitectura``:
+
+1. ``src/emgteach/profiles.py`` — ``SignalProfile`` + ``EMG_PROFILE``,
+   the biopotential extension point.
+2. The three workers source their DSP/analysis/channel defaults from a
+   profile; the triple-duplicated filter literals are gone.
+3. ``src/emgteach/devices/factory.py`` — ``create_device`` /
+   ``register_device`` registry; the acquisition tab builds devices
+   through it instead of importing concrete classes.
+4. The acquisition tab sources its display ranges, marker vocabulary and
+   nominal sampling rate from ``EMG_PROFILE``; the legacy EDF helpers now
+   emit ``DeprecationWarning``.
+
+Verification: the full suite grew from 74 to 97 tests, all passing
+(``pytest -m "not hardware"``), ``ruff check`` clean, and the GUI boots
+offscreen with the profile-driven values live. The buffer-then-flush
+writer in ``io.py`` was not modified and its round-trip tests still pass,
+confirming the central buffered-write pattern is intact. ``mypy`` reports only the
+same pre-existing QSettings/Qt typing notes present before the refactor.

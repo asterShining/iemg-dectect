@@ -1,0 +1,149 @@
+# Standalone Windows build
+
+This folder packages `emgteach` into a single Windows executable
+(`emgteach.exe`) that runs on any Windows 10/11 PC **without** a Python
+installation. It is meant for the critical-testing phase: hand the `.exe`
+to testers, they double-click it, no setup.
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `emgteach.spec` | PyInstaller recipe (one-file, windowed). |
+| `run_emgteach.py` | Frozen entry point. Normal launch starts the GUI; `--selftest` runs a headless integrity check. |
+| `diagnostico_bitalino.spec` | PyInstaller recipe of the connection diagnostic (one-file, console, no Qt). |
+| `run_diagnostico.py` | Its frozen entry point. |
+| `requirements-exe.txt` | The versions the laboratory kit is built with (the runtime dependencies and PyInstaller, pinned), used as constraints. |
+| `build.log` | Last build output (git-ignored). |
+
+## Build (developer machine)
+
+From the **project root**, inside the project venv (Python 3.10–3.12):
+
+```powershell
+pip install -e ".[build]" -c packaging\requirements-exe.txt
+pyinstaller --noconfirm --clean packaging\emgteach.spec
+```
+
+The executable is written to `dist\emgteach.exe`. The build is large
+(~several hundred MB on disk before one-file compression) because it bundles
+PySide6, mne, scipy, matplotlib and numpy.
+
+`-c packaging\requirements-exe.txt` installs the versions the laboratory kit
+was built with, so two builds weeks apart bundle the same libraries: the
+dependencies of `pyproject.toml` and PyInstaller, with everything they pull
+in, pinned. After updating the build environment on purpose, write it again
+from that environment, keeping its header.
+
+### Verify the frozen build (headless)
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+dist\emgteach.exe --selftest      # exit code 0 = OK
+Get-Content dist\emgteach_selftest.log
+```
+
+`--selftest` imports the full runtime surface and builds the main window
+off-screen. Because the app is windowed (no console), the outcome is written
+to `emgteach_selftest.log` next to the executable.
+
+### The connection diagnostic
+
+```powershell
+pyinstaller --noconfirm --clean packaging\diagnostico_bitalino.spec
+```
+
+writes `dist\diagnostico_bitalino.exe`, a console program that uses the
+application's own BITalino backend and no Qt, scipy, mne, pyedflib or reportlab
+(the spec excludes them; `tests/test_diagnostico.py` checks a whole
+diagnosis runs without them). Put it next to `emgteach.exe`:
+double-clicked, it takes the address from `bitalino.txt` (or autodetects the
+board), checks the Bluetooth adapter, the pairing, the COM port, the
+handshake and ten seconds of acquisition, keeps its window open, and saves
+`diagnostico_bitalino_<date>.txt` beside it. From a console,
+`diagnostico_bitalino.exe simulada` checks the tool itself without the board,
+and `diagnostico_bitalino.exe COM5` tries a given port.
+
+### Recovering a recording that did not close
+
+A recording the process did not get to close — a power cut, a forced
+close — leaves an EDF with all its signal on disk that no reader accepts
+(its header says `-1` records) and without the session's marks, which
+pyedflib writes only on close. The worker mirrors every mark to
+`<name>.marcas.txt` beside the EDF as it is made, and removes that file on
+a normal close. To rebuild a readable file:
+
+```powershell
+python -m emgteach.recovery C:\Records\P07_2026-09-10_16-32.edf
+```
+
+writes `P07_2026-09-10_16-32_recuperado.edf` with the signal and the marks;
+the original is never modified.
+
+### Build in CI
+
+The *Build Windows exe* workflow (`.github/workflows/build-windows-exe.yml`)
+builds both executables with the versions of `requirements-exe.txt` and
+self-tests each one on Windows — `emgteach.exe --selftest`, and a whole
+diagnosis of the simulated board with `diagnostico_bitalino.exe simulada` —
+on demand (*Actions → Build Windows exe → Run workflow*), on a pushed `exe-*`
+tag and on pull requests that touch `packaging/`. The two executables are
+kept as a workflow artifact named `emgteach-windows-exe`.
+
+A manual run also has GitHub attest where both executables were built
+(`actions/attest-build-provenance`). After 3.8.0 a version tag does not build
+again: PyInstaller does not reproduce a file byte for byte, so a second build
+would publish an executable nobody tried. The release job takes the latest
+successful manual run on the tag's commit, verifies its attestation and that
+the executable says the tag's version, renames it
+`emgteach-vX.Y.Z-windows-x64.exe` and creates a **draft** release with
+`docs/RELEASE_NOTES_vX.Y.Z.md`, the run's number, the executable's SHA-256 and
+the executable. Without such a run it fails and creates nothing. A draft is
+not published, so Zenodo, which archives on publication, is not told until
+the executable has been through VirusTotal and the draft is published by
+hand. The diagnostic stays a workflow artifact. The steps are in
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#releasing-a-version).
+
+## Run (tester machine)
+
+Double-click `emgteach.exe`. The first launch is a few seconds slower (the
+one-file bundle self-extracts to a temp folder). No install, no admin rights.
+
+> **Antivirus note.** The executable is not signed, and unsigned one-file
+> PyInstaller executables occasionally trigger a SmartScreen / antivirus false
+> positive. If Windows SmartScreen appears, choose *More info → Run anyway*.
+> A released executable can be checked against the SHA-256 in its release
+> notes and with `gh attestation verify` (see the main README). If Microsoft
+> Defender flags a release, it is reported to Microsoft as a false positive.
+
+### Hardware backends in the .exe
+
+- **Arduino + MyoWare** — over USB serial (`pyserial`). Works out of the box.
+- **BITalino (revolution)** — over the **Windows Bluetooth virtual COM port**
+  (e.g. `COM5`), using `pyserial`. The backend speaks the BITalino protocol
+  itself, so no external `bitalino` module and no PyBluez are bundled.
+
+  **How to connect:** pair the BITalino in Windows Bluetooth settings first;
+  Windows then exposes an outgoing COM port for it. In the acquisition tab,
+  prefer the device's **MAC address** — it is the same on every PC, whereas
+  the COM number is assigned per machine and can change. The app resolves the
+  MAC to the current COM port by reading the port list. An explicit `COMx` is
+  also accepted, and an empty field autodetects.
+- **Once per station** — put a text file `bitalino.txt` next to
+  `emgteach.exe` with the address on its first line (lines starting with `#`
+  are comments; `simulada` works too, and an empty file means autodetect).
+  The acquisition tab starts with it and «Default» returns to it.
+- **Without the board** — write `simulada` in the address field: the
+  application connects a BITalino simulated in software
+  (`emgteach.devices.bitalino_sim`) that speaks the same protocol, so the
+  recording, the calibration and the classroom broadcast can be tried on
+  any PC. The Bluetooth link is what it leaves out.
+
+## Notes / limitations
+
+- PyInstaller does not cross-compile: build on Windows for Windows. A macOS or
+  Linux build must be produced on that OS with the same spec.
+- The build is unsigned. For wider distribution, sign `emgteach.exe` with an
+  authenticode certificate.
+- `git`, if present on a tester's PC, is not required; the PDF-report footer
+  simply omits the commit hash when git is unavailable.

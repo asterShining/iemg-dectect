@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="{{LANG}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>emgteach</title>
+<style>
+  :root { --blue:#4169E1; --red:#D62728; --ok:#1a7f37; --warn:#E67E22; --dang:#cc0000; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Arial, sans-serif; background:#0f1420; color:#eef2f7; }
+  header { display:flex; align-items:center; gap:10px; padding:10px 14px; background:#16203a; position:sticky; top:0; }
+  header h1 { font-size:16px; margin:0; font-weight:700; }
+  #conn { margin-left:auto; font-size:12px; display:flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#888; }
+  .dot.on { background:#2ecc71; } .dot.off { background:#c0392b; }
+  #rec { font-size:12px; color:#ff6b6b; font-weight:700; display:none; }
+  #rec.on { display:inline; }
+  main { padding:10px 12px 24px; max-width:900px; margin:0 auto; }
+  /* Calibration banner */
+  #calib { display:none; margin:6px 0 12px; padding:14px; border-radius:12px;
+           background:#141626; text-align:center; }
+  #calib.on { display:block; }
+  #calib .title { font-size:18px; font-weight:700; margin-bottom:6px; }
+  #calib .count { font-size:56px; font-weight:800; color:var(--blue); line-height:1; }
+  #calib .bars { margin-top:10px; }
+  .bar { height:14px; border-radius:7px; background:#2a2d3f; overflow:hidden; margin:6px 0; }
+  .bar > i { display:block; height:100%; width:0; background:var(--blue); }
+  .bar.effort > i { background:#2ecc71; }
+  #calib .lbl { font-size:12px; color:#aeb6c4; }
+  /* Channel cards */
+  .ch { background:#141626; border-radius:12px; padding:12px; margin:10px 0; }
+  .ch h2 { font-size:15px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }
+  .swatch { width:12px; height:12px; border-radius:3px; }
+  canvas { width:100%; height:110px; display:block; background:#0b0e17; border-radius:8px; }
+  .load { margin-top:10px; }
+  .loadbar { position:relative; height:22px; border-radius:6px; background:#2a2d3f; overflow:hidden; }
+  .loadbar > .fill { position:absolute; left:0; top:0; bottom:0; width:0; background:var(--ok); transition:width .12s linear; }
+  .loadbar > .z { position:absolute; top:0; bottom:0; width:2px; }
+  .loadbar > .zw { background:var(--warn); } .loadbar > .zd { background:var(--dang); }
+  .loadtxt { display:flex; justify-content:space-between; font-size:12px; margin-top:4px; color:#c7cedb; }
+  .pct { font-weight:700; }
+  #wait { text-align:center; color:#8a93a6; padding:30px 10px; font-size:14px; }
+  footer { text-align:center; color:#66708a; font-size:11px; padding:14px; }
+  .dlbtn { background:#20304a; color:#dfe7f3; border:1px solid #3a4a63;
+                   border-radius:8px; padding:11px 15px; font-size:14px;
+                   text-decoration:none; display:inline-block; cursor:pointer; }
+  .dlbtn:active { background:#2c4064; }
+  #results .resgrid { display:grid; grid-template-columns:1fr 1fr; gap:2px 14px; }
+  #results .m { display:flex; justify-content:space-between; gap:8px; font-size:13px;
+                border-bottom:1px solid #222838; padding:5px 0; }
+  #results .m span { color:#aeb6c4; }
+  #resDl { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .hint { color:#aeb6c4; font-size:13px; margin:4px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="appTitle">emgteach</h1>
+  <span id="rec">● REC</span>
+  <span id="conn"><span id="dot" class="dot off"></span><span id="cs"></span></span>
+</header>
+<main>
+  <div id="calib">
+    <div class="title" id="cTitle"></div>
+    <div class="count" id="cCount"></div>
+    <div class="bars" id="cBars" style="display:none">
+      <div class="bar"><i id="cProg"></i></div>
+      <div class="lbl" id="cEffortLbl"></div>
+      <div class="bar effort"><i id="cEffort"></i></div>
+    </div>
+    <div class="lbl" id="cSub"></div>
+  </div>
+  <div id="wait"></div>
+  <div id="chs"></div>
+  <div id="results" class="ch" style="display:none">
+    <h2 id="resultsTitle"></h2>
+    <div class="resgrid" id="resMetrics"></div>
+    <div id="resDl"></div>
+  </div>
+  <div id="pdfHint" class="hint"></div>
+</main>
+<footer id="foot"></footer>
+
+<script>
+// ---- i18n: follow the app language injected by the server ----
+const ES = "{{LANG}}" !== "en";      // default to Spanish for any non-"en" value
+const M = {
+  // key:            [English,                              Spanish]
+  appTitle:          ["emgteach · Classroom",              "emgteach · Aula"],
+  title:             ["emgteach — Classroom",              "emgteach — Aula"],
+  connecting:        ["connecting…",                       "conectando…"],
+  connected:         ["connected",                         "conectado"],
+  reconnecting:      ["reconnecting…",                     "reconectando…"],
+  effort:            ["Effort",                            "Esfuerzo"],
+  waiting:           ["Waiting for the instructor's data…", "Esperando datos del profesor…"],
+  pdfHint:           ["The PDF report will appear here as soon as the instructor analyses the recording.",
+                      "El informe en PDF aparecerá aquí en cuanto el profesor analice el registro."],
+  resultsTitle:      ["📊 Analysis results",               "📊 Resultados del análisis"],
+  footer:            ["Follower view (read-only) · emgteach", "Vista de seguimiento (solo lectura) · emgteach"],
+  mvcUnit:           ["% MVC",                             "% CVM"],
+  mFile:             ["File",                              "Archivo"],
+  mMnf:              ["Mean freq. (MNF)",                  "Frec. media (MNF)"],
+  mMdf:              ["Median freq. (MDF)",                "Frec. mediana (MDF)"],
+  mSlope:            ["MDF slope",                         "Pendiente MDF"],
+  mRms:              ["Global RMS",                        "RMS global"],
+  mIemg:             ["iEMG",                              "iEMG"],
+  mDur:              ["Duration",                          "Duración"],
+  mFat:              ["Fatigue",                           "Fatiga"],
+  fatDetected:       ["Detected",                          "Detectada"],
+  fatNotDetected:    ["Not detected",                      "No detectada"],
+  fatUndetermined:   ["Undetermined",                      "Indeterminada"],
+  mStep:             ["Step",                              "Escalón"],
+  mStepMax:          ["max",                               "máx."],
+  mHeldOf:           ["held, asked",                       "mantenido, pedido"],
+  mLoadMdf:          ["MDF, start → end of its line",      "MDF, inicio → final de su recta"],
+  mLoadR2:           ["MDF line, R²",                      "Recta de la MDF, R²"],
+  mLoadRms:          ["RMS, start → end of its line",      "RMS, inicio → final de su recta"],
+  mLoadT10:          ["MDF −10 % at",                      "MDF −10 % a los"],
+  mLoadRatio:        ["Effort / rest",                     "Esfuerzo / reposo"],
+  mLoadWeak:         ["weak signal: check the contact or use a heavier weight",
+                      "señal débil: revise el contacto o use un peso mayor"],
+  mNever:            ["not reached",                       "no se alcanza"],
+  mTrain:            ["Quick contractions",                "Contracciones rápidas"],
+  mTrainPeaks:       ["Peaks, first → last third",         "Picos, primer → último tercio"],
+  mTrainFloor:       ["Floor between them",                "Suelo entre ellas"],
+  mOfPeak:           ["of the peak; the measure alone",    "del pico; la medida sola"],
+  dlReport:          ["⬇️ Download report (PDF)",          "⬇️ Descargar informe (PDF)"],
+};
+function t(k) { return (M[k] || ["", ""])[ES ? 1 : 0]; }
+const UNIT = t("mvcUnit");
+
+function applyStaticText() {
+  document.title = t("title");
+  document.getElementById("appTitle").textContent = t("appTitle");
+  document.getElementById("cs").textContent = t("connecting");
+  document.getElementById("cEffortLbl").textContent = t("effort");
+  document.getElementById("wait").textContent = t("waiting");
+  document.getElementById("pdfHint").textContent = t("pdfHint");
+  document.getElementById("resultsTitle").textContent = t("resultsTitle");
+  document.getElementById("foot").textContent = t("footer");
+}
+
+const COLORS = ["#4169E1", "#D62728"];
+const WIN = 600;                       // samples kept per channel for the plot
+let nCh = 0, labels = [], warn = 40, danger = 70;
+const bufs = [];                       // ring buffers of envelope per channel
+const cards = [];                      // DOM refs per channel
+
+function buildChannels() {
+  const chs = document.getElementById("chs");
+  chs.innerHTML = "";
+  cards.length = 0; bufs.length = 0;
+  for (let c = 0; c < nCh; c++) {
+    bufs.push(new Array(WIN).fill(0));
+    const col = COLORS[c % COLORS.length];
+    const el = document.createElement("div");
+    el.className = "ch";
+    el.innerHTML = `
+      <h2><span class="swatch" style="background:${col}"></span>${labels[c] || ("EMG " + (c+1))}</h2>
+      <canvas></canvas>
+      <div class="load">
+        <div class="loadbar">
+          <div class="fill"></div>
+          <div class="z zw"></div><div class="z zd"></div>
+        </div>
+        <div class="loadtxt">
+          <span class="pct">— ${UNIT}</span>
+          <span class="stats">P10 — · P50 — · P90 —</span>
+        </div>
+      </div>`;
+    chs.appendChild(el);
+    const cv = el.querySelector("canvas");
+    cards.push({
+      el, col, canvas: cv, ctx: cv.getContext("2d"),
+      fill: el.querySelector(".fill"), zw: el.querySelector(".zw"),
+      zd: el.querySelector(".zd"), pct: el.querySelector(".pct"),
+      stats: el.querySelector(".stats"), max: 0.5,
+    });
+  }
+  positionZones();
+  document.getElementById("wait").style.display = nCh ? "none" : "block";
+}
+
+function positionZones() {
+  for (const k of cards) {
+    k.zw.style.left = warn + "%";
+    k.zd.style.left = danger + "%";
+  }
+}
+
+function pushData(env) {
+  for (let c = 0; c < Math.min(env.length, nCh); c++) {
+    const b = bufs[c], s = env[c];
+    for (const v of s) { b.push(v); b.shift(); }
+  }
+}
+
+function draw() {
+  for (let c = 0; c < cards.length; c++) {
+    const k = cards[c], ctx = k.ctx, b = bufs[c];
+    const w = k.canvas.width = k.canvas.clientWidth * (window.devicePixelRatio || 1);
+    const h = k.canvas.height = k.canvas.clientHeight * (window.devicePixelRatio || 1);
+    ctx.clearRect(0, 0, w, h);
+    let mx = 0; for (const v of b) if (v > mx) mx = v;
+    k.max = Math.max(k.max * 0.95, mx, 0.05);         // smooth auto-scale
+    ctx.strokeStyle = k.col; ctx.lineWidth = 2 * (window.devicePixelRatio || 1);
+    ctx.beginPath();
+    for (let i = 0; i < b.length; i++) {
+      const x = (i / (b.length - 1)) * w;
+      const y = h - (b[i] / k.max) * (h - 6) - 3;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+  requestAnimationFrame(draw);
+}
+
+function setLoad(chs) {
+  for (let c = 0; c < Math.min(chs.length, cards.length); c++) {
+    const k = cards[c], d = chs[c];
+    if (!d.active) { k.pct.textContent = "— " + UNIT; k.stats.textContent = "P10 — · P50 — · P90 —"; k.fill.style.width = "0%"; continue; }
+    const col = d.zone === "danger" ? "var(--dang)" : d.zone === "warning" ? "var(--warn)" : "var(--ok)";
+    k.fill.style.background = col;
+    k.fill.style.width = Math.max(0, Math.min(100, d.pct)) + "%";
+    k.pct.textContent = Math.round(d.pct) + " " + UNIT;
+    k.pct.style.color = col;
+    k.stats.textContent = `P10 ${Math.round(d.static)} · P50 ${Math.round(d.median)} · P90 ${Math.round(d.peak)}`;
+  }
+}
+
+const cal = {
+  box: document.getElementById("calib"), title: document.getElementById("cTitle"),
+  count: document.getElementById("cCount"), bars: document.getElementById("cBars"),
+  prog: document.getElementById("cProg"), effort: document.getElementById("cEffort"),
+  sub: document.getElementById("cSub"),
+};
+function setCalib(d) {
+  if (!d.active) { cal.box.classList.remove("on"); return; }
+  cal.box.classList.add("on");
+  cal.title.textContent = d.title || "";
+  cal.sub.textContent = d.sub || "";
+  if (d.phase === "ready") {
+    cal.count.style.display = ""; cal.count.textContent = d.count;
+    cal.bars.style.display = "none";
+  } else if (d.phase === "contract") {
+    cal.count.style.display = ""; cal.count.textContent = (d.secs != null ? Math.ceil(d.secs) : "") + " s";
+    cal.bars.style.display = "block";
+    cal.prog.style.width = Math.round((d.progress || 0) * 100) + "%";
+    cal.effort.style.width = Math.round((d.effort || 0) * 100) + "%";
+  } else if (d.phase === "rest") {
+    cal.count.style.display = ""; cal.count.textContent = "🧘";
+    cal.bars.style.display = "none";
+  } else if (d.phase === "warmup" || d.phase === "prep") {
+    cal.count.style.display = ""; cal.count.textContent = d.count != null ? d.count : "";
+    cal.bars.style.display = "none";
+  } else { // done
+    cal.count.style.display = "none"; cal.bars.style.display = "none";
+  }
+}
+
+// ---- WebSocket ----
+let ws, retry = 0;
+function connect() {
+  // location.search carries the session code (?k=...) — the data server
+  // rejects connections without it.
+  ws = new WebSocket(`ws://${location.hostname}:{{WS_PORT}}/${location.search}`);
+  ws.onopen = () => { retry = 0; dot(true); };
+  ws.onclose = () => { dot(false); setTimeout(connect, Math.min(3000, 400 * ++retry)); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.t === "config") {
+      nCh = m.n; labels = m.labels || []; buildChannels();
+      document.getElementById("rec").classList.toggle("on", !!m.recording);
+      clearResults();
+    } else if (m.t === "data") {
+      if (m.env) pushData(m.env);
+    } else if (m.t === "load") {
+      if (m.warn != null) { warn = m.warn; danger = m.danger; positionZones(); }
+      if (m.ch) setLoad(m.ch);
+    } else if (m.t === "calib") {
+      setCalib(m);
+    } else if (m.t === "results") {
+      showResults(m);
+    } else if (m.t === "download") {
+      addDownload(m);
+    } else if (m.t === "status") {
+      document.getElementById("rec").classList.toggle("on", !!m.recording);
+      if (m.recording) clearResults();
+    }
+  };
+}
+function dot(on) {
+  document.getElementById("dot").className = "dot " + (on ? "on" : "off");
+  document.getElementById("cs").textContent = on ? t("connected") : t("reconnecting");
+}
+// ---- analysis results / downloads ----
+// A new recording or a new session: the last one's metrics and report go,
+// as they go from the server (bench of 12 Oct 2026, M10). A page that was
+// open kept them on screen, under the new recording.
+function clearResults() {
+  document.getElementById("results").style.display = "none";
+  document.getElementById("resMetrics").innerHTML = "";
+  const a = document.getElementById("dl_report");
+  if (a) a.remove();
+  document.getElementById("pdfHint").style.display = "";
+}
+function showResults(m) {
+  document.getElementById("results").style.display = "block";
+  const fat = m.fatigue < 0 ? t("fatDetected") : m.fatigue > 0 ? t("fatNotDetected") : t("fatUndetermined");
+  const fc = m.fatigue < 0 ? "var(--dang)" : m.fatigue > 0 ? "var(--ok)" : "#c9a227";
+  const items = [
+    [t("mFile"), m.file || "—"], [t("mMnf"), m.mnf + " Hz"],
+    [t("mMdf"), m.mdf + " Hz"],
+    // No slope and no verdict over a train of quick contractions: nothing held.
+    ...(m.mdf_slope == null ? [] : [[t("mSlope"), m.mdf_slope + " Hz/s"]]),
+    [t("mRms"), m.rms + " mV"], [t("mIemg"), m.iemg + " mV·s"],
+    [t("mDur"), m.duration + " s"],
+    ...(m.fatigue == null ? [] : [[t("mFat"), `<b style="color:${fc}">${fat}</b>`]]),
+  ];
+  // The gradation, step by step: the level held against the one asked.
+  // The fixed load held: how much MDF and RMS fell, and when.
+  if (m.load) {
+    const signo = (x) => x == null ? "—" : (x > 0 ? "+" : "") + x + " %";
+    items.push([t("mLoadMdf"), signo(m.load.mdf)]);
+    if (m.load.r2 != null) items.push([t("mLoadR2"), m.load.r2]);
+    items.push([t("mLoadRms"), signo(m.load.rms)],
+               [t("mLoadT10"), m.load.t10 == null ? t("mNever") : m.load.t10 + " s"]);
+    if (m.load.ratio != null) {
+      const debil = m.load.ratio < 2;
+      items.push([t("mLoadRatio"), (debil ? `<b style="color:var(--dang)">` : "") + "×" + m.load.ratio
+                  + (debil ? ` <small>(${t("mLoadWeak")})</small></b>` : "")]);
+    }
+  }
+  if (m.train) {
+    const tr_ = m.train;
+    items.push([t("mTrain"), `${tr_.n} · ${tr_.rate}/s`]);
+    if (tr_.peaks != null) items.push([t("mTrainPeaks"), (tr_.peaks > 0 ? "+" : "") + tr_.peaks + " %"]);
+    if (tr_.floor != null) items.push([t("mTrainFloor"), `${tr_.floor} % <small>(${t("mOfPeak")} ${tr_.proc} %)</small>`]);
+  }
+  for (const [pedido, mantenido] of (m.steps || [])) {
+    const nombre = pedido >= 100 ? t("mStepMax") : pedido + " %";
+    items.push([`${t("mStep")} ${nombre}`,
+                `${mantenido} ${UNIT} <small>(${t("mHeldOf")} ${pedido})</small>`]);
+  }
+  document.getElementById("resMetrics").innerHTML =
+    items.map(([k, v]) => `<div class="m"><span>${k}</span><b>${v}</b></div>`).join("");
+}
+function addDownload(m) {
+  // The report and nothing else: it is what a student takes home and
+  // reads. Any other kind is ignored, so a newer or older machine cannot
+  // put a file on the page that this one does not offer.
+  if (m.kind !== "report") return;
+  document.getElementById("results").style.display = "block";
+  let a = document.getElementById("dl_report");
+  if (!a) {
+    a = document.createElement("a"); a.id = "dl_report"; a.className = "dlbtn";
+    document.getElementById("resDl").appendChild(a);
+  }
+  document.getElementById("pdfHint").style.display = "none";
+  a.href = m.url + location.search; a.setAttribute("download", m.name || "");
+  a.textContent = t("dlReport");
+}
+
+applyStaticText();
+connect();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

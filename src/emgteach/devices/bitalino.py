@@ -1,0 +1,886 @@
+"""BITalino *(revolution)* acquisition backend over a Bluetooth virtual COM port.
+
+The BITalino *(revolution)* communicates over Bluetooth **Classic**
+(SPP / RFCOMM), not Bluetooth Low Energy. On Windows the paired device is
+exposed as an outgoing **virtual COM port**, so this backend speaks the
+BITalino wire protocol directly through :mod:`pyserial`. There is therefore
+
+* no dependency on PyBluez (whose C extension needs Microsoft C++ Build
+  Tools and is abandoned since 2020),
+* no dependency on the external ``bitalino`` package, and
+* no Bluetooth Low Energy stack (``bleak`` cannot reach a Classic device).
+
+``pyserial`` is already a hard dependency of the package (the Arduino
+backend uses it), it imports cleanly on every supported Python (3.10-3.14)
+and freezes without C-toolchain gymnastics, so the standalone executable
+keeps working across Windows updates.
+
+Addressing
+----------
+COM-port numbers vary per PC, which is awkward in a teaching lab. To keep
+configuration minimal and stable across machines, the constructor accepts
+three forms of address and :meth:`open` resolves them to a concrete port:
+
+* a **MAC address** (e.g. ``"98:D3:91:FE:44:E4"``) — the stable identifier
+  used historically. Windows exposes the paired device's MAC inside the COM
+  port's ``hwid``, so the MAC is resolved to whatever ``COMx`` the local PC
+  assigned. This is the recommended, same-on-every-PC form.
+* a **COM port** (e.g. ``"COM5"``) — used verbatim, as an explicit override.
+* **empty / ``"auto"``** — autodetect: probe the Bluetooth serial ports and
+  pick the first that answers the version handshake as a BITalino.
+* ``simulada`` / ``simulated`` — a BITalino in software
+  (:mod:`emgteach.devices.bitalino_sim`), to try the application without the
+  board: the same protocol, and no Bluetooth.
+
+No PyBluez is involved in any case: resolution only reads the COM-port list
+and the transport is always ``pyserial``.
+
+Wire protocol *(BITalino (revolution), live-acquisition mode)*
+--------------------------------------------------------------
+All commands are single bytes; the device must be idle to accept the
+sampling-rate, version and start commands. ``_send`` spaces consecutive
+command bytes by 100 ms, which the firmware requires.
+
+==========  =================================================  ==================
+Direction   Byte                                               Meaning
+==========  =================================================  ==================
+PC→BITalino ``0000 0111`` (``0x07``)                           Request version
+BITalino→PC ``"BITalino..._vX.Y\\n"``                          ASCII version string
+PC→BITalino ``<Fs:2> 0000 11``                                 Set sampling rate
+PC→BITalino ``A6 A5 A4 A3 A2 A1 0 1``                          Start live mode
+BITalino→PC ``N`` bytes per sample (CRC4 + digital + analog)   Acquisition frame
+PC→BITalino ``0000 0000`` (``0x00``)                           Stop → idle
+==========  =================================================  ==================
+
+The ``<Fs>`` field encodes 1000/100/10/1 Hz as ``3/2/1/0``. Each analog
+sample is packed into ``N`` bytes together with a 4-bit sequence number and
+four digital states. The frame has room for 10 bits in each of its first four
+analogue slots and 6 bits in the fifth and sixth, which only exist when five or
+six inputs are enabled. A 4-bit CRC closes every frame and is validated on
+read; a frame that fails it is skipped and the stream resynchronised (see
+:meth:`BitalinoDevice._read_frames`), and the sequence number counts the
+frames the link dropped (:attr:`BitalinoDevice.lost_frames`).
+
+Watchdog
+--------
+Because the per-frame serial read can block forever when the Bluetooth
+link is silently dropped mid-session, this class implements the watchdog
+protocol described in Agis-Torres (2026):
+
+1. :meth:`read` releases the connection lock **before** the blocking
+   serial read, so a second thread can acquire the lock and close the
+   underlying port.
+2. :meth:`force_close` closes the serial port from any thread; the
+   blocked :meth:`read` then unblocks immediately and raises.
+3. The GUI's ``QTimer`` polls a separate ``time_since_last_sample``
+   property (implemented in the worker thread, not here) and triggers
+   :meth:`force_close` when no samples have been produced for several
+   seconds.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import threading
+import time
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import numpy as np
+
+from emgteach.devices.base import AcquisitionDevice
+from emgteach.devices.bitalino_sim import (
+    SIMULATED_PORT,
+    SimulatedBitalinoPort,
+    is_simulated_address,
+)
+from emgteach.i18n import tr
+
+if TYPE_CHECKING:
+    import numpy.typing as npt
+
+    FloatArray = npt.NDArray[np.float64]
+
+
+class BitalinoDevice(AcquisitionDevice):
+    """Acquisition backend for BITalino *(revolution)* over a virtual COM port.
+
+    Parameters
+    ----------
+    port : str
+        Device address, resolved by :meth:`open` to a concrete COM port:
+        a **MAC address** (recommended, stable across PCs — resolved to the
+        local virtual COM port via its ``hwid``), an explicit **COM port**
+        (``"COM5"``, ``/dev/...``), or **empty/``"auto"``** to autodetect the
+        BITalino among the paired Bluetooth serial ports. The device must be
+        paired in the operating system's Bluetooth settings beforehand.
+    fs : int, optional
+        Sampling frequency in Hz (default 1000). Must be one of the rates
+        supported by the BITalino firmware: 1, 10, 100 or 1000.
+    channels : sequence of int, optional
+        Channel indices to record (default ``[0]``). The BITalino
+        revolution exposes 6 analogue channels indexed 0..5.
+    acc : bool, optional
+        When ``True``, additionally record the accelerometer (analogue A4,
+        index 3) as an extra channel appended after the EMG channels. A4 keeps
+        the 10-bit resolution of the EMG channels. It is decoded as normalised
+        (uncalibrated) acceleration in *g* rather than millivolts and is tagged
+        ``"ACC"`` in :meth:`channel_kinds`, so the worker stores it with its
+        own EDF unit and does not apply the EMG filter chain (default
+        ``False``). Intended for EMG on A1/A2 at most, so the set stays within
+        A1..A4.
+
+    Raises
+    ------
+    RuntimeError
+        From :meth:`open` if a MAC address is supplied instead of a COM
+        port, if a connection is already active, or if the device on the
+        port does not identify itself as a BITalino.
+
+    Examples
+    --------
+    >>> from emgteach.devices import BitalinoDevice
+    >>> device = BitalinoDevice("COM5")    # doctest: +SKIP
+    >>> device.open()                      # doctest: +SKIP
+    >>> samples_mv = device.read(1000)     # doctest: +SKIP
+    >>> device.close()                     # doctest: +SKIP
+    """
+
+    # ADC and analogue-front-end constants. The BITalino EMG channel is a
+    # 10-bit ADC on a 3.3 V supply reading the output of a differential
+    # amplifier of gain 1009, so the full ADC excursion corresponds to
+    # ±1.635 mV *referred to the electrodes* (see _raw_to_mv).
+    _ADC_MAX = 2**10 - 1  # 1023
+    _V_REF = 3.3
+    # Gain of the BITalino EMG front end (datasheet transfer function). The
+    # ADC never sees the biopotential itself, only this amplified copy of it.
+    _GAIN_EMG = 1009.0
+    # The accelerometer is wired to analogue channel A4 (index 3) so it shares
+    # the 10-bit resolution of the EMG channels (A1-A4 are 10-bit; A5-A6 would
+    # be 6-bit). With the EMG on A1/A2 at most, the recorded set stays within
+    # A1..A4 and every channel keeps full resolution. The ACC is not a
+    # biopotential, so it is converted and stored apart (see _raw_to_acc).
+    _ACC_CHANNEL = 3
+    _ADC_MAX_ACC = 2**10 - 1  # 1023 (10-bit, A4)
+
+    # Serial-link constants.
+    _BAUD = 115_200
+    _TIMEOUT_OPEN_S = 5.0  # max wait for the version reply on open
+    _TIMEOUT_READ_S = 5.0  # serial read timeout per chunk while streaming
+    _PROBE_TIMEOUT_S = 1.5  # max wait for the version reply while autodetecting
+    _CMD_GAP_S = 0.1  # spacing the firmware requires between command bytes
+    # Windows releases a Bluetooth SPP virtual COM port a little after close, so
+    # a reopen (after autodetect probing, or a quick reconnect) can transiently
+    # fail with WinError 1168. Retry the open a few times before giving up.
+    _OPEN_RETRIES = 4
+    _OPEN_RETRY_GAP_S = 0.4
+    # A write that the Bluetooth link does not take blocks forever without
+    # a timeout, and the command bytes of the opening are writes: bounded.
+    _TIMEOUT_WRITE_S = 2.0
+
+    # Sampling-rate byte encoding accepted by the firmware.
+    _SRATE_CODE: ClassVar[dict[int, int]] = {1000: 3, 100: 2, 10: 1, 1: 0}
+
+    # MAC address (rejected): 6 hex pairs separated by ':' or '-'.
+    _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
+
+    def __init__(
+        self,
+        port: str,
+        fs: int = 1000,
+        channels: list[int] | None = None,
+        acc: bool = False,
+        acc_channel: int | None = None,
+    ) -> None:
+        self._port = str(port)
+        self._fs = int(fs)
+        emg = list(channels) if channels is not None else [0]
+        self._acc = bool(acc)
+        # Which analogue input the accelerometer is actually wired to. The
+        # BITalino packs the *enabled* channels consecutively in the frame, so
+        # this must be the physical channel; it defaults to A4 but is
+        # configurable because different sensors/boards land on different
+        # inputs (found with the channel diagnostic).
+        self._acc_channel = (
+            self._ACC_CHANNEL if acc_channel is None else int(acc_channel)
+        )
+        # The wire packs the *enabled* inputs in ascending order (``decode``),
+        # so the frame is always decoded ascending. But the rest of the app
+        # relies on "the accelerometer is the trailing column", so the exposed
+        # order is EMG channels first (as given) and the ACC last — whatever
+        # physical input each is on. ``_expose`` maps exposed position → column
+        # in the ascending-decoded frame.
+        emg_only = [c for c in emg if not (acc and c == self._acc_channel)]
+        if acc:
+            decode = sorted(set(emg) | {self._acc_channel})
+            expose = [*emg_only, self._acc_channel]
+        else:
+            decode = list(emg)
+            expose = list(emg)
+        self._decode_channels = decode
+        self._expose = [decode.index(c) for c in expose]
+        self._kinds = [
+            "ACC" if (acc and c == self._acc_channel) else "EMG" for c in expose
+        ]
+        # Public channel list = what read() returns, in exposed order.
+        self._channels = list(expose)
+        self._serial = None  # type: ignore[var-annotated]
+        #: The port while open() is still talking to it; see force_close.
+        self._opening_serial = None
+        #: Set by force_close: whatever open() is doing, it gives up as soon
+        #: as it can, closing what it has opened.
+        self._abandonar = False
+        self._resolved_port: str | None = None
+        self._firmware = ""
+        self._conn_lock = threading.Lock()
+        # Link accounting, from the 4-bit sequence number every frame carries
+        # and from the CRC. Reset when streaming starts.
+        self._lost_frames = 0
+        self._crc_errors = 0
+        self._last_seq: int | None = None
+        self._pending = bytearray()
+
+    @property
+    def _n_decode(self) -> int:
+        """Number of channels actually enabled/decoded from the wire."""
+        return len(self._decode_channels)
+
+    # -- AcquisitionDevice properties ----------------------------------------
+
+    @property
+    def fs(self) -> float:
+        return float(self._fs)
+
+    @property
+    def name(self) -> str:
+        if self.is_simulated:
+            return "BITalino (simulated)"
+        if self._resolved_port and self._resolved_port != self._port.strip():
+            label = self._port.strip() or "auto"
+            return f"BITalino ({label} -> {self._resolved_port})"
+        if self._port.strip():
+            return f"BITalino ({self._port})"
+        return "BITalino (auto)"
+
+    @property
+    def n_channels(self) -> int:
+        return len(self._channels)
+
+    @property
+    def is_simulated(self) -> bool:
+        """Whether the address selects the BITalino in software."""
+        return is_simulated_address(self._port)
+
+    @property
+    def firmware_version(self) -> str:
+        """The version string the board answered on the last open, or ``""``."""
+        return self._firmware
+
+    @property
+    def lost_frames(self) -> int:
+        """Frames the link dropped since streaming started.
+
+        Counted from the 4-bit sequence number in every frame: a jump of k
+        codes is k lost frames. The counter wraps every 16 frames, so a gap
+        of exactly 16 (or 32, ...) is invisible and a long dropout is
+        under-counted by a multiple of 16. What it reliably says is whether
+        the link is losing anything at all.
+        """
+        return self._lost_frames
+
+    @property
+    def crc_errors(self) -> int:
+        """Bytes discarded while resynchronising after a corrupted frame."""
+        return self._crc_errors
+
+    @classmethod
+    def full_scale_mv(cls, sensor_gain: float | None = None) -> float:
+        # ±1.635 mV referred to the electrodes (see _raw_to_mv). This goes
+        # into the EDF header, so it has to be the same scale as the samples.
+        return cls._V_REF / 2.0 * 1000.0 / (sensor_gain or cls._GAIN_EMG)
+
+    # -- per-channel metadata (EMG in mV, ACC in normalised g) ---------------
+
+    def channel_kinds(self) -> list[str]:
+        return list(self._kinds)
+
+    def channel_units(self) -> list[str]:
+        return ["g" if k == "ACC" else "mV" for k in self._kinds]
+
+    def channel_physical_ranges(self) -> list[tuple[float, float]]:
+        # ACC is decoded as normalised (uncalibrated) acceleration in [-1, 1] g.
+        return [
+            (-1.0, 1.0) if k == "ACC" else (self.physical_min, self.physical_max)
+            for k in self._kinds
+        ]
+
+    @property
+    def is_connected(self) -> bool:
+        """``True`` while the underlying serial port is open."""
+        with self._conn_lock:
+            return self._serial is not None
+
+    # -- AcquisitionDevice interface -----------------------------------------
+
+    def instruct(self, channel_index: int, level: float | None,
+                 *, repeat_s: float | None = None) -> None:
+        """Pass the instruction to the simulated board; a real one ignores it.
+
+        The board cannot be told what the person attached to it should do.
+        The simulated one can, and has to be: its subject repeats a fixed
+        cycle, so a calibration span that fell on the quiet half of that
+        cycle measured a maximum that was not one, and the task then read
+        above 100 % of it.
+        """
+        if not self.is_simulated:
+            return
+        with self._conn_lock:
+            ser = self._serial
+        if ser is not None:
+            ser.instruct(channel_index, level, repeat_s=repeat_s)
+
+    def open(self) -> None:
+        """Open the virtual COM port and start streaming.
+
+        Raises
+        ------
+        RuntimeError
+            If a connection is already active, if the sampling rate or channel
+            list is invalid, if the address cannot be resolved to a COM port
+            (MAC not paired / no BITalino autodetected), or if the device on
+            the resolved port does not identify itself as a BITalino.
+        """
+        import serial  # lazy — keeps import time low when device is not used
+
+        self._abandonar = False
+        self._validate_config()
+        resolved = self._resolve_port()  # MAC -> COM, autodetect, or direct COM
+
+        with self._conn_lock:
+            if self._serial is not None:
+                raise RuntimeError(
+                    tr(
+                        "A BITalino connection is already active. "
+                        "Close it before opening another."
+                    )
+                )
+            ser = self._open_serial(serial, resolved)
+            # Visible to force_close while the opening talks to it, so a
+            # handshake that hangs can be released from another thread.
+            self._opening_serial = ser
+            try:
+                # Given up on while Windows was still opening the port
+                # (force_close could not reach it: it did not exist yet).
+                self._comprobar_abandono()
+                # Confirm we are actually talking to a BITalino before
+                # streaming, so a wrong COM port fails fast and clearly.
+                version = self._read_version(ser)
+                if "BITalino" not in version:
+                    raise RuntimeError(
+                        tr(
+                            "The device on {port} did not identify itself as a "
+                            "BITalino. Check that the BITalino is paired and "
+                            "switched on."
+                        ).format(port=resolved)
+                    )
+                self._firmware = version
+                self._set_sampling_rate(ser)
+                self._comprobar_abandono()
+                self._start_streaming(ser)
+            except Exception:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                raise
+            finally:
+                self._opening_serial = None
+            ser.timeout = self._TIMEOUT_READ_S
+            self._resolved_port = resolved
+            self._serial = ser
+
+    def read(self, n_samples: int) -> FloatArray:
+        """Read *n_samples* and return the active channels as float64 mV.
+
+        Returns shape ``(n_samples, n_channels)``. The analogue channels
+        are returned in the order given to the constructor.
+
+        The connection lock is released **before** the blocking serial
+        read, allowing :meth:`force_close` to release a stuck read from
+        another thread without dead-locking.
+        """
+        with self._conn_lock:
+            ser = self._serial
+        if ser is None:
+            raise RuntimeError(tr("The BITalino device is not open."))
+
+        adc = self._read_frames(ser, int(n_samples))  # blocking; no lock
+        return self._adc_to_physical(adc)
+
+    def read_raw(self, n_samples: int) -> FloatArray:
+        """Read *n_samples* and return the **raw ADC** value of every decoded
+        channel (no mV/g conversion), shape ``(n_samples, n_decode)``.
+
+        Used by the channel-diagnostic tool to see which analogue input carries
+        the accelerometer, independent of any per-channel scaling.
+        """
+        with self._conn_lock:
+            ser = self._serial
+        if ser is None:
+            raise RuntimeError(tr("The BITalino device is not open."))
+        return self._read_frames(ser, int(n_samples))  # blocking; no lock
+
+    def _adc_to_physical(self, adc: FloatArray | np.ndarray) -> FloatArray:
+        """Select the exposed columns from the decoded frame and convert each to
+        its physical unit (mV for EMG, normalised g for ACC).
+
+        ``adc`` has one column per *decoded* channel (A1..A5 when the ACC is on);
+        only the positions in ``self._expose`` are returned, in exposed order.
+        Each column is scaled by the resolution of the frame slot it came in
+        (see :meth:`adc_max_for_slot`).
+        """
+        arr = np.asarray(adc, dtype=np.float64)
+        out = np.empty((arr.shape[0], len(self._expose)), dtype=np.float64)
+        for i, (pos, kind) in enumerate(zip(self._expose, self._kinds, strict=True)):
+            col = arr[:, pos]
+            top = self.adc_max_for_slot(pos)
+            out[:, i] = (self._raw_to_acc(col, top) if kind == "ACC"
+                         else self._raw_to_mv(col, top))
+        return out
+
+    def close(self) -> None:
+        """Stop streaming and close the COM port.
+
+        Safe to call when already closed (no-op).
+        """
+        with self._conn_lock:
+            ser = self._serial
+            if ser is None:
+                return
+            try:
+                if ser.is_open:
+                    self._send(ser, 0x00)  # stop → idle
+            except Exception:
+                pass
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                self._serial = None
+
+    def force_close(self) -> None:
+        """Close the COM port from any thread, **without ever waiting**.
+
+        Used by the watchdog described in this module's docstring, and by the
+        acquisition tab when the board has not answered in 20 s — which is to
+        say from the interface's own thread. It used to take the connection
+        lock, and :meth:`open` holds that lock for the whole opening, including
+        the ``CreateFile`` that Windows can keep for most of a minute on a
+        Bluetooth port whose board is off: on the bench the window froze for
+        52 s, the 20-second warning came out together with the port's own
+        error, and a click on «Stop» waited in the queue.
+
+        So it never blocks. It marks the opening as given up — :meth:`open`
+        checks the mark as soon as it has a port and closes it —, closes a
+        port that is already in its handshake, and closes the streaming port
+        only if the lock is free, which it is whenever a read is blocked.
+        """
+        self._abandonar = True
+        abriendo = self._opening_serial
+        if abriendo is not None:
+            try:
+                abriendo.close()
+            except Exception:
+                pass
+        if not self._conn_lock.acquire(blocking=False):
+            return                      # open() has it; the mark reaches it
+        try:
+            ser = self._serial
+            if ser is None:
+                return
+            try:
+                ser.close()
+            except Exception:
+                pass
+            self._serial = None
+        finally:
+            self._conn_lock.release()
+
+    def _comprobar_abandono(self) -> None:
+        """Stop the opening here if force_close gave it up meanwhile."""
+        if self._abandonar:
+            raise RuntimeError(tr(
+                "The connection attempt was given up before the board answered."))
+
+    # -- protocol helpers ----------------------------------------------------
+
+    def _resolve_port(self) -> str:
+        """Resolve the configured address to a concrete serial port.
+
+        A MAC address is mapped to the local COM port whose ``hwid`` carries
+        that MAC; an explicit ``COMx`` / ``/dev/...`` is used verbatim; an
+        empty address (or ``"auto"``) triggers autodetection by handshake.
+        Never imports PyBluez — only reads the COM-port list.
+        """
+        addr = self._port.strip()
+        if is_simulated_address(addr):
+            return SIMULATED_PORT  # the BITalino in software: no COM port at all
+        if addr and not self._MAC_RE.match(addr) and addr.lower() != "auto":
+            return addr  # explicit serial port
+
+        from serial.tools import list_ports
+
+        ports = list(list_ports.comports())
+        if self._MAC_RE.match(addr):
+            wanted = self._norm_hex(addr)
+            for p in ports:
+                if wanted in self._norm_hex(p.hwid or ""):
+                    return p.device
+            raise RuntimeError(
+                tr(
+                    "BITalino {mac} was not found among the paired Bluetooth COM "
+                    "ports. Pair it in the operating system's Bluetooth settings "
+                    "and switch it on."
+                ).format(mac=addr)
+            )
+        return self._autodetect(ports)
+
+    def _autodetect(self, ports: list) -> str:
+        """Probe the Bluetooth serial ports and return the first BITalino."""
+        for p in self._bluetooth_ports(ports):
+            if self._probe(p):
+                return p
+        raise RuntimeError(
+            tr(
+                "No BITalino was found on the Bluetooth COM ports. Pair the "
+                "BITalino in the operating system's Bluetooth settings and switch "
+                "it on, or enter its MAC address or COM port explicitly."
+            )
+        )
+
+    @classmethod
+    def _bluetooth_ports(cls, ports: list) -> list[str]:
+        """Candidate outgoing Bluetooth serial ports, in enumeration order.
+
+        Keeps ports that look like a Bluetooth serial link and drops the
+        "incoming" port whose ``hwid`` carries the all-zero address, which
+        never answers a handshake.
+        """
+        out: list[str] = []
+        for p in ports:
+            hwid = (p.hwid or "").upper()
+            desc = (p.description or "").lower()
+            is_bt = "BTHENUM" in hwid or "bluetooth" in desc
+            if is_bt and "000000000000" not in cls._norm_hex(hwid):
+                out.append(p.device)
+        return out
+
+    def _probe(self, port: str) -> bool:
+        """Open *port* briefly and return ``True`` if it answers as a BITalino."""
+        import serial
+
+        try:
+            ser = serial.Serial(
+                port=port, baudrate=self._BAUD, timeout=self._PROBE_TIMEOUT_S
+            )
+        except Exception:
+            return False
+        try:
+            return "BITalino" in self._read_version(ser, timeout_s=self._PROBE_TIMEOUT_S)
+        except Exception:
+            return False
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _norm_hex(s: str) -> str:
+        """Uppercase a string and strip ``:`` / ``-`` so MACs compare cleanly."""
+        return s.upper().replace(":", "").replace("-", "")
+
+    def _open_serial(self, serial_mod: Any, port: str) -> Any:
+        """Open *port*, retrying briefly to ride over Bluetooth SPP release lag."""
+        if port == SIMULATED_PORT:
+            return SimulatedBitalinoPort(
+                acc_channel=self._acc_channel if self._acc else None,
+                timeout=self._TIMEOUT_OPEN_S,
+            )
+        last_exc: Exception | None = None
+        for attempt in range(self._OPEN_RETRIES):
+            try:
+                return serial_mod.Serial(
+                    port=port, baudrate=self._BAUD, timeout=self._TIMEOUT_OPEN_S,
+                    write_timeout=self._TIMEOUT_WRITE_S,
+                )
+            except Exception as exc:  # pyserial: SerialException — retry transient lock
+                last_exc = exc
+                if attempt < self._OPEN_RETRIES - 1:
+                    time.sleep(self._OPEN_RETRY_GAP_S)
+        raise RuntimeError(
+            tr(
+                "Could not open the BITalino port {port}: {err}. If the port is "
+                "busy or access is denied, switch the BITalino off and on to reset "
+                "the Bluetooth link, then retry."
+            ).format(port=port, err=last_exc)
+        )
+
+    def _validate_config(self) -> None:
+        """Validate sampling rate and channel list before opening the port."""
+        if self._fs not in self._SRATE_CODE:
+            raise RuntimeError(
+                tr(
+                    "Unsupported BITalino sampling rate {fs} Hz. "
+                    "Use one of 1, 10, 100 or 1000."
+                ).format(fs=self._fs)
+            )
+        if not self._decode_channels or any(
+            c not in range(6) for c in self._decode_channels
+        ):
+            raise RuntimeError(
+                tr("Invalid BITalino channel list; channels must be in 0..5.")
+            )
+
+    def _send(self, ser: object, byte: int) -> None:
+        """Send a single command byte, spaced as the firmware requires."""
+        time.sleep(self._CMD_GAP_S)
+        ser.write(bytes([byte]))  # type: ignore[attr-defined]
+
+    def _read_version(self, ser: object, timeout_s: float | None = None) -> str:
+        """Request and return the firmware version string."""
+        self._send(ser, 0x07)
+        chars: list[str] = []
+        deadline = time.monotonic() + (timeout_s or self._TIMEOUT_OPEN_S)
+        while time.monotonic() < deadline:
+            chunk = ser.read(1)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            chars.append(chunk.decode("ascii", errors="ignore"))
+            text = "".join(chars)
+            if text.endswith("\n") and "BITalino" in text:
+                return text[text.index("BITalino") : -1]
+        return "".join(chars)
+
+    def _set_sampling_rate(self, ser: object) -> None:
+        """Send the set-sampling-rate command for ``self._fs``."""
+        code = self._SRATE_CODE[self._fs]
+        self._send(ser, (code << 6) | 0x03)
+
+    def _start_streaming(self, ser: object) -> None:
+        """Send the live-acquisition start command for the active channels."""
+        self._lost_frames = 0
+        self._crc_errors = 0
+        self._last_seq = None
+        self._pending = bytearray()
+        command = 0x01  # low two bits: 01 = live mode
+        for ch in self._decode_channels:
+            command |= 1 << (2 + ch)
+        self._send(ser, command)
+
+    def _frame_size(self) -> int:
+        """Bytes per acquisition frame for the active channel count."""
+        n = self._n_decode
+        if n <= 4:
+            return math.ceil((12.0 + 10.0 * n) / 8.0)
+        return math.ceil((52.0 + 6.0 * (n - 4)) / 8.0)
+
+    def _receive_exact(self, ser: object, nbytes: int) -> bytes:
+        """Read exactly *nbytes* from the port or raise on timeout/closure."""
+        buf = bytearray()
+        while len(buf) < nbytes:
+            chunk = ser.read(nbytes - len(buf))  # type: ignore[attr-defined]
+            if not chunk:
+                raise RuntimeError(
+                    tr("Timeout while reading from the BITalino — connection lost.")
+                )
+            buf.extend(chunk)
+        return bytes(buf)
+
+    #: Bytes of unframed data tolerated while looking for the next frame
+    #: whose CRC validates, before the link is declared lost. About 80
+    #: single-channel frames: far more than a glitch, far less than a
+    #: session.
+    _MAX_RESYNC_BYTES = 256
+
+    def _read_frames(self, ser: object, n_samples: int) -> FloatArray:
+        """Read and decode *n_samples* frames into ``(n_samples, n_channels)``
+        ADC codes, resynchronising after a corrupted frame.
+
+        A single bad CRC used to abort the whole acquisition as "connection
+        lost". On a Bluetooth SPP link one corrupted byte in a session is
+        normal, and the abort cost the student the recording. The stream is
+        now scanned forward one byte at a time until a frame validates: every
+        byte discarded counts as a CRC error, every jump in the sequence
+        number as lost frames (see :attr:`lost_frames`), and only
+        :data:`_MAX_RESYNC_BYTES` in a row without a valid frame give the
+        link up.
+
+        A misaligned window validates by chance one time in sixteen, and the
+        sample it would yield is garbage — up to full scale, which is what
+        the MVC calibration looks for, since it takes the maximum. So after
+        discarding, a frame that validates is only a candidate: it is
+        accepted when the frame after it also validates and carries the next
+        sequence number, and otherwise the scan goes on. Two chance
+        validations in a row with consecutive numbers happen about one time
+        in 4096: one in 16 for each CRC, and one in 16 for the number.
+        """
+        n_ch = self._n_decode
+        frame_bytes = self._frame_size()
+        out = np.empty((n_samples, n_ch), dtype=np.float64)
+        buf = self._pending
+        s = 0
+        skipped = 0
+        while s < n_samples:
+            if len(buf) < frame_bytes:
+                buf.extend(self._receive_exact(ser, frame_bytes - len(buf)))
+            frame = list(buf[:frame_bytes])
+            ok = self._crc_ok(frame)
+            if ok and skipped:
+                # Resynchronising: confirm the candidate with the frame after it.
+                if len(buf) < 2 * frame_bytes:
+                    buf.extend(self._receive_exact(ser, 2 * frame_bytes - len(buf)))
+                after = list(buf[frame_bytes:2 * frame_bytes])
+                ok = (self._crc_ok(after)
+                      and after[-1] >> 4 == ((frame[-1] >> 4) + 1) & 0x0F)
+            if not ok:
+                del buf[0]
+                self._crc_errors += 1
+                skipped += 1
+                if skipped > self._MAX_RESYNC_BYTES:
+                    raise RuntimeError(
+                        tr("Corrupted BITalino frames (CRC mismatch) — connection lost.")
+                    )
+                continue
+            del buf[:frame_bytes]
+            skipped = 0
+            # _crc_ok has cleared the CRC nibble; the high nibble is the
+            # frame's sequence number.
+            self._count_sequence(frame[-1] >> 4)
+            for ch in range(n_ch):
+                out[s, ch] = self._extract_channel(frame, ch)
+            s += 1
+        return out
+
+    def _count_sequence(self, seq: int) -> None:
+        """Advance the sequence check and count the frames a jump skipped."""
+        if self._last_seq is not None:
+            expected = (self._last_seq + 1) & 0x0F
+            if seq != expected:
+                self._lost_frames += (seq - expected) & 0x0F
+        self._last_seq = seq
+
+    @staticmethod
+    def _crc_ok(frame: list[int]) -> bool:
+        """Validate the trailing 4-bit CRC of a decoded frame in place."""
+        crc = frame[-1] & 0x0F
+        frame[-1] = frame[-1] & 0xF0
+        x = 0
+        for byte in frame:
+            for bit in range(7, -1, -1):
+                x = x << 1
+                if x & 0x10:
+                    x = x ^ 0x03
+                x = x ^ ((byte >> bit) & 0x01)
+        return crc == (x & 0x0F)
+
+    @staticmethod
+    def _extract_channel(frame: list[int], ch: int) -> int:
+        """Extract the analogue value in frame slot *ch* (0-based among the
+        enabled inputs): 10 bits in slots 0-3, 6 bits in slots 4-5.
+
+        ``frame`` must already have its CRC nibble cleared (see
+        :meth:`_crc_ok`). The bit packing follows the BITalino frame layout,
+        where analogue channels occupy the trailing bytes.
+        """
+        if ch == 0:
+            return ((frame[-2] & 0x0F) << 6) | (frame[-3] >> 2)
+        if ch == 1:
+            return ((frame[-3] & 0x03) << 8) | frame[-4]
+        if ch == 2:
+            return (frame[-5] << 2) | (frame[-6] >> 6)
+        if ch == 3:
+            return ((frame[-6] & 0x3F) << 4) | (frame[-7] >> 4)
+        if ch == 4:
+            return ((frame[-7] & 0x0F) << 2) | (frame[-8] >> 6)
+        return frame[-8] & 0x3F
+
+    # -- ADC ↔ mV conversion -------------------------------------------------
+
+    @classmethod
+    def adc_max_for_slot(cls, slot: int) -> int:
+        """Full-scale ADC code of frame slot *slot* (0-based among the enabled
+        inputs, in ascending order).
+
+        The frame has 10 bits for each of its first four analogue slots and 6
+        bits for the fifth and sixth (see :meth:`_frame_size`), so the
+        resolution follows the slot, not the physical input: A5 recorded with
+        one other input travels in the second slot, at 10 bits. The 6-bit
+        slots only exist with five or six inputs enabled; scaling their codes
+        against the 10-bit full scale would under-read them by a factor of 16.
+        PLUX's documentation places the 6 bits on two of the six inputs when
+        all are used at once ("4 in (10-bit) + 2 in (6-bit)", core datasheet,
+        https://support.pluxbiosignals.com/wp-content/uploads/2021/11/bitalino-core-datasheet.pdf;
+        support page "How many channels does BITalino (r)evolution have?",
+        https://support.pluxbiosignals.com/knowledge-base/how-many-channels-does-bitalino-have/).
+        That those two are the fifth and sixth frame slots, which exist only
+        with more than four inputs enabled, is a reading of the frame format,
+        not a statement of PLUX's. The application never enables more than
+        three.
+
+        ecgteach decides by the physical input instead (``adc_max_for``); here
+        that would read an accelerometer on A5 or A6, next to one EMG input,
+        16 times too large.
+        """
+        return (2**6 - 1) if int(slot) >= 4 else cls._ADC_MAX
+
+    @classmethod
+    def _raw_to_mv(cls, raw_adc: FloatArray | np.ndarray,
+                   adc_max: int | None = None) -> FloatArray:
+        """Convert 10-bit BITalino ADC values to millivolts at the electrodes.
+
+        The datasheet transfer function, with the volts-to-millivolts factor
+        folded in::
+
+            EMG(mV) = (ADC / 2**n - 0.5) * VCC * 1000 / G
+
+        where ``n`` = 10 bits (6 in the fifth and sixth frame slots, passed as
+        *adc_max*), ``VCC`` = 3.3 V and ``G`` = 1009. Dividing by
+        the gain is what makes the result a biopotential: the ADC reads the
+        amplifier's output, not the signal at the skin.
+
+        Full excursion is therefore ±1.635 mV, not the ±1.65 mV this returned
+        while the gain was treated as unity. The two are within 0.9 % of each
+        other by coincidence — the gain is close to 1000 and a volt is 1000 mV
+        — which is why the amplitudes looked plausible.
+        """
+        top = cls._ADC_MAX if adc_max is None else adc_max
+        normalised = (np.asarray(raw_adc, dtype=np.float64) / top) - 0.5
+        return normalised * cls._V_REF * 1000.0 / cls._GAIN_EMG
+
+    @staticmethod
+    def raw_to_mv(raw_adc: FloatArray | np.ndarray) -> FloatArray:
+        """Public alias of the internal ADC to mV conversion."""
+        return BitalinoDevice._raw_to_mv(raw_adc)
+
+    @classmethod
+    def _raw_to_acc(cls, raw_adc: FloatArray | np.ndarray,
+                    adc_max: int | None = None) -> FloatArray:
+        """Convert 10-bit BITalino ACC values (A4) to normalised acceleration (g).
+
+        The accelerometer sample (A4, 0..1023) is mapped linearly onto the
+        ``[-1, 1]`` g full-scale. This is **uncalibrated**: without the
+        per-device ``Cmin``/``Cmax`` reference it captures the shape, timing
+        and relative amplitude of the acceleration — enough for movement
+        segmentation, artefact monitoring and tremor-frequency demonstrations
+        — but not absolute g. A per-axis calibration step can refine it later.
+        In a 6-bit frame slot the full scale is *adc_max* (63) instead.
+        """
+        top = cls._ADC_MAX_ACC if adc_max is None else adc_max
+        return (np.asarray(raw_adc, dtype=np.float64) / top) * 2.0 - 1.0
+
+    @staticmethod
+    def raw_to_acc(raw_adc: FloatArray | np.ndarray) -> FloatArray:
+        """Public alias of the internal ADC to acceleration conversion."""
+        return BitalinoDevice._raw_to_acc(raw_adc)

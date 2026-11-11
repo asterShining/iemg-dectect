@@ -1,0 +1,92 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+wheels/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- PyInstaller ---
+*.spec.bak
+*.exe
+packaging/build.log
+*_selftest.log
+
+# --- EDF recordings — never versioned ---
+*.edf
+*.bdf
+# The one exception, and it is deliberate: the recording the report for the
+# Sourcebook article is written from. A paper that describes what the
+# software measures has to ship the file it measured, or the numbers cannot
+# be checked. It is one recording of 140 s, 611 kB.
+!docs/informe-sourcebook/*.edf
+
+# --- Local data files ---
+data/
+local/
+salida/
+output/
+*.csv
+# Igual que el EDF: la exportación CSV que el informe cita como adjunto, y su
+# equivalente en inglés, que es material suplementario del artículo.
+!docs/informe-sourcebook/*.csv
+!docs/articulo-advances/*.csv
+*.npy
+*.npz
+!tests/**/*.npy
+!tests/**/*.npz
+
+# --- Documentation builds ---
+site/
+docs/_build/
+# generated PDFs (artifacts); the .md files are the versioned source
+docs/*.pdf
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- Secrets / personal config ---
+.env
+.env.*
+!.env.example
+secrets.toml
+
+# Scratch copy of a discarded implementation (August 2026). Kept on disk as a
+# reference and deliberately out of the repository: its code is dead and its
+# own document claims a testing it never had.
+emgteach_work/

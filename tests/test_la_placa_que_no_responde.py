@@ -1,0 +1,419 @@
+"""A board that does not answer is said to not answer.
+
+On the bench, after changing practical inside one run of the application,
+the connection hung without a word: the log stopped at «Connecting to
+BITalino…», the status line said «recording…» over empty plots and, once
+stopped, «connected (ready to record)», and no file was written. A student
+believes the status line.
+
+- Until the first block the status says it is connecting, and after
+  ``CONEXION_MAX_S`` with nothing it stops, says the board did not answer,
+  and offers to try again.
+- A stop asked for while the board is being reached survives the opening:
+  the thread used to set itself back to running once the device answered,
+  and a recording stopped at the bench would have started later, holding
+  the port.
+- A handshake that hangs half-way can be released from another thread, and
+  no write of the opening waits forever.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from emgteach.devices import AcquisitionDevice
+from emgteach.i18n import tr
+from emgteach.workers.acquisition import AcquisitionWorker
+
+
+class _Colgada(AcquisitionDevice):
+    """A board whose opening does not return until the test says so."""
+
+    def __init__(self) -> None:
+        self.soltar = threading.Event()
+        self.abierta = False
+        self.lecturas = 0
+
+    @property
+    def fs(self) -> float:
+        return 1000.0
+
+    @property
+    def name(self) -> str:
+        return "Colgada"
+
+    @property
+    def n_channels(self) -> int:
+        return 1
+
+    def open(self) -> None:
+        self.soltar.wait(10.0)
+        self.abierta = True
+
+    def read(self, n_samples: int) -> np.ndarray:
+        self.lecturas += 1
+        time.sleep(0.01)
+        return np.zeros((int(n_samples), 1))
+
+    def close(self) -> None:
+        self.abierta = False
+
+    def force_close(self) -> None:
+        self.abierta = False
+
+
+def _hasta(condicion, segundos: float) -> bool:
+    app = QApplication.instance()
+    fin = time.monotonic() + segundos
+    while time.monotonic() < fin:
+        app.processEvents()
+        if condicion():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _esperar(condicion, que: str, segundos: float = 30.0) -> None:
+    """Wait for *condicion*; if it never comes, say which one it was."""
+    t0 = time.monotonic()
+    if not _hasta(condicion, segundos):
+        raise AssertionError(
+            f"waited {time.monotonic() - t0:.1f} s for {que}, and it did not come")
+
+
+@pytest.mark.gui
+class TestAStopWhileOpeningSurvivesTheOpening:
+    def test_the_thread_ends_without_recording(self, qapp, tmp_path: Path) -> None:
+        placa = _Colgada()
+        worker = AcquisitionWorker(device=placa, save_path=str(tmp_path / "x.edf"))
+        datos, fin = [], []
+        worker.data_ready.connect(datos.append)
+        worker.finished_ok.connect(fin.append)
+        worker.start()
+        assert _hasta(worker.is_opening, 2.0)
+        worker.stop()
+        placa.soltar.set()                       # the board answers, late
+        assert worker.wait(5000)
+        assert _hasta(lambda: bool(fin), 2.0)
+        assert fin == [""]
+        assert datos == [] and placa.lecturas == 0
+        assert not placa.abierta, "the port is released, not kept"
+        assert not (tmp_path / "x.edf").exists()
+
+
+@pytest.fixture
+def pestana(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The acquisition tab with a board that hangs on opening."""
+    from emgteach.gui.tabs import acquisition as acq_mod
+    from emgteach.gui.tabs.acquisition import AcquisitionTab
+    from emgteach.gui.widgets.logger import LoggerWidget
+
+    settings = QSettings("emgteach-test", "placa-que-no-responde")
+    settings.clear()
+    settings.setValue("app/mode", "single")
+    settings.setValue("adquisicion/device_type", 0)
+    settings.setValue("adquisicion/save_dir", str(tmp_path))
+    placa = _Colgada()
+    monkeypatch.setattr(acq_mod, "create_device", lambda *a, **k: placa)
+    monkeypatch.setattr(acq_mod.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "a.edf"), "")))
+    tab = AcquisitionTab(LoggerWidget(), settings)
+    tab.apply_mode("single", False)
+    tab._conexion._conexion_timer.setInterval(300)
+    tab.placa = placa
+    tab.connect_to("98:D3:91:FE:44:E4")
+    yield tab
+    placa.soltar.set()
+    if tab._conexion._aviso_conexion is not None:
+        tab._conexion._aviso_conexion.close()
+    tab.cleanup()
+    if tab._worker is not None:
+        tab._worker.wait(5000)
+
+
+def _grabar(tab) -> None:
+    tab._btn_grabar.setChecked(True)
+    tab._toggle_grabacion()
+
+
+@pytest.mark.gui
+class TestTheTabSaysWhatIsHappening:
+    def test_it_says_connecting_until_the_first_block(self, qapp, pestana) -> None:
+        from emgteach.gui.acquisition.connection import CONEXION_MAX_S
+
+        # The fixture's 300 ms limit is for the test of the limit, below. Here
+        # the board answers, and on a slow runner the lines written to the
+        # event log before the first block (each one synced to disk since
+        # 3.8.0) took longer than that once (Windows, Python 3.10, 11 Oct
+        # 2026): the limit fired first. The application waits CONEXION_MAX_S.
+        pestana._conexion._conexion_timer.setInterval(int(CONEXION_MAX_S * 1000))
+        _grabar(pestana)
+        assert pestana._lbl_estado.text() == tr("Status: connecting to the board…")
+        pestana.placa.soltar.set()
+        assert _hasta(lambda: pestana._lbl_estado.text() == tr("Status: recording…"), 5.0)
+
+    def test_after_the_limit_it_stops_and_says_the_board_did_not_answer(
+        self, qapp, pestana
+    ) -> None:
+        _grabar(pestana)
+        assert _hasta(lambda: pestana._conexion._aviso_conexion is not None, 3.0)
+        assert pestana._lbl_estado.text() == tr("Status: the board did not answer")
+        assert not pestana._btn_grabar.isChecked()
+        assert pestana._btn_grabar.text() == tr("Start recording")
+        assert "20" in tr(
+            "No data arrived from the board in {s:.0f} s, so nothing is being "
+            "recorded. Check that the BITalino is switched on, switch it off "
+            "and on again, and try again. If it happens again, close emgteach "
+            "and open it again.").format(s=20.0)
+
+    def test_a_stop_before_the_first_block_does_not_say_connected(
+        self, qapp, pestana
+    ) -> None:
+        _grabar(pestana)
+        pestana._btn_grabar.setChecked(False)
+        pestana._toggle_grabacion()
+        assert pestana._lbl_estado.text() == tr("Status: the board did not answer")
+        pestana.placa.soltar.set()
+        assert _hasta(lambda: not pestana.is_recording(), 5.0)
+        QApplication.instance().processEvents()
+        assert pestana._lbl_estado.text() == tr("Status: the board did not answer")
+
+
+class TestTheOpeningCanBeReleased:
+    def test_force_close_closes_a_port_still_in_its_handshake(self) -> None:
+        from emgteach.devices.bitalino import BitalinoDevice
+
+        class _Puerto:
+            cerrado = False
+
+            def close(self) -> None:
+                self.cerrado = True
+
+        dev = BitalinoDevice(port="COM9")
+        puerto = _Puerto()
+        dev._opening_serial = puerto
+        dev.force_close()
+        assert puerto.cerrado
+
+    def test_the_writes_of_the_opening_are_bounded(self) -> None:
+        from emgteach.devices.bitalino import BitalinoDevice
+
+        pedidos = []
+
+        class _Serial:
+            def Serial(self, **kwargs):  # pyserial's name
+                pedidos.append(kwargs)
+                return object()
+
+        BitalinoDevice(port="COM9")._open_serial(_Serial(), "COM9")
+        assert pedidos[0]["write_timeout"] is not None
+
+
+# ---------------------------------------------------------------------------
+# The opening that holds the lock: Windows' CreateFile on a Bluetooth port
+# whose board is off. On the bench it took 52 s, and the 20-second warning
+# froze the window for all of them.
+# ---------------------------------------------------------------------------
+
+class _PuertoFalso:
+    """What serial.Serial returns once CreateFile lets go."""
+
+    def __init__(self) -> None:
+        self.cerrado = False
+        self.timeout = None
+
+    def close(self) -> None:
+        self.cerrado = True
+
+    def write(self, data: bytes) -> int:
+        return len(data)
+
+    def read(self, n: int = 1) -> bytes:
+        return b""
+
+
+def _bitalino_que_tarda(segundos: float = 60.0):
+    """A real BitalinoDevice whose port takes *segundos* to open, lock held."""
+    from emgteach.devices.bitalino import BitalinoDevice
+
+    class _Tarda(BitalinoDevice):
+        def __init__(self) -> None:
+            super().__init__(port="COM9")
+            self.soltar = threading.Event()
+            self.dentro = threading.Event()
+            self.puertos: list[_PuertoFalso] = []
+
+        def _resolve_port(self) -> str:
+            return "COM9"
+
+        def _open_serial(self, serial_mod, port):
+            self.dentro.set()
+            self.soltar.wait(segundos)            # inside CreateFile
+            puerto = _PuertoFalso()
+            self.puertos.append(puerto)
+            return puerto
+
+    return _Tarda()
+
+
+class TestForceCloseNeverWaits:
+    def test_it_returns_at_once_while_open_holds_the_lock(self) -> None:
+        dev = _bitalino_que_tarda()
+        errores: list[BaseException] = []
+
+        def abrir() -> None:
+            try:
+                dev.open()
+            except BaseException as exc:          # recorded, then asserted
+                errores.append(exc)
+
+        hilo = threading.Thread(target=abrir)
+        hilo.start()
+        assert dev.dentro.wait(2.0)
+        t0 = time.monotonic()
+        dev.force_close()
+        assert time.monotonic() - t0 < 0.2, "force_close waited for the opening"
+        dev.soltar.set()                          # Windows lets go, late
+        hilo.join(5.0)
+        assert not hilo.is_alive()
+        assert errores and isinstance(errores[0], RuntimeError)
+        assert dev.puertos[0].cerrado, "the port that arrived late is closed"
+        assert not dev.is_connected
+
+
+@pytest.fixture
+def pestana_que_tarda(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The tab whose first board takes a minute to open and whose next one answers."""
+    from emgteach.gui.tabs import acquisition as acq_mod
+    from emgteach.gui.tabs.acquisition import AcquisitionTab
+    from emgteach.gui.widgets.logger import LoggerWidget
+
+    settings = QSettings("emgteach-test", "placa-que-tarda")
+    settings.clear()
+    settings.setValue("app/mode", "single")
+    settings.setValue("adquisicion/device_type", 0)
+    settings.setValue("adquisicion/save_dir", str(tmp_path))
+    primera = _bitalino_que_tarda()
+    rapida = _Colgada()
+    rapida.soltar.set()
+    placas = [primera, rapida]
+    monkeypatch.setattr(acq_mod, "create_device", lambda *a, **k: placas.pop(0))
+    # Every worker the tab makes, not only the one it points at: the retry
+    # replaces the first, and the teardown has to wait for both.
+    hilos: list[AcquisitionWorker] = []
+
+    class _Registrado(AcquisitionWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            hilos.append(self)
+
+    monkeypatch.setattr(acq_mod, "AcquisitionWorker", _Registrado)
+    monkeypatch.setattr(acq_mod.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "a.edf"), "")))
+    tab = AcquisitionTab(LoggerWidget(), settings)
+    tab.apply_mode("single", False)
+    tab._conexion._conexion_timer.setInterval(300)
+    tab.primera, tab.rapida = primera, rapida
+    tab.connect_to("98:D3:91:FE:44:E4")
+    yield tab
+    # No recording may start from here on. «Retry» wires the old thread's
+    # end to _puerto_liberado, which starts the recording asked for; a test
+    # that failed before the port was let go left that wiring armed. The
+    # port let go below ended the old thread, monkeypatch then put the real
+    # QFileDialog back, and pytest-qt's processEvents at the end of the
+    # teardown started a recording on a tab already cleaned: a real «Save
+    # as» dialog nobody could close. The CI's Windows runner (15 Oct 2026,
+    # Python 3.10) sat like that for the job's thirty minutes after one «F»,
+    # with no stack dump, the dialog's event loop being alive. Reproduced
+    # here with a test that fails right after the retry.
+    tab._esperando_puerto = False
+    primera.soltar.set()
+    # The box that said the board did not answer, should a test have left
+    # it open: _tras_aviso_conexion called straight, as test_retry does, does
+    # not close it, and a modal box left behind swallows the shortcuts of
+    # the tests that follow (test_marcas_manuales, on the CI of 22 Oct 2026).
+    for caja in tab.findChildren(QMessageBox):
+        caja.close()
+    tab.cleanup()
+    vivos = []
+    for w in hilos:
+        if w.isRunning():
+            w.stop_forced()
+            if not w.wait(5000):
+                vivos.append(w)
+    if vivos:
+        # Kept alive on purpose: Qt aborts when Python drops a running
+        # QThread, and this message has to reach the report first.
+        _HILOS_HUERFANOS.extend(vivos)
+        estados = "; ".join(
+            f"worker {i}: opening={w.is_opening()} answered={w.placa_respondio()} "
+            f"streaming={w.is_streaming()} device={w._device.name}"
+            for i, w in enumerate(vivos))
+        raise AssertionError(
+            f"{len(vivos)} worker thread(s) still running after cleanup: {estados}")
+
+
+#: Worker threads a teardown could not stop, kept referenced so that Python
+#: never destroys a running QThread (see pestana_que_tarda).
+_HILOS_HUERFANOS: list = []
+
+
+@pytest.mark.gui
+class TestTheWarningDoesNotFreezeTheWindow:
+    def test_the_warning_comes_on_time_while_the_port_is_still_opening(
+        self, qapp, pestana_que_tarda
+    ) -> None:
+        tab = pestana_que_tarda
+        t0 = time.monotonic()
+        _grabar(tab)
+        assert _hasta(lambda: tab._conexion._aviso_conexion is not None, 3.0), \
+            "the warning waited for the port"
+        assert time.monotonic() - t0 < 2.0
+        assert tab.primera.dentro.is_set() and not tab.primera.soltar.is_set()
+        assert tab._lbl_estado.text() == tr("Status: the board did not answer")
+
+    def test_retry_waits_for_the_port_and_then_records(
+        self, qapp, pestana_que_tarda
+    ) -> None:
+        tab = pestana_que_tarda
+        _grabar(tab)
+        _esperar(lambda: tab._conexion._aviso_conexion is not None,
+                 "the warning that the board did not answer")
+        viejo = tab._worker
+        t0 = time.monotonic()
+        tab._conexion._tras_aviso_conexion(QMessageBox.StandardButton.Retry)
+        # Frozen, the window would wait for a port that is let go only after
+        # this call returns: for ever. What is checked is that it came back
+        # with the old attempt still holding it. The ceiling is only for a
+        # wait with a time limit, and a loaded runner is not one: 0.5 s
+        # measured 0.64 once (CI, Windows, Python 3.12, the tag of 3.10.0).
+        assert viejo.isRunning(), "Retry waited for the old attempt to end"
+        assert time.monotonic() - t0 < 3.0, "Retry froze the window"
+        assert tab._worker is viejo, "no second connection while the port is taken"
+        assert tab._lbl_estado.text() == tr(
+            "Status: waiting for Windows to release the port…")
+        assert not tab._btn_grabar.isEnabled()
+        # The second board answers: the 300 ms limit the first one needed is
+        # not what this checks (see test_it_says_connecting_until_the_first_block).
+        from emgteach.gui.acquisition.connection import CONEXION_MAX_S
+
+        tab._conexion._conexion_timer.setInterval(int(CONEXION_MAX_S * 1000))
+        tab.primera.soltar.set()                  # Windows lets go
+        # Each wait says which step did not come, and waits for the step
+        # itself: it returns as soon as the application gets there, so the
+        # ceiling only matters on a slow machine. Five fixed seconds failed
+        # once on the CI (2 Oct 2026) without saying which of the two it was
+        # (3.8.0, from ecgteach 0.4.0).
+        _esperar(lambda: tab._worker is not viejo,
+                 "the new worker after the old one let go of the port")
+        _esperar(tab.is_recording, "the new worker to be recording")
+        _esperar(lambda: tab._lbl_estado.text() == tr("Status: recording…"),
+                 "the first block, with the status saying it records")
+        assert tab.primera.puertos[0].cerrado

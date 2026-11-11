@@ -1,0 +1,839 @@
+# Guion de prácticas de electromiografía de superficie con emgteach
+
+> **Asignatura:** Fisiología (laboratorio de prácticas).
+> **Software:** emgteach (rama `feat/ui-levels`, septiembre de 2026).
+> **Equipo:** BITalino con electrodos de superficie; en la práctica de un músculo
+> sirve también un Arduino con sensor MyoWare 2.0.
+>
+> Este guion tiene **tres prácticas**, una por cada práctica que ofrece la
+> aplicación en su selector. Dentro de cada una hay varios **ejercicios**, cada uno
+> con lo que se hace, lo que la aplicación calcula sola, lo que hay que anotar y
+> lo que hay que razonar. El profesorado elige los ejercicios que caben en el
+> tiempo disponible; cada uno se entiende sin los demás.
+
+---
+
+## Cómo está organizado esto, y por qué
+
+La aplicación se configura **eligiendo la práctica**, no ajustando controles. El
+desplegable de la esquina superior derecha tiene tres opciones, y de esa elección
+salen el número de canales, el uso del acelerómetro, qué pide la grabación y qué
+paneles ofrece el análisis. La banda de color al lado dice el nivel.
+
+| Práctica de este guion | Opción del selector | Nivel | Canales | Lo que se aprende |
+|---|---|---|---|---|
+| 1 | **Contracción de un músculo** | básico (verde) | 1 | de la señal al número: amplitud, espectro, fatiga, carga |
+| 2 | **Contracción agonista / antagonista** | intermedio (naranja) | 2 | comparar dos músculos en % CVM; coactivación |
+| 3 | **Cinemática muscular** | avanzado (violeta) | 1 + acelerómetro | fuerza-velocidad, retraso electromecánico, temblor |
+
+Las tres pestañas de la ventana son siempre las mismas: **Adquisición** (grabar),
+**Análisis** (leer un registro) y **Normalización CVM** (expresar la tarea en
+porcentaje del máximo y medir la carga). Lo que cambia con la práctica es lo que
+cada pestaña enseña.
+
+---
+
+## Objetivos generales
+
+Al terminar las prácticas, el alumnado debe ser capaz de:
+
+1. Colocar los electrodos y obtener una señal de EMG de superficie limpia, y
+   reconocer en la pantalla una señal buena y una estropeada.
+2. Explicar la cadena de procesado (filtrado, rectificación, envolvente) y qué
+   pregunta responde cada medida: RMS e iEMG (cuánto se activa), MNF y MDF (a qué
+   frecuencias), % CVM (cuánto respecto al propio máximo).
+3. Calibrar una **contracción voluntaria máxima** que sea de verdad máxima, y
+   reconocer en el análisis cuándo no lo fue.
+4. Leer la **tabla por contracción** y las **fichas del resumen** contra los
+   rangos orientativos, y decir qué es normal y qué es una pregunta.
+5. Detectar la **fatiga** por el desplazamiento del espectro, y distinguir «no
+   detectada» de «no concluyente».
+6. Comparar un **agonista y su antagonista** en % CVM y medir su **coactivación**.
+7. Evaluar la **carga muscular** de una tarea con el método de Jonsson.
+8. En la práctica avanzada, obtener la **relación fuerza-velocidad** de un
+   músculo, medir su **retraso electromecánico** y ver el **temblor fisiológico**.
+
+---
+
+## Seguridad e higiene
+
+- Equipo de **muy baja tensión**, alimentado por batería o USB; no presenta riesgo
+  eléctrico para el sujeto.
+- Electrodos **desechables**, uno por persona; limpiar la piel con alcohol y dejar
+  secar. No reutilizar electrodos entre sujetos.
+- Personas con lesiones cutáneas en la zona deben abstenerse.
+- Los esfuerzos máximos son contracciones breves e intensas (1.5 s) que hace el
+  sujeto solo, nunca contra otra persona. Quien note dolor articular, para.
+
+---
+
+## Antes de empezar (común a las tres prácticas)
+
+### 0 · Elegir la práctica
+
+En el desplegable de la esquina superior derecha, antes que nada. La aplicación
+recuerda la última elección; conviene comprobarla cada sesión. La guía rápida
+(botón **«Guía»**) recorre en cinco pasos lo que sigue, y cada caja de la
+aplicación tiene un **«?»** en su esquina con la explicación de lo que hace.
+
+### 1 · Colocar los electrodos
+
+Regla general: dos electrodos activos sobre el **vientre del músculo**, alineados
+con las fibras y separados **2 cm entre centros**; el de referencia sobre **hueso**,
+y **uno solo aunque haya dos canales**, porque los dos sensores comparten la masa
+de la placa (en el antebrazo, el **olécranon**). Piel limpia y seca, sin crema. Si
+la señal sale pequeña, desplazar el par uno o dos centímetros hacia el tendón.
+
+El par que usa este guion en las prácticas 1 y 2 es el del antebrazo: **flexor
+radial del carpo** (FCR, cara anterior) y **extensores radiales del carpo** (ECR,
+cara posterior). Dónde exactamente, con qué comprobación palpatoria y qué error
+es fácil cometer, está en
+[`colocacion_electrodos_antebrazo_es.md`](colocacion_electrodos_antebrazo_es.md).
+La práctica 3 usa el bíceps braquial, con el acelerómetro en la muñeca.
+
+![Dónde están los músculos y dónde van los electrodos](electrodos_antebrazo_es.png)
+
+Canal 1 a 5 cm de la epitróclea, canal 2 a 5 cm del epicóndilo lateral, y una
+referencia sobre el olécranon.
+
+### 2 · Conectar
+
+Pestaña **Adquisición**, caja **Configuración del dispositivo**:
+
+- En la práctica de un músculo se elige el dispositivo (BITalino por Bluetooth o
+  Arduino + MyoWare por USB). En las otras dos la caja dice **«Dispositivo:
+  BITalino»** sin desplegable, porque necesitan dos canales o el acelerómetro,
+  que solo tiene la placa BITalino. En todos los casos la dirección (MAC o puerto) se
+  puede cambiar; la placa se identifica mejor por su **MAC**, que es la misma
+  en cualquier ordenador.
+- **Ruta y archivo de salida**: carpeta donde se guardará el EDF.
+- **Etiquetas**: el nombre de cada músculo, en el orden de los canales de la
+  placa (**Músculo 1 es el que se registra por A1**). En el par, las casillas
+  empiezan vacías con una pista («Agonista, p. ej. FCR»). Lo que se escriba aquí
+  es lo que aparecerá en los carriles, las tablas y el informe.
+- **Identificador de prueba**: un alumno, una pareja, una mesa o un intento;
+  va a la cabecera del EDF y al informe.
+- Pulsar **Conectar**. El indicador pasa a amarillo (conectado) y a verde cuando
+  llegan datos.
+- Con la placa se habla al pulsar **Iniciar grabación**. Si la placa no contesta,
+  espera el aviso y pulsa **Reintentar**; si Windows da error al abrir el puerto,
+  apaga y enciende la placa y vuelve a pulsar **Iniciar grabación**.
+
+### 3 · Probar la señal antes de grabar
+
+Con la conexión hecha, pedir una contracción breve y mirar las dos gráficas: la
+señal en bruto debe estallar en picos simétricos y la envolvente subir y volver a
+la línea base. En reposo, la línea base es casi plana. La aplicación avisa en el
+registro de eventos de dos fallos frecuentes: **canal plano** (electrodo suelto o
+no conectado) y **saturación** (mal contacto o electrodo sobre el tendón).
+
+### 4 · Cómo transcurre una grabación con calibración
+
+Las medidas en **% CVM** necesitan saber cuál es el máximo de ese músculo en esa
+sesión. La aplicación lo pide con un asistente que va escribiendo todo en el mismo
+fichero, sin parar la grabación:
+
+1. **Calentamiento (10 s).** Dos o tres contracciones suaves de cada músculo. La
+   primera contracción máxima de una sesión nunca es la más intensa, y esto lo
+   corrige en parte.
+2. **Tres esfuerzos máximos breves**, de 1.5 s cada uno, con cuenta atrás de
+   3 s y 2 s de descanso entre ellos. La pantalla dice «¡Máximo, breve e intenso!».
+3. Con dos músculos, lo mismo para el segundo.
+4. En la práctica del par, después viene una **preparación** de 5 s y empieza el
+   **registro** de la tarea. En las otras dos prácticas la calibración se lanza
+   con el botón **«Calibrar CVM»** mientras se graba, y el registro sigue.
+
+La referencia es **el punto más alto que alcanza la envolvente en las tres
+repeticiones**. ¿Por qué breves?
+Porque una contracción mantenida muestra un pico al empezar y luego
+una meseta, y los esfuerzos breves de una tarea alcanzan ese pico. Si la
+referencia se midiera sobre la meseta, la tarea la superaría, y eso es lo que
+pasaba: 135 % de «máximo» en un registro.
+
+> **La maniobra del máximo es lo que decide la práctica.**
+>
+> - **Flexor (FCR, canal 1): contracción en flexión de muñeca a la máxima potencia,
+>   cerrando el puño con toda la fuerza.**
+> - **Extensor (ECR, canal 2): contracción en extensión de muñeca a la máxima
+>   potencia, con la mano abierta y los dedos extendidos a tope.**
+> - **Breve e intensa**, dentro de los 1.5 s de la cuenta: no un empuje
+>   sostenido contra algo fijo. Una repetición que salga floja no vale; la
+>   aplicación permite descartarla después.
+> - **Por qué esta maniobra.** Un electrodo de superficie en el antebrazo no ve un
+>   músculo: ve el compartimento, con los flexores o los extensores de los dedos
+>   debajo, y la referencia solo sirve de vara de medir si recluta la misma masa
+>   muscular que la tarea. La tarea incluye una presa: cerrar el puño enciende los
+>   flexores de los dedos, mientras que el empuje de muñeca los deja fuera y, como
+>   obliga a fijar el antebrazo, enciende además al antagonista.
+> - **Comprobación inmediata:** al terminar la tarea, el resumen del análisis dice
+>   el **máximo de la tarea** en % CVM. Si pasa del 150 % lo marca en rojo, «no fue
+>   un máximo», y hay que repetir la calibración. Entre el 90 y el 125 % es lo que
+>   dan las sesiones bien calibradas.
+
+### 5 · Qué pasa al parar
+
+Al pulsar **Detener grabación**, la pestaña de Adquisición muestra la **sesión
+entera** con sus tramos sombreados (calentamiento, cada repetición de calibración,
+preparación, registro) y la pestaña de **Análisis** analiza el registro **sola**,
+sin pulsar nada. Al pasar a Análisis aparece un cuadro que señala el paso
+siguiente:
+
+1. **«Repeticiones de la calibración…»**: la lista de las tres repeticiones de
+   cada músculo con su valor. Se desmarcan las que salieron flojas y se acepta;
+   la referencia se recalcula. Esto va primero porque **todos los porcentajes se
+   miden contra esa referencia**.
+2. **«Seleccionar fragmentos…»**: una fila por contracción encontrada, con su
+   inicio, fin, duración y, con dos músculos, cuál llevó cada una. La calibración
+   ya queda fuera sola. El cuadro lleva por **tres pasos**, y una línea amarilla
+   sobre el gráfico dice en cuál se está:
+   1. **Sensibilidad.** Moverla hasta que el recuento de al lado coincida con lo
+      que se hizo: en el par, 6 flexiones, 6 extensiones y 1 presa; en
+      cinemática, una por levantamiento. La línea discontinua es el umbral.
+      Cada fila propuesta abarca la contracción entera, desde que la
+      envolvente deja el reposo (la línea de puntos «reposo») hasta que vuelve a él:
+      no hace falta ampliarla a mano.
+   2. **Cada contracción por turno**, con ▶ o pulsándola en el gráfico:
+      **Mantener** si está bien, **Eliminar** si no debe contar (queda rayada y
+      se recupera), **Dividir** si un tramo guarda dos picos (una línea de trazo
+      y punto marca antes el corte), o **arrastrarla** sobre la contracción
+      buena, donde encaja sola. Un tramo **punteado** es actividad que el umbral
+      dejó fuera: un clic lo añade. En cinemática, una subida que el asistente
+      no pidió se queda punteada; añadida con un clic entra sin carga. En el
+      par, un botón por músculo confirma quién la llevó.
+   3. **«Usar estos fragmentos»**, cuando todo está revisado y el recuento
+      coincide. Hasta entonces no se aplica nada.
+
+   En el par hay además el **umbral de coactivación** (a partir de qué fracción
+   del músculo mayor el menor cuenta como coactivación), que cambia los nombres y
+   no las filas. El **ajuste fino** (duración mínima, unión de huecos, separación
+   entre contracciones) está plegado y rara vez hace falta. El «?» del cuadro
+   repite estos pasos.
+
+Después se lee. La pestaña tiene tres zonas: los **paneles** (arriba, con la rueda
+del ratón se desplazan; los botones ▲▼ y ▶◀ de la izquierda cambian las escalas),
+el **gráfico de contracciones** y el **resumen** (abajo) y, en el par, el
+**gráfico de coactivación**. El de contracciones enseña una vista cada vez,
+elegida en su línea de título, y abre en la **relación**, que es de la que se
+saca la conclusión. Con un músculo es la **amplitud frente a la MDF**,
+contracción a contracción y unidas en orden: una deriva hacia más amplitud y
+menos frecuencia es fatiga, hacia más de las dos es más fuerza, y los otros dos
+cuadrantes son sus contrarios. Con dos músculos es **un músculo frente al otro**,
+con la cuña en la que la aplicación llama coactivación a una contracción: una
+flexión cae sobre un eje, una extensión sobre el otro y una presa dentro de la
+cuña. Con dos músculos hay además **«Categoría»**, la media de cada músculo por
+maniobra con cada contracción como punto, y **«Quién lidera»**, una barra por
+contracción hacia la derecha si llevó el primer músculo y hacia la izquierda si
+llevó el segundo, con la banda de coactivación en medio. **«Serie»** sigue las
+contracciones en orden, con su recta de tendencia y la MDF en el eje derecho, y
+en cinemática **«Por carga»** agrupa amplitud, velocidad y retraso electromecánico por
+la carga que dejó marcada el asistente. **«Tabla»** son los números, que son los
+que se copian en las tablas de este guion. El de coactivación es una línea por
+ventana: el nombre a la izquierda, los segundos a la derecha y, en medio, el
+índice como barra morada o, cuando no se informa, un bloque dorado y un
+cuadradito del color del músculo que trabajó solo; la leyenda de arriba dice
+qué es cada color, y las medias en % CVM están en su «Tabla». El botón **«Generar informe
+PDF»** produce el entregable con las figuras, la calibración, los gráficos, las
+tablas y las fichas.
+
+### 6 · Seguir la sesión desde el móvil
+
+En una práctica en grupo, **una persona maneja el equipo** y el resto sigue la
+señal en el navegador del móvil. En Adquisición, casilla **«Difundir a móviles (en
+laboratorio)»**; aparece una dirección `http://…:8080/?k=…` y un botón **QR**.
+Todos en la misma Wi-Fi, y la dirección escrita con `http://`. El móvil solo mira
+y descarga: la sesión en CSV mientras se graba y, cuando el operador analiza, el
+informe PDF y los resultados. Cada activación genera un código nuevo; los enlaces
+de una práctica anterior caducan.
+
+---
+
+## Práctica 1 — Contracción de un músculo (nivel básico)
+
+**Montaje.** Un canal sobre el FCR (o sobre el bíceps si se prefiere un músculo
+grande), referencia en el olécranon. Selector en **Contracción de un músculo**.
+
+**Lo que enseña la aplicación en esta práctica.** Tres paneles por defecto: **1.
+En bruto**, **2. Env. norm.** (la envolvente escalada a su máximo) y **3. PSD** (el
+espectro, con el espectro *antes* del filtro en gris detrás). Abajo, la **tabla de
+contracciones** con una fila por esfuerzo (inicio, duración, RMS, pico en % CVM,
+MDF) y las **fichas del resumen** (MNF, MDF, pendiente de la MDF, fatiga, máximo de
+la tarea, RMS global, iEMG, duración, CVM). El botón **«Más paneles…»** revela el
+resto para quien quiera mirar más.
+
+**Fragmentos.** Comprueba que cada contracción tiene su fila; las muy breves
+pueden salir punteadas o sin marcar, y se añaden a mano (pulsando la punteada o
+con «Añadir fragmento»). El editor no propone una contracción que pase menos de
+0.5 s por encima del umbral, y en esta práctica no hay recuento de esperadas que
+lo avise.
+
+### Ejercicio 1a · Primer registro: de la señal al número
+
+**Objetivo.** Obtener un registro limpio y reconocer las representaciones de la
+señal.
+
+**Procedimiento.**
+1. **Iniciar grabación**. Secuencia: 5 s de reposo, contracción suave 4 s, reposo
+   5 s, contracción intensa 4 s, reposo 5 s. La aplicación marca sola el inicio de
+   cada contracción (**Auto-inicio**, umbral = reposo + k × ruido, con k = 3).
+2. **Detener**. Pasar a **Análisis** y aceptar los fragmentos que propone.
+
+**Datos a recoger.** De la tabla de contracciones:
+
+| Contracción | Duración (s) | RMS (mV) | MDF (Hz) |
+|---|---|---|---|
+| suave | | | |
+| intensa | | | |
+
+**Cuestiones.**
+- ¿Por qué la señal en bruto es positiva y negativa y la envolvente solo
+  positiva? ¿Qué hace la rectificación?
+- En el panel 3, el espectro gris es la señal antes del filtro y el azul después.
+  ¿Qué ha desaparecido? ¿A qué frecuencia estaba? ¿Y por debajo de 20 Hz?
+- El RMS de la contracción intensa, ¿es mayor que el de la suave? ¿Cuántas veces?
+  ¿Qué dos mecanismos nerviosos explican que crezca la amplitud?
+- ¿Coinciden los inicios automáticos con lo que se ve en la envolvente?
+
+### Ejercicio 1b · Escalones de esfuerzo: más fuerza, más señal, pero no el doble
+
+**Objetivo.** Comprobar que la amplitud crece con la activación de forma monótona
+pero **no lineal**, y ver para qué sirve normalizar.
+
+**Procedimiento.** Con la sesión guiada **«Contracciones graduales»**.
+1. En la línea de «Calibrar CVM», elegir **«Contracciones graduales»** en el desplegable (abre
+   en «Grabación libre») y pulsar **Iniciar grabación**. La aplicación pide el
+   calentamiento y los tres esfuerzos máximos (apartado 4), cuenta 5 s y dirige
+   los escalones: cinco contracciones isométricas de 4 s contra la mesa, al
+   **20, 40, 60 y 80 % de la barra y al máximo**, con 6 s de reposo entre ellas.
+   Cada cambio de fase se anuncia con un tono (casilla «Tono»); el panel muestra la
+   barra con la franja del escalón pedido, que sube hasta su nivel en 1.5 s.
+   **Suba despacio hasta la marca (1-2 s) y manténgala**: un salto al nivel deja
+   un pico al empezar que no es lo que se pide.
+2. La grabación se **detiene sola** al terminar. En Análisis, revisar las
+   repeticiones de la calibración; los cinco escalones ya son las cinco filas de
+   la tabla, sin elegir fragmentos.
+
+**Datos a recoger.** De la tabla de contracciones y de la vista **«Escalones»**:
+
+| Escalón pedido | Mantenido (% CVM) | RMS (mV) | MDF (Hz) |
+|---|---|---|---|
+| 20 % | | | |
+| 40 % | | | |
+| 60 % | | | |
+| 80 % | | | |
+| máximo | | | |
+
+«Mantenido» es la media de la envolvente en la meseta de la contracción de cada
+escalón, desde 1.5 s después de su inicio (lo que se tarda en llegar al nivel)
+y antes de soltar. Cada
+escalón es la contracción que empieza tras su aviso, seguida hasta 1.5 s más allá
+de su final: se empieza y se suelta con unas décimas de retraso. La CVM de la
+gradación es la mayor media en medio segundo de la calibración, no su pico,
+porque el mantenido también es una media.
+
+**Cuestiones.**
+- ¿Sube el RMS en cada escalón? ¿Cómo de cerca del escalón pedido se quedó cada
+  uno, y cuál costó más mantener? La barra mide **activación**, no fuerza: ¿le
+  pareció que el 40 % de la barra era el 40 % de su fuerza? Comente por qué la
+  sEMG es un buen indicador de activación y un mal dinamómetro.
+- ¿Cambia la MDF de un escalón a otro? ¿Qué unidades motoras se suman al subir
+  la fuerza, y cómo afectaría eso al espectro?
+- Compare su RMS al 100 % con el de un compañero. ¿Quién «hace más fuerza»? ¿Por
+  qué esa comparación no vale, y sí vale la columna de % CVM?
+- ¿Qué dice la ficha **«Máximo de la tarea»**? Si pasa del 100 %, ¿qué ocurrió en
+  la calibración?
+
+### Ejercicio 1c · Una carga fija: la firma de la fatiga
+
+**Objetivo.** Detectar la fatiga por el desplazamiento del espectro hacia
+frecuencias bajas, y entender qué hace falta para poder afirmarla.
+
+**Fundamento.** Al sostener una contracción bajan el pH y la velocidad de
+conducción de las fibras, y las unidades motoras descargan más sincronizadas;
+el espectro se comprime hacia abajo y **la MDF cae**. Lo que hace el RMS depende
+del esfuerzo: con una carga **submáxima** se mantiene o **sube**, porque se
+reclutan más unidades para sostener el mismo peso; en una contracción **máxima**
+ya no quedan unidades que sumar y el RMS **baja**. La prueba específica de la
+fatiga es la caída de la MDF, no la de la amplitud.
+
+**Procedimiento.** Con la sesión guiada **«Fatiga con carga fija»**, sobre el
+**flexor del antebrazo**: los electrodos ya están ahí de los ejercicios 1a y 1b.
+**Antebrazo apoyado en la mesa, con la mano fuera del borde**, y un peso fijo que
+no pueda sostener más de 60-90 s (3-5 kg, una mancuerna), para que la fatiga
+llegue dentro de la sesión.
+1. Elegir la sesión en el desplegable de la línea de «Calibrar CVM» y pulsar
+   **Iniciar grabación**; no hace falta calibrar. Tras 5 s de preparación,
+   **5 s de reposo** con el antebrazo apoyado, la mano relajada y sin el peso
+   (si sale alto, la aplicación avisa de que un electrodo está suelto), una
+   cuenta atrás de 3 s para **coger el peso** y sostenerlo **colgando de la
+   mano, sin apretar más de lo necesario**, durante **90 s**. Durante el
+   esfuerzo no hay barra: la carga es fija. Si a los 5 s sale «Señal débil»,
+   el esfuerzo apenas supera el reposo: revise el contacto de los electrodos o
+   use un peso mayor, y repita.
+   **Respire normalmente durante el esfuerzo.**
+2. **Si no puede más, pulse la barra espaciadora** (o «No puedo más
+   (Espacio)»): el esfuerzo termina en ese momento y la sesión pasa a dejar el
+   peso. La grabación se **detiene sola**.
+3. En Análisis, el tramo analizado empieza 2 s después de que empiece la
+   actividad (coger el peso no es la contracción que fatiga) y acaba donde la
+   actividad cae. La caja de contracciones abre en la vista **«MDF en el
+   tiempo»**, y los paneles **6. RMS/ventana** y **7. MDF/tiempo** aparecen
+   marcados.
+
+**Variante · El bíceps.** La misma sesión, con los electrodos sobre el **bíceps
+braquial**, en la línea entre el acromion medial y la fosa del codo, **a 1/3 de
+esa línea desde la fosa del codo** (criterio SENIAM), alineados en el sentido de
+las fibras y a unos 2 cm uno de otro; la referencia, sobre hueso (olécranon o
+muñeca). El reposo, con el brazo relajado a lo largo del cuerpo; el peso,
+sostenido **con el codo a 90°** y el brazo pegado al cuerpo. El análisis es el
+mismo.
+
+**Cómo decide la aplicación.** Calcula la MDF y la MNF en ventanas de 1 s cada
+0.5 s y ajusta una recta a cada una frente al tiempo. Dice **«Fatiga
+detectada»** si la recta de la MDF baja de forma **significativa** (p < 0.01) y
+al menos un **10 %**; **«No detectada»** si es significativa pero baja menos o
+sube; y **«No concluyente»** si no es significativa o el esfuerzo fue demasiado
+corto. No se exige un R² mínimo: el espectro de cada ventana tiene mucha
+dispersión propia: en el banco, el antebrazo bajó la MDF un 26 % en 66 s con un
+R² de 0.39, y el bíceps un 16-20 % en 90 s con un R² de solo 0.3.
+
+**Datos a recoger.** De la línea de resumen de la caja de contracciones y de la
+tabla del informe:
+
+| Magnitud | Inicio | Final | Cambio | Pendiente por minuto | R² | p |
+|---|---|---|---|---|---|---|
+| MDF (Hz) | | | | | | |
+| MNF (Hz) | | | | | | |
+| RMS (mV) | | | | | | |
+
+Tiempo sostenido: ____ s. MDF −10 % a los ____ s. Veredicto: ______________.
+
+**Cuestiones.**
+- ¿Bajó la MDF? ¿Cuánto en porcentaje, y a los cuántos segundos había caído un
+  10 %? ¿Qué lo explica en las fibras?
+- ¿Qué hizo el RMS? ¿Por qué con una carga submáxima se mantiene o sube, y qué
+  esperaría en una contracción máxima?
+- ¿Por qué la aplicación mira la significación (p) y no el R²? ¿Qué significa un
+  R² de 0.3 con una p de 10⁻⁸?
+- Un compañero pulsó la barra a los 20 s y su veredicto es «no concluyente».
+  ¿Está fatigado o no? ¿Qué le falta al registro?
+
+**Después: contracciones rápidas repetidas** (sesión **«Contracciones rápidas
+repetidas»**), con los electrodos en el flexor del antebrazo: 10 s de
+contracciones del puño, cerrándolo y relajándolo lo más rápido posible. En la vista **«Tren»**: el ritmo conseguido, cuánto suben los picos
+del primer al último tercio, y el suelo entre contracciones en % del pico, junto al
+que dejaría la medida sola a ese ritmo.
+- ¿Subieron los picos? ¿Quedó el suelo por encima del de la medida sola? ¿Qué
+  parte de ese suelo es del procesado y qué parte de usted?
+- ¿Es esto la *treppe*? ¿Por qué no se puede afirmar que el músculo haga más
+  fuerza a partir del EMG?
+
+### Ejercicio 1d · La carga de una tarea (método de Jonsson)
+
+**Objetivo.** Expresar una tarea en % CVM y describir su carga con tres niveles.
+
+**Fundamento.** El **APDF** ordena todos los instantes de la tarea de menor a
+mayor esfuerzo y lee tres puntos: **P10 (estático)**, la carga que el músculo no
+suelta en ningún momento; **P50 (mediano)**, el esfuerzo típico; **P90 (pico)**,
+los momentos de máxima exigencia. Jonsson recomendó no pasar del 2–5 % en el
+estático, 10–14 % en el mediano y 50–70 % en el pico; la aplicación usa el
+extremo alto de cada rango (5, 14 y 70 %). El riesgo no suele venir de los picos
+sino de un estático alto y mantenido.
+
+**Procedimiento.**
+1. **Iniciar grabación**, **Calibrar CVM**, y hacer durante **60 s** una tarea:
+   sostener una botella de agua con la muñeca en neutro, o teclear con la mano en
+   alto, o cargar y descargar un peso cada 10 s. Cada grupo una distinta.
+2. **Detener**. En **Normalización CVM** el resultado aparece solo. Con
+   **«Seleccionar fragmentos…»** dejar solo la tarea (sin la calibración), o el
+   pico será el propio máximo.
+
+**Datos a recoger.** Del panel de datos:
+
+| Nivel | Valor (% CVM) | Límite | ¿Dentro? |
+|---|---|---|---|
+| Estático (P10) | | 5 % | |
+| Mediano (P50) | | 14 % | |
+| Pico (P90) | | 70 % | |
+| Activación media | | 10 % | |
+
+**Cuestiones.**
+- ¿Qué nivel supera su límite? Compare con la tarea de otro grupo: ¿cuál tiene el
+  pico más alto y cuál el estático más alto? ¿Cuál es peor para el músculo, y por
+  qué?
+- Las barras en vivo avisaban en naranja al pasar del 40 % y en rojo del 70 %.
+  ¿Coincide esa impresión con el APDF? Explique por qué miden cosas distintas.
+- Proponga un cambio de la tarea que baje el estático sin bajar el pico.
+
+---
+
+## Práctica 2 — Contracción agonista / antagonista (nivel intermedio)
+
+**Montaje.** Dos canales: **FCR** en el canal 1 (A1) y **ECR** en el canal 2 (A2),
+y **una sola referencia, compartida por los dos, en el olécranon**; el cable de
+referencia del otro sensor se queda sin electrodo. No es una preferencia: está
+comprobado en el banco, con los dos pares sobre el mismo músculo, que quitar la
+referencia de cualquiera de los dos sensores no cambia ni la amplitud ni el ruido,
+y una referencia menos es una conexión menos que equivocar. Selector en
+**Contracción agonista / antagonista**. Etiquetas: FCR y ECR.
+
+**Lo que enseña la aplicación en esta práctica.** Al pulsar **Iniciar grabación**
+el asistente calibra **los dos músculos** (apartado 4) y después abre el registro.
+El análisis ofrece **1. En bruto** con los dos músculos, cada uno contra su propio eje, **3. PSD** con las dos
+curvas, **7. MDF/tiempo** de los dos y **9. Env. superp.**, las dos envolventes en
+% CVM sobre el mismo eje. La tabla de contracciones dice **qué músculo llevó cada
+una** (FCR, ECR o «Coactivación», cuando el menor supera la mitad del mayor,
+medidos cada uno contra su propio máximo) y la **tabla de coactivación** da, por
+ventana, la activación media de cada músculo y el **índice de Falconer-Winter**.
+
+**Por qué en % CVM y no en milivoltios.** Los milivoltios de dos músculos distintos
+no se comparan: dependen de dónde quedaron los electrodos y de cuánta piel y grasa
+hay debajo. En un registro la referencia del flexor era un tercio
+de la del extensor; una flexión al 100 % del flexor leía *menos milivoltios* que el
+extensor al 42 %. Todo lo que compara dos músculos en esta práctica lo hace en
+porcentaje del máximo de cada uno.
+
+### Ejercicio 2a · Flexión, extensión y presa
+
+**Objetivo.** Ver el patrón recíproco de un par antagonista y medir su
+coactivación.
+
+**Fundamento de la presa.** Los flexores de los dedos son extrínsecos: sus
+vientres están en el antebrazo y sus tendones cruzan la muñeca. Al cerrar el puño
+producen, además del cierre de los dedos, un momento flexor sobre la muñeca que la
+doblaría; los extensores radiales del carpo lo contrarrestan y la sostienen en
+ligera extensión, que es la longitud a la que esos flexores dan más fuerza. Por eso
+la fuerza de presa cae cuando la muñeca se flexiona, y por eso los extensores están
+activos de forma continua durante toda la presa, sin los silencios que muestran en
+un movimiento recíproco. Aquí no son antagonistas, son estabilizadores. Es también
+el mecanismo de la epicondilitis lateral, que es una lesión por presa repetida y no
+por extender la muñeca.
+
+**Procedimiento.**
+1. **Iniciar grabación**. Calibrar los dos músculos como dice el apartado 4 (una
+   contracción con el puño cerrado para el FCR, con la mano abierta para el ECR).
+2. **La aplicación guía también esta parte**: pide las seis de un músculo, las
+   seis del otro y la presa, con una fila de casillas —una por contracción,
+   del color que ese músculo tiene en las gráficas— que se van llenando según
+   se detectan. Las seis son libres, al ritmo de quien las hace, y la
+   aplicación **pasa sola** a la parte siguiente cuando ha contado las seis y
+   el músculo lleva un segundo en reposo —no en el instante de la sexta, que
+   le cortaría la cola—. **«Hecho — siguiente»** (o la barra espaciadora) pasa
+   cuando se quiera. Si el detector se salta una, la casilla se queda vacía y
+   la fase pasa igual al cabo de 12 s sin contar nada nuevo; el botón lo
+   adelanta. Lo que cuenta es lo que cuente después el análisis. En el
+   registro, y siempre en este orden,
+   con 2 s de quietud entre maniobras:
+   **seis flexiones** de muñeca (1 s cada una, libres, sin resistencia),
+   **seis extensiones**, también libres, y por último la **presa**. Libres
+   porque, si la muñeca empuja contra algo, el antagonista entra a
+   estabilizarla y el patrón recíproco se emborrona.
+3. **La presa, con detalle**, porque es la maniobra que da número y la que más
+   fácil sale mal:
+   - Antebrazo apoyado en la mesa hasta la muñeca, codo a 90°, pulgar hacia
+     arriba, y **la muñeca fuera del borde, en el aire**. Si la muñeca descansa
+     sobre la mesa, el tablero hace de estabilizador, el extensor afloja y la
+     maniobra no mide nada.
+   - **Cerrar la mano sobre una pelota de tenis**, que es lo que nombra la pantalla; si
+     no hay, algo que no se deforme y dé una postura repetible, como un
+     manguito de tensión enrollado o una toalla apretada. Con dinamómetro de
+     mano, mejor, porque además cuantifica el esfuerzo. **Con el puño cerrado
+     en vacío no sale**: sin nada sobre lo que cerrar la mano, el extensor apenas se activa
+     (en el banco, un 4 % de su referencia) y la presa no da índice.
+   - «Cierre la mano sobre la pelota con una contracción intensa y manténgala» **8 s**, firme pero submáximo,
+     guiándose por la barra de carga hacia el 50–60 %. **Nunca «extienda la
+     muñeca»**: los extensores tienen que entrar solos. La aplicación guía esos
+     ocho segundos con su reloj y enseña las dos barras de carga dentro del
+     propio cuadro, que es donde hay que mirar mientras se mantiene la contracción.
+   - Repetirla da más señal y sigue contando como una sola ventana, porque las
+     filas seguidas con el mismo nombre se agrupan; el asistente guía una.
+   - Va la última, para que su fatiga no contamine las flexiones ni las
+     extensiones.
+4. **Detener**. En Análisis, revisar las repeticiones y aceptar los fragmentos:
+   la columna **Músculo** viene rellena con quién llevó cada contracción; corregir
+   solo si la traza dice otra cosa. Las filas seguidas con el mismo nombre forman
+   una sola ventana de la tabla de coactivación.
+
+**Datos a recoger.**
+
+| Ventana | FCR (% CVM medio) | ECR (% CVM medio) | Índice de coactivación |
+|---|---|---|---|
+| Flexiones | | | |
+| Extensiones | | | |
+| Presa | | | |
+
+Del registro de eventos o del PDF, la **separación entre canales** durante la
+calibración: ECR durante el máximo del FCR ____ %; FCR durante el máximo del ECR
+____ %.
+
+**Lo que enseña cada maniobra.** Las tres de este ejercicio, más la del 2b, forman
+una progresión; conviene leerla entera antes de responder:
+
+| Maniobra | Qué hacen los dos músculos | Qué da el índice |
+|---|---|---|
+| Flexiones | trabaja el FCR; el ECR, poco o nada | «no se informa» si el ECR no llega al suelo del 4.5 %; si lo pasa, un índice bajo, en torno al 30 % |
+| Extensiones | los papeles se intercambian | lo mismo: «no se informa» o en torno al 30 % |
+| Presa | los dos trabajan a la vez | claramente más alto que en las maniobras recíprocas |
+| Alternancia rápida (2b) | los dos trabajan, pero por turnos | número bajo |
+
+**Un 30 % en las flexiones no es un error.** Quiere decir que el ECR pasó del
+suelo del 4.5 % mientras el FCR trabajaba, lo que depende de cuánto estabilice
+cada persona la muñeca; en el banco, la misma persona dio «no se informa» en una
+sesión y 30 % en otra. Lo que no cambia es el orden: la presa sale claramente
+por encima.
+
+La presa es la única maniobra de este montaje que da siempre un número, y la
+comparación con la alternancia rápida del ejercicio 2b es la que cierra el
+argumento: en las dos trabajan los dos músculos, pero solo en la presa trabajan **a
+la vez**, que es lo que el índice mide. La coactivación es una propiedad de la
+tarea, no del músculo.
+
+**Cuestiones.**
+- En las flexiones, ¿qué hace el ECR? Si su fila dice «no se informa», ¿por qué es
+  eso la respuesta correcta y no un fallo? Y si da un número bajo, ¿qué dice de
+  cómo se sostuvo la muñeca?
+- Durante la presa, ¿quién trabaja? Explique por qué los extensores de la muñeca
+  se contraen con fuerza al cerrar la mano aunque nadie extienda nada, y qué tiene
+  que ver con la epicondilitis lateral.
+- La separación entre canales durante los máximos: ¿está por debajo del 25 %? Si
+  pasa del 50 % la aplicación dice «canales sin separar». ¿Qué mide ese número y
+  qué se puede hacer con los electrodos?
+- Compare las MDF de los dos músculos en el panel 3. ¿Son distintas? ¿Qué puede
+  significar una MDF muy por encima del rango habitual?
+
+### Ejercicio 2b · Coactivación voluntaria y fatiga de un par
+
+**Objetivo.** Ver que la coactivación depende de la tarea, no del músculo.
+
+**Procedimiento.** Sin recalibrar, grabar de nuevo: 10 s de **flexiones y
+extensiones alternas rápidas** (como agitar la mano), y luego una **presa
+mantenida 30 s**.
+
+**Datos a recoger.** Índice de coactivación de la ventana de alternancia y de la
+presa; veredicto de fatiga de cada músculo en la presa (panel 7 dibuja los dos).
+
+**Cuestiones.**
+- ¿Sale más coactivación en la alternancia rápida o en la presa? ¿Por qué el
+  índice compara la *forma* de las dos envolventes y no su tamaño?
+- En la presa mantenida, ¿cuál de los dos músculos muestra antes la caída de la
+  MDF? Proponga una explicación.
+
+---
+
+### Variante · Un segundo par: bíceps y tríceps
+
+La práctica 2 es **agonista / antagonista**, no «flexores y extensores del
+antebrazo». La aplicación no sabe qué músculo hay debajo de cada electrodo: los
+canales se llaman «agonista» y «antagonista», el docente escribe los nombres en
+«Etiquetas» y todo lo que se mide —la referencia de CVM, el % CVM, la tabla de
+contracciones, el índice de coactivación, la MDF— se calcula igual con cualquier
+par. Esta variante está escrita para que se vea, y porque el par del codo resuelve
+un caso del pilotaje: **una alumna a la que la flexión y la extensión de muñeca le
+salían mezcladas**, con las dos envolventes subiendo juntas en todas las maniobras.
+En bíceps y tríceps el gesto es más grande, la diafonía menor y la disociación se
+ve de inmediato; si tampoco se separan allí, el problema está en la técnica y no en
+el sujeto.
+
+**Montaje.** Dos canales: **bíceps braquial** en el canal 1 (A1), sobre el vientre
+del músculo en la cara anterior del brazo, y **tríceps braquial** (cabeza lateral)
+en el canal 2 (A2), en la cara posterior, a media altura entre el acromion y el
+olécranon. Referencia común en el **olécranon** o en el acromion. Selector en
+**Contracción agonista / antagonista**; etiquetas «Bíceps» y «Tríceps», que van a
+la cabecera del EDF y a todos los informes. Brazo apoyado y codo a unos 90°, de
+modo que ninguno de los dos músculos tenga que sostener el miembro.
+
+**Las maniobras, por si se compara con el antebrazo.** Seis flexiones de codo
+contra resistencia suave, seis extensiones y, en lugar de la presa, una
+**cocontracción**: «contraiga el codo como si quisiera doblarlo y estirarlo a la vez,
+sin moverlo», tres segundos. La presa no existe en este par, y esa es la diferencia
+importante: en el antebrazo la presa es una tarea real que enciende los dos
+músculos sola; aquí hay que pedir la cocontracción, que es una instrucción
+artificial y cada sujeto la interpreta a su manera, así que el número del índice se
+compara con el de esa misma persona, no con el del par del antebrazo.
+
+**La referencia se pide igual, con el gesto de este par.** El asistente pide una
+contracción breve e intensa del movimiento que hace cada músculo (apartado 4): una
+flexión de codo a la máxima potencia para el bíceps, una extensión para el tríceps.
+La regla es la de siempre —la referencia solo sirve de vara de medir si recluta la
+misma masa muscular que la tarea—, y con este par el gesto es el propio del codo.
+
+**Qué revisar la primera vez.** Los límites que la aplicación usa para avisar están
+**medidos sobre el par del antebrazo** (FCR y ECR), y este par no tiene por qué
+comportarse igual:
+
+| Aviso | Valor por omisión | Qué esperar en bíceps/tríceps |
+|---|---|---|
+| Canales no separados | el callado llega al 50 % de su propia referencia durante el máximo del otro | menos diafonía (están en caras opuestas y más separados): si salta, lo más probable es que un electrodo esté mal puesto |
+| Suelo del índice | 4.5 % CVM de media en la ventana | la cocontracción debería superarlo con holgura; una extensión limpia no |
+| Máximo poco creíble | la tarea pasa del 125 % de la referencia | si salta, la contracción de referencia no fue máxima: repítala antes de dar por bueno el % CVM |
+
+Conviene hacer **un registro de prueba por par nuevo** antes de usarlo con el
+grupo, mirar esos tres avisos y anotar en el cuaderno del puesto los valores que
+salieron. La aplicación no los cambia sola.
+
+**Qué se conserva y qué no.** Se conserva todo el método: normalización, tabla de
+contracciones, índice por ventana, fatiga, informe. No se conservan los **rangos
+orientativos** del apartado final de este guion, que están medidos en antebrazo, ni
+la lectura clínica de la presa.
+
+## Práctica 3 — Cinemática muscular (nivel avanzado)
+
+**Montaje.** Un canal sobre el **bíceps braquial**, referencia en el olécranon, y
+el **acelerómetro** de la placa BITalino sujeto con cinta sobre el **dorso de la muñeca**
+(el segmento que se mueve). Selector en **Cinemática muscular**. El cableado es
+una convención que la caja del acelerómetro dice: **el músculo en A1 y el
+acelerómetro en A2**. En esa caja, colocación «sobre el segmento que se mueve», y
+en «Etiquetas» el nombre del músculo (bíceps), que va a la cabecera del EDF.
+
+**Lo que enseña la aplicación en esta práctica.** Los controles finos aparecen
+(corte de la envolvente, región, EDF afinado, estudio fuerza-velocidad). El
+análisis ofrece los tres paneles básicos más **10. EMG vs MMG**, **11. Temblor** y
+**12. Movimiento vs EMG**. La tabla de contracciones añade el **retraso
+electromecánico (EMD)** de cada esfuerzo: el tiempo entre el inicio de la señal
+eléctrica y el inicio del movimiento en el acelerómetro. El botón **«Ensayar…»**
+corre todo el procedimiento de fuerza-velocidad sin hardware, con una señal
+simulada, para aprenderlo antes de atar a nadie a nada.
+
+### Ejercicio 3a · La relación fuerza-velocidad
+
+**Objetivo.** Obtener la curva fuerza-velocidad del bíceps con cargas conocidas.
+
+**Fundamento.** Cuanta más carga, más despacio se acorta el músculo; contra una
+carga igual a su máximo no se mueve (isométrica). La potencia (fuerza × velocidad)
+es máxima con cargas intermedias. El acelerómetro da la velocidad de la elevación
+y el EMG la activación.
+
+**Procedimiento.**
+1. Preparar cuatro cargas conocidas (por ejemplo 0, 1, 2 y 3 kg: una botella y
+   mancuernas o botellas llenas).
+2. La caja **«Estudio fuerza-velocidad»** trae los dos primeros pasos de la
+   secuencia. **«Parámetros de la F-V…»** pide el **plan** (las cargas en
+   orden, cuántos levantamientos por carga —tres por defecto— y los segundos
+   de preparación y de levantamiento) y lo guarda. **El plan se guarda en
+   cada equipo**: al lado del botón se lee el último que se guardó ahí, que
+   no tiene por qué ser el de por defecto, así que conviene mirarlo antes de
+   empezar. **«Ensayar…»**, a su lado,
+   recorre el procedimiento entero sin hardware, que es opcional y merece una
+   pasada antes de que nadie sostenga un peso. Y **«Iniciar grabación»** lleva
+   la sesión sola: pide el nombre del archivo, **calibra primero el máximo**
+   (calentamiento y tres contracciones máximas, breves e intensas), anuncia
+   el estudio y, para cada carga, pide las
+   repeticiones de **una elevación rápida**, cada una con su cuenta atrás y
+   marcada en el fichero con su carga. Debajo del cuadro van **dos filas de
+   casillas**: arriba los levantamientos de la carga que se está haciendo y
+   abajo el experimento entero, agrupado por carga y con la que toca
+   perfilada. No hay otro máximo en vacío entre
+   medias: la calibración ya lo fue. Basta seguir la pantalla; «Cancelar guía
+   (Esc)» la detiene sin parar la grabación.
+3. **Detener**. En Análisis, la tabla de contracciones trae una fila por
+   levantamiento con su carga, y **«Estudio fuerza-velocidad…»** lee esas filas y
+   devuelve cuatro curvas: carga-velocidad, fuerza-velocidad (hiperbólica
+   normalizada), potencia y reclutamiento (amplitud EMG frente a carga).
+
+**Datos a recoger.**
+
+| Carga (kg) | Velocidad pico (u. rel.) | RMS del bíceps (% CVM) |
+|---|---|---|
+| 0 | | |
+| 1 | | |
+| 2 | | |
+| 3 | | |
+
+Carga de potencia máxima: ____ kg.
+
+**Cuestiones.**
+- ¿Baja la velocidad al subir la carga? ¿Con qué forma? ¿Dónde cae la potencia
+  máxima?
+- ¿Sube la amplitud EMG con la carga aunque la velocidad baje? ¿Qué mecanismo lo
+  explica?
+- ¿Por qué la calibración isométrica del máximo se hace con el codo bloqueado?
+
+### Ejercicio 3b · El retraso electromecánico
+
+**Objetivo.** Medir el tiempo entre la orden eléctrica y el movimiento.
+
+**Fundamento.** Entre que la fibra se despolariza y el segmento empieza a moverse
+pasan unas decenas de milisegundos: liberación de calcio, formación de puentes,
+tensado de los elementos elásticos en serie. En adultos sanos el retraso está
+entre **30 y 100 ms** en contracciones voluntarias.
+
+**Procedimiento.** Con el mismo montaje, **Iniciar grabación** y hacer **ocho
+flexiones rápidas** del codo sin carga, partiendo del brazo relajado y colgando, con
+3 s de reposo entre ellas. **Detener**. En la tabla de contracciones, columna
+**EMD (ms)**.
+
+**Datos a recoger.** EMD de las ocho flexiones; media y desviación.
+
+**Cuestiones.**
+- ¿Están sus valores dentro del rango? ¿Qué pasos fisiológicos ocupan ese tiempo?
+- Repita tres flexiones **con 2 kg en la mano**. ¿Cambia el retraso? ¿Por qué el
+  segmento tarda más en empezar a moverse cuando hay que vencer una carga?
+
+### Ejercicio 3c · El temblor fisiológico
+
+**Objetivo.** Ver el temblor fisiológico en el acelerómetro y situar su frecuencia.
+
+**Procedimiento.** **Iniciar grabación** y mantener el brazo **extendido al frente,
+horizontal, 30 s**, sin apoyo; después, otros 30 s sosteniendo 2 kg. **Detener**.
+Panel **11. Temblor**: el espectro del acelerómetro.
+
+**Datos a recoger.** Frecuencia del pico del temblor sin carga ____ Hz; con carga
+____ Hz.
+
+**Cuestiones.**
+- ¿Cae el pico entre 8 y 12 Hz? ¿Cambia con la carga?
+- El temblor fisiológico se debe en parte a la descarga sincronizada de unidades
+  motoras y en parte a la mecánica del segmento. ¿Qué parte cambiaría con la
+  carga y cuál no?
+
+---
+
+## Rangos orientativos para interpretar
+
+Los números de la tabla son **orientativos**, no límites: valen para EMG de
+superficie en adultos sanos, y dependen del músculo, de los electrodos y del
+sujeto. Un valor fuera de rango es una pregunta, no un error. Estos mismos rangos
+aparecen en gris bajo las fichas del resumen y en los «?» de las tablas.
+
+| Medida | Rango orientativo | De dónde sale |
+|---|---|---|
+| Frecuencia media (MNF) | 80–170 Hz | el grueso de la energía del EMG de superficie está entre 50 y 150 Hz; la MNF queda siempre algo por encima de la MDF por la cola del espectro |
+| Frecuencia mediana (MDF) | 60–150 Hz; en el antebrazo, más bien 90–150 | la misma banda; en el banco (FCR y ECR) 86–127 Hz con buen montaje; 176 Hz con el electrodo mal situado |
+| Caída de la MDF con la fatiga | pendiente negativa clara; sin umbral universal de magnitud | la aplicación no exige una cuantía sino una tendencia que ajuste (R² ≥ 0.30, ≥ 4 ventanas de 1 s) |
+| RMS en reposo | ≈ 0.005–0.02 mV | ruido de fondo del amplificador y la piel (≥ 8 µV pico a pico en el mejor caso) |
+| RMS en esfuerzo firme | 0.1–1 mV; máximos hasta ~1.5 mV | electrodos de superficie sobre músculos de extremidad |
+| Esfuerzo de tarea | 20–80 % CVM | un esfuerzo submáximo típico; > 100 % sostenido dice que la calibración no fue máxima |
+| Máximo de la tarea con buena calibración | 90–125 % CVM | sesiones de banco con calibración correcta; la aplicación avisa en rojo a partir del 150 % |
+| Coactivación del antagonista | 5–10 % CVM en esfuerzos suaves; 25–35 % en máximos | tríceps durante la flexión máxima del codo ≈ 26 %; extensor de los dedos durante la flexión de muñeca al 75 % ≈ 15 % |
+| Índice de coactivación (Falconer-Winter) | movimiento recíproco: «no se informa», o bajo (≈ 30 %) si el antagonista pasa del suelo; presa firme cerrando la mano sobre la pelota: claramente más alto | el índice mide actividad compartida; en una flexión limpia el antagonista no llega al suelo del 4.5 % |
+| Separación entre canales (diafonía) | ≤ 20–25 % de la propia referencia | banco con electrodos bien situados; > 50 %, «canales sin separar» |
+| Carga estática (P10) | ≤ 2–5 % CVM (la aplicación usa 5) | Jonsson 1978, 1982 |
+| Carga mediana (P50) | ≤ 10–14 % CVM (la aplicación usa 14) | Jonsson 1978, 1982 |
+| Carga pico (P90) | ≤ 50–70 % CVM (la aplicación usa 70) | Jonsson 1978, 1982 |
+| Retraso electromecánico | 30–100 ms; voluntario, 35–80 ms | Cavanagh y Komi 1979: bíceps 41 ± 13 ms, tríceps 26 ± 11 ms |
+| Temblor fisiológico | pico a 8–12 Hz | acelerometría de la postura mantenida en adultos sanos |
+| Umbral de inicio de contracción | reposo + 3 desviaciones típicas | Hodges y Bui 1996 |
+
+---
+
+## Anexo — Plantilla de informe del alumnado
+
+Para cada práctica, entregar:
+
+1. **Identificación**: identificador de prueba, músculo(s), dispositivo, práctica
+   y ejercicios realizados.
+2. El **informe PDF** que genera la aplicación (tiene las figuras, la calibración
+   con sus repeticiones, la tabla de contracciones y las fichas). Con la difusión
+   activa se descarga en el propio móvil.
+3. Las **tablas de datos** de los ejercicios, copiadas del informe.
+4. Las **respuestas razonadas** a las cuestiones, citando los números.
+5. Una **conclusión** breve que relacione lo observado con la fisiología: unidad
+   motora, reclutamiento, velocidad de conducción, relación fuerza-velocidad,
+   riesgo ergonómico.
+
+> **Nota para el profesorado.** Lo que decide la calidad de una práctica es la
+> calibración: una máxima que no lo fue vuelve falsos todos los porcentajes, y la
+> aplicación lo dice en rojo en la ficha «Máximo de la tarea». Conviene
+> comprobarla antes de dejar que el grupo siga. Las cuestiones marcadas con
+> comparaciones entre grupos funcionan mejor si cada grupo hace una tarea
+> distinta en 1d. Los rangos de la tabla anterior están también en la aplicación,
+> de modo que el alumno tiene contra qué interpretar sin abrir el guion.

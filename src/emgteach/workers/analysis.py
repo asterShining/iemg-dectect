@@ -1,0 +1,1477 @@
+"""Background worker for full offline EMG analysis.
+
+Runs the seven-panel analysis pipeline in a QThread so the GUI stays
+responsive while a long EDF file is being processed. The result is
+emitted as a single dictionary that the analysis tab consumes to draw
+all plots.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+import numpy as np
+from PySide6.QtCore import QThread, Signal
+from scipy.integrate import trapezoid
+
+from emgteach.coactivation import (
+    coactivation_by_fragments,
+    coactivation_by_window,
+)
+from emgteach.contractions import contraction_table, mean_emd_ms
+from emgteach.dsp import (
+    compute_psd_mnf_mdf,
+    compute_segments,
+    detect_acquisition_problems,
+    detect_onsets,
+    process_offline,
+)
+from emgteach.fatigue import (
+    FATIGUE,
+    NO_FATIGUE,
+    active_segments,
+    fatigue_verdict,
+    fit_mdf_vs_time,
+    fit_rms_vs_mdf,
+)
+from emgteach.force_velocity import (
+    markers_by_span,
+    movement_onset_signal,
+    parse_fv_load_markers,
+    velocity_from_acc,
+    windows_from_markers,
+)
+from emgteach.guided import (
+    MARGIN_S,
+    effort_ratio,
+    fragments_hull,
+    gradation_steps,
+    load_fatigue,
+    load_piece,
+    load_row,
+    load_span,
+    measured_windows,
+    rapid_train,
+    rest_level,
+    train_span,
+)
+from emgteach.i18n import tr
+from emgteach.io import (
+    list_edf_channels,
+    list_edf_emg_channels,
+    read_edf_mne,
+    read_edf_pyedflib,
+)
+from emgteach.mvc import parse_mvc_ref_markers
+from emgteach.phases import (
+    NO_CALIBRATION,
+    mvc_reference,
+    parse_phase_markers,
+    rep_values,
+    strip_phase_markers,
+)
+from emgteach.profiles import EMG_PROFILE, SignalProfile
+from emgteach.selection import Segment, normalise_segments, total_duration_s
+from emgteach.sessions import GRAD_MVC_WINDOW_S, parse_session_markers
+
+
+def _cola_de_la_pausa(envelope, fs: float, phases, profile):
+    """The resting stretch a two-phase session leaves for the taking, or None.
+
+    The last ``onset_baseline_s`` of the preparation pause. The end and not the
+    whole of it: the pause begins as the subject lets go of the third maximal
+    contraction, and the tail of a maximal effort is not a resting level. Taking
+    the quietest window anywhere in the pause would bias the threshold low by
+    construction; taking the end asks the plainest question there is — what was
+    this muscle doing in the second before the recording started.
+    """
+    if envelope is None or phases.prep_start_s is None or phases.rec_start_s is None:
+        return None
+    env = np.asarray(envelope, dtype=np.float64)
+    i0 = max(0, round(phases.prep_start_s * fs))
+    i1 = min(env.size, round(phases.rec_start_s * fs))
+    n_base = max(2, int(profile.onset_baseline_s * fs))
+    if i1 - i0 < n_base:
+        return None
+    return env[i1 - n_base:i1]
+
+
+def _contracted(envelope, fs: float, profile, baseline=None) -> bool:
+    """Did this muscle actually contract, by the application's own definition?
+
+    Reported so the event log can say when a channel never left its baseline —
+    a muscle that stayed silent is a finding, and one worth naming rather than
+    leaving the reader to infer from a flat line. Which is exactly why it must
+    not be said wrongly: it is a statement about the subject's arm.
+
+    The test is the app's own onset detector rather than a threshold invented
+    here, so "a contraction happened" means the same thing everywhere in the
+    program. But the detector takes its baseline from the opening second of
+    whatever it is given, and in a two-phase session that second is *not*
+    quiet — the countdown tells the subject the recording is starting. So the
+    preparation pause is glued in front, the detector finds its rest there, and
+    only onsets that land in the analysed span are counted. On the session that
+    found this, the extensor reached 151 µV against a threshold of 78 and was
+    still reported as never having left its baseline.
+    """
+    env = np.asarray(envelope, dtype=np.float64)
+    desplazamiento = 0.0
+    if baseline is not None:
+        base = np.asarray(baseline, dtype=np.float64)
+        if base.size >= int(profile.onset_baseline_s * fs):
+            env = np.concatenate([base, env])
+            desplazamiento = base.size / float(fs)
+    try:
+        inicios = detect_onsets(
+            env, fs,
+            k=profile.onset_k,
+            baseline_s=profile.onset_baseline_s,
+            refractory_s=profile.onset_refractory_s,
+            min_duration_s=profile.onset_min_duration_s,
+        )
+    except Exception:      # a span too short to hold a baseline
+        return False
+    # The join between the pause and the recording is itself a step, and when
+    # the subject starts at the countdown that step *is* the first onset —
+    # which is the right answer, not an artefact.
+    return any(float(t) >= desplazamiento for t in inicios)
+
+
+def _sustained(envelope, fs: float, window_s: float):
+    """The envelope as a running mean over ``window_s`` seconds.
+
+    The MVC reference is measured the same way
+    (:func:`emgteach.mvc.mvc_peak_hold`), so anything that judges a recording
+    against it goes through here first: measured two different ways, the
+    ratio would move by itself. With the profile's ``mvc_peak_window_s`` of 0
+    the window is one sample and this is the envelope as it is, whose
+    highest point is compared with the reference's.
+    """
+    env = np.asarray(envelope, dtype=np.float64)
+    w = max(1, round(window_s * fs))
+    if w == 1 or env.size < w:
+        return env
+    csum = np.cumsum(np.insert(env, 0, 0.0))
+    return (csum[w:] - csum[:-w]) / w
+
+
+def _baseline_is_usable(envelope, fs: float, profile, baseline=None) -> bool:
+    """Could a resting baseline be measured at all?
+
+    The onset detector takes its baseline from the opening second, so a
+    recording that starts with the muscle already working has no baseline to
+    take: the threshold comes out above everything that follows and nothing is
+    ever detected. That looks identical to a muscle that stayed silent, and
+    saying so would be a false statement about the subject rather than about
+    the recording — so the two are told apart here.
+
+    The test is self-evident: a threshold higher than the recording's own
+    maximum cannot be a resting threshold.
+
+    ``baseline`` is a stretch known to be at rest — the preparation pause of
+    a two-phase session, which is quiet by construction. Given one, the
+    threshold comes from it instead of from the opening second of the
+    analysed span, which in that model is precisely *not* quiet: the
+    countdown tells the subject the recording is starting, so they start.
+    Measured on the first complete session, the extensor's opening second
+    was 41 µV against 17 µV during the pause, and the threshold it gave
+    (171 µV) sat above the recording's own maximum (130 µV) — so nothing was
+    ever detected, and the application told the student to do something it
+    had itself made impossible.
+    """
+    env = np.asarray(envelope, dtype=np.float64)
+    n_base = int(profile.onset_baseline_s * fs)
+    if env.size < n_base + 2 or n_base < 2:
+        return False
+    base = (
+        np.asarray(baseline, dtype=np.float64)
+        if baseline is not None and np.asarray(baseline).size >= 2
+        else env[:n_base]
+    )
+    umbral = float(np.mean(base) + profile.onset_k * np.std(base))
+    return umbral < float(np.max(env))
+
+
+def _channel_position(channel_name, emg_channels) -> int | None:
+    """Where a channel sits among the recording's EMG channels, or ``None``.
+
+    The wizard numbers muscles by that position — which is the order they
+    were labelled in — so it is what maps a channel name back to its
+    annotations, both the ``CAL`` spans and the cached ``MVC ref``.
+    """
+    if not channel_name:
+        return None
+    try:
+        return list(emg_channels).index(channel_name)
+    except ValueError:
+        return None
+
+
+def _ref_for(channel_name, emg_channels, *, phases, envelope, fs, cached,
+             profile, keep=None):
+    """``(reference_mV, source_token)`` for a named channel.
+
+    Delegates the decision to :func:`emgteach.phases.mvc_reference`, which is
+    the one place that ranks a reference recomputed from the calibration spans
+    above the value cached in the annotation. Passing the *untrimmed* envelope
+    matters: the calibration sits outside the analysed span by design, so an
+    envelope of the analysed span alone would have nothing to measure.
+    """
+    idx = _channel_position(channel_name, emg_channels)
+    if idx is None:
+        return None, NO_CALIBRATION
+    seleccion = None if keep is None else keep.get(idx)
+    try:
+        return mvc_reference(
+            idx, phases=phases, envelope=envelope, fs=fs, cached=cached,
+            percentile=profile.mvc_percentile,
+            window_s=profile.mvc_peak_window_s, keep=seleccion,
+        )
+    except ValueError:
+        # Every repetition of this channel unticked. The interface does not
+        # allow it, but a stale selection can outlive the file it was made
+        # on — and answering with the whole calibration is a smaller lie
+        # than answering with none of it.
+        return mvc_reference(
+            idx, phases=phases, envelope=envelope, fs=fs, cached=cached,
+            percentile=profile.mvc_percentile,
+            window_s=profile.mvc_peak_window_s,
+        )
+
+
+class AnalysisWorker(QThread):
+    """QThread that runs :func:`process_offline` plus spectral and fatigue fits.
+
+    Signals
+    -------
+    result_ready : dict
+        Carries the full result for every panel of the analysis tab.
+    progress : int
+        0..100 progress percentage for a progress bar.
+    log : str
+        Human-readable status updates.
+    error : str
+        Emitted on any failure during loading or processing.
+    """
+
+    result_ready = Signal(dict)
+    progress = Signal(int)
+    log = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        edf_path: str,
+        channel_name: str | None = None,
+        channel_name_2: str | None = None,
+        cal_keep: dict[int, set[int]] | None = None,
+        roi_labels: list[str] | None = None,
+        acc_channel: str | None = None,
+        acc_placement: str = "unknown",
+        f_low: float | None = None,
+        f_high: float | None = None,
+        f_notch: float | None = None,
+        f_env: float | None = None,
+        rms_window_ms: float | None = None,
+        seg_len_s: float | None = None,
+        overlap: float | None = None,
+        plot_duration_s: float = 10.0,
+        roi_start_s: float | None = None,
+        roi_end_s: float | None = None,
+        roi_segments: list[tuple[float, float]] | None = None,
+        detection_kwargs: dict[str, float] | None = None,
+        profile: SignalProfile = EMG_PROFILE,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._profile = profile
+        self._edf_path = edf_path
+        #: The detection settings the fragment editor was left on — the
+        #: sensitivity, the split between contractions, the co-activation
+        #: rule. The contraction table is built with the same numbers, so
+        #: what the student tuned by eye is what the rows are made of.
+        self._detection = dict(detection_kwargs or {})
+        self._roi_start_s = float(roi_start_s) if roi_start_s is not None else None
+        self._roi_end_s = float(roi_end_s) if roi_end_s is not None else None
+        # Optional multi-fragment selection. When given (and non-empty) it takes
+        # precedence over the single roi_start/roi_end window: the kept fragments
+        # are concatenated and analysed as one continuous signal.
+        self._roi_segments = (
+            [(float(a), float(b)) for a, b in roi_segments] if roi_segments else None
+        )
+        self._channel_name = (
+            channel_name if channel_name is not None else profile.raw_label
+        )
+        # Optional second channel: its envelope is overlaid (agonist/antagonist).
+        self._channel_name_2 = channel_name_2
+        #: Calibration repetitions to keep, by channel index. ``None`` keeps
+        #: them all, which is what every recording starts as. Discarding one
+        #: moves the reference and, with it, every % MVC in the analysis —
+        #: that is the point of offering the choice.
+        self._cal_keep = dict(cal_keep) if cal_keep else None
+        #: What the operator calls each fragment, in the same order as
+        #: ``roi_segments``. A named fragment becomes a window of the
+        #: co-activation table; an unnamed one is only signal worth
+        #: keeping. No algorithm can supply these — the onset detector
+        #: says a contraction started, not that this window is the grip.
+        self._roi_labels = list(roi_labels) if roi_labels else None
+        # Optional accelerometer channel: enables the MMG and tremor panels.
+        self._acc_channel = acc_channel
+        self._acc_placement = acc_placement
+        self._f_low = float(f_low) if f_low is not None else profile.f_low
+        self._f_high = float(f_high) if f_high is not None else profile.f_high
+        self._f_notch = float(f_notch) if f_notch is not None else profile.f_notch
+        self._f_env = float(f_env) if f_env is not None else profile.f_env
+        self._rms_window_ms = (
+            float(rms_window_ms) if rms_window_ms is not None else profile.rms_window_ms
+        )
+        self._seg_len_s = float(seg_len_s) if seg_len_s is not None else profile.seg_len_s
+        self._overlap = float(overlap) if overlap is not None else profile.overlap
+        self._plot_duration_s = float(plot_duration_s)
+        self._cancelled = False
+
+    def stop(self) -> None:
+        """Request that the next checkpoint abandon the run."""
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        """``True`` once :meth:`stop` has been called."""
+        return self._cancelled
+
+    def _resolve_roi(
+        self, n_samples: int, fs: float, full_duration: float
+    ) -> tuple[int, int, float, float] | None:
+        """Clamp and validate the requested region of interest.
+
+        Returns ``(i0, i1, start_s, end_s)`` sample bounds and their times,
+        or ``None`` (after emitting :attr:`error`) if the window is invalid.
+        When no ROI is requested the full recording ``(0, n_samples, ...)``
+        is returned. The analysis needs enough samples for the pipeline's
+        500 ms reflective padding, so a window shorter than 1 s is rejected.
+        """
+        start_s = 0.0 if self._roi_start_s is None else max(0.0, self._roi_start_s)
+        end_s = full_duration if self._roi_end_s is None else self._roi_end_s
+        end_s = min(end_s, full_duration)
+        if end_s - start_s < 1.0:
+            self.error.emit(
+                tr(
+                    "The selected region ({a:.2f}-{b:.2f} s) is shorter than "
+                    "the 1 s minimum required for analysis."
+                ).format(a=start_s, b=end_s)
+            )
+            return None
+        i0 = round(start_s * fs)
+        i1 = round(end_s * fs)
+        i0 = max(0, min(i0, n_samples))
+        i1 = max(i0, min(i1, n_samples))
+        return i0, i1, start_s, end_s
+
+    @staticmethod
+    def _ventanas_de_carga(
+        fv_loads: list[tuple[float, float]], fs: float, n_samples: int,
+    ) -> list[Segment] | None:
+        """One segment per lift of the guided force-velocity wizard, from
+        its load markers, in the analysed span's time; ``None`` without
+        markers, so the detector runs as everywhere else. The contraction
+        table trims each to the effort inside it."""
+        if not fv_loads:
+            return None
+        ventanas, _cargas = windows_from_markers(fv_loads, fs, n_samples)
+        return [Segment(i0 / fs, i1 / fs) for i0, i1 in ventanas if i1 > i0] or None
+
+    def _carga_sostenida(self, sesion, emg_raw, fs: float) -> tuple[float, float] | None:
+        """The held load of a fatigue session, in file time: the span the
+        analysis takes by default, so its windows, its MDF line and its
+        verdict are the held contraction's (guided.load_span) and not the
+        rests' around it, nor the picking up of the weight. One extra pass of
+        the DSP over the whole file, only for that session and for the quick
+        contractions, whose train is read on it when fragments are chosen
+        (guided.fragments_hull) and proposed as one fragment (guided.train_span)."""
+        carga = (sesion is not None and sesion.family == "HOLD"
+                 and sesion.params.get("mode") == "load")
+        tren = sesion is not None and sesion.family == "FAST"
+        if not (carga or tren):
+            return None
+        todo = process_offline(
+            emg_raw, fs, f_low=self._f_low, f_high=self._f_high,
+            f_notch=self._f_notch, f_env=self._f_env,
+            rms_window_ms=self._rms_window_ms,
+        )
+        env = todo["emg_envelope"]
+        # Kept for chosen fragments: the load is then read on the piece of it
+        # they keep, out of the whole file's filtered signal (no cut edges).
+        self._filtrado_sesion: np.ndarray | None = todo["emg_filtered"]
+        self._envolvente_sesion: np.ndarray | None = env
+        if tren:
+            self._tramo_tren: tuple[float, float] | None = train_span(sesion, env, fs)
+            return None
+        self._reposo_sesion = rest_level(sesion, env, fs)
+        self._fila_carga: tuple[float, float] | None = load_row(sesion, env, fs)
+        return load_span(sesion, env, fs)
+
+    def _tren_rapido(self, sesion) -> tuple[float, float] | None:
+        """The train of quick contractions and the three seconds of rest
+        before it, in file time: the rest is what the floor is compared with.
+        Run on past its end mark (guided.measured_windows), where the
+        subject is still making the contractions the cue to stop was late
+        for, and to the end of the last of them (guided.train_span)."""
+        if sesion is None or sesion.family != "FAST":
+            return None
+        trenes = sesion.spans_named("train")
+        if not trenes:
+            return None
+        fin = trenes[-1].end_s + MARGIN_S
+        if self._tramo_tren is not None:
+            fin = max(fin, self._tramo_tren[1])
+        if sesion.end_s is not None:
+            fin = min(fin, sesion.end_s)
+        return (max(0.0, trenes[-1].start_s - 3.0), max(trenes[-1].end_s, fin))
+
+    @staticmethod
+    def _tramos_de_sesion(sesion, piezas) -> list[Segment] | None:
+        """One segment per effort a guided session marked, in the analysed
+        signal's time, run on past its end (guided.measured_windows): the
+        subject lets go after the cue, not on it. ``None`` without a session,
+        so the next rule applies. The contraction table trims each to the
+        effort inside it."""
+        if sesion is None:
+            return None
+        return [Segment(a, b) for t, a, b in measured_windows(sesion, piezas)
+                if b > a and t.name != "rest"] or None
+
+    def _resolve_segments(
+        self, n_samples: int, fs: float, full_duration: float,
+        default_span: tuple[float, float] | None = None,
+    ) -> list[tuple[int, int, float, float, str]] | None:
+        """Resolve the analysis fragments into ordered sample-index windows.
+
+        Precedence: an explicit multi-fragment ``roi_segments`` list, else the
+        single ``roi_start_s``/``roi_end_s`` window, else the whole recording.
+        The fragments are clamped to the recording, ordered and merged if they
+        overlap. The total kept time must be at least 1 s (the pipeline's
+        reflective-padding minimum); otherwise :attr:`error` is emitted and
+        ``None`` is returned.
+
+        Returns ``[(i0, i1, start_s, end_s, label), ...]`` in chronological
+        order. The label travels with the fragment through the merging, so
+        a name given in the editor survives whatever tidying happens here.
+        """
+        etiquetas = self._roi_labels or []
+        if self._roi_segments:
+            requested = [
+                Segment(a, b, label=etiquetas[i] if i < len(etiquetas) else "")
+                for i, (a, b) in enumerate(self._roi_segments)
+            ]
+        elif self._roi_start_s is not None or self._roi_end_s is not None:
+            start = self._roi_start_s if self._roi_start_s is not None else 0.0
+            end = self._roi_end_s if self._roi_end_s is not None else full_duration
+            requested = [Segment(start, end)]
+        elif default_span is not None:
+            # A two-phase recording analyses its recording phase. The
+            # calibration and the preparation pause are before it and drop
+            # out here, with no separate notion of excluded regions to keep
+            # in step with anything.
+            requested = [Segment(*default_span)]
+        else:
+            return [(0, n_samples, 0.0, full_duration, "")]
+
+        segs = normalise_segments(requested, full_duration)
+        total = total_duration_s(segs)
+        if not segs or total < 1.0:
+            self.error.emit(
+                tr(
+                    "The selected fragments total {t:.2f} s, below the 1 s "
+                    "minimum required for analysis."
+                ).format(t=total)
+            )
+            return None
+
+        bounds: list[tuple[int, int, float, float, str]] = []
+        for s in segs:
+            i0 = max(0, min(round(s.start_s * fs), n_samples))
+            i1 = max(i0, min(round(s.end_s * fs), n_samples))
+            if i1 > i0:
+                bounds.append((i0, i1, s.start_s, s.end_s, s.label))
+        return bounds
+
+    def run(self) -> None:
+        try:
+            # 1) Load EDF
+            self.log.emit(tr("Loading file: {path}").format(path=self._edf_path))
+            self.progress.emit(5)
+            edf = read_edf_mne(self._edf_path, self._channel_name)
+            emg_raw = edf["emg_raw"]
+            fs = edf["sfreq"]
+            times = edf["times"]
+            markers = edf.get("markers", [])
+            # Read before any fragment trimming: a calibration made
+            # outside the analysed span is still this muscle's
+            # maximum, and dropping it would send the panel back to
+            # millivolts for no good reason.
+            mvc_refs = parse_mvc_ref_markers(markers)
+            # The shape of the session, read before anything is trimmed: the
+            # calibration lies outside the analysed span on purpose.
+            phases = parse_phase_markers(markers)
+            # A guided session of the one-muscle practical, if the file was
+            # recorded with one: its marks say where each effort was.
+            sesion = parse_session_markers(markers)
+            # The gradation measures its maximum, its task maximum and its rows
+            # as the highest mean over half a second, like the level its steps
+            # hold (sessions.GRAD_MVC_WINDOW_S); the other practicals keep the
+            # profile's peak.
+            if sesion is not None and sesion.family == "GRAD":
+                self._profile = replace(self._profile,
+                                        mvc_peak_window_s=GRAD_MVC_WINDOW_S)
+            # The loads of the guided force-velocity wizard, kept apart: the
+            # contraction chart groups the efforts by them.
+            fv_loads = parse_fv_load_markers(markers)
+            # The MVC references and the force-velocity loads are facts about
+            # the session, not phases of it. Once read they are dropped, so
+            # they neither clutter every panel with a marker line nor open a
+            # window in the co-activation table — the student's own marks are
+            # what divide a recording into phases.
+            markers = strip_phase_markers([
+                m for m in markers
+                if not parse_mvc_ref_markers([m])
+                and not parse_fv_load_markers([m])
+            ])
+            try:
+                emg_channels = list_edf_emg_channels(self._edf_path)
+            except Exception:
+                emg_channels = []
+
+            # The calibration spans are in file time and lie outside the
+            # analysed span by design, so the reference is recomputed from an
+            # envelope of the *whole* recording. One extra pass of the DSP,
+            # and only when there is a calibration in the file to measure.
+            env_calibracion = None
+            if phases.cal_reps:
+                env_calibracion = process_offline(
+                    emg_raw, fs,
+                    f_low=self._f_low, f_high=self._f_high,
+                    f_notch=self._f_notch, f_env=self._f_env,
+                    rms_window_ms=self._rms_window_ms,
+                )["emg_envelope"]
+
+            # 1b) Restrict to the selected fragment(s), if requested. The kept
+            # fragments are concatenated into one continuous signal; everything
+            # downstream (DSP, PSD, segments, fatigue) runs on it, time is
+            # re-based to 0 and markers are shifted into concatenated time (those
+            # in discarded fragments are dropped). The kept windows are recorded
+            # in the result so the report states them explicitly.
+            full_duration = float(times[-1])
+            self._reposo_sesion = None
+            self._filtrado_sesion = None
+            self._envolvente_sesion = None
+            self._tramo_tren = None
+            self._fila_carga = None
+            tramo_carga = self._carga_sostenida(sesion, emg_raw, fs)
+            bounds = self._resolve_segments(
+                len(emg_raw), fs, full_duration,
+                default_span=(tramo_carga
+                              or self._tren_rapido(sesion)
+                              or phases.rec_span(full_duration, fv_loads)),
+            )
+            if bounds is None:
+                return  # error already emitted
+            kept_segments = [(s, e) for (_, _, s, e, _lbl) in bounds]
+            # Where each kept piece of the file lands in the analysed signal:
+            # what moves a guided session's stretches into its time.
+            piezas: list[tuple[float, float, float]] = []
+            _off = 0.0
+            for (_i0, _i1, _a, _b, _lbl) in bounds:
+                piezas.append((_a, _b, _off))
+                _off += (_i1 - _i0) / fs
+            fragmentos_concat: list[Segment] = []
+            is_whole = (
+                len(bounds) == 1
+                and bounds[0][0] == 0
+                and bounds[0][1] == len(emg_raw)
+            )
+            # The co-activation table is read on the recording phase *uncut*,
+            # before the fragments below are concatenated for everything
+            # else: a named window is a mask over that envelope, and the
+            # resting level the index subtracts comes from a signal that still
+            # has rest in it. Read off the concatenation, the "rest" was the
+            # quietest the muscle got while working (coactivation_by_fragments).
+            tramo_completo: tuple[int, int] | None = None
+            env_completo_1 = None
+            fragmentos_completo: list[tuple[float, float, str]] = []
+            if self._roi_segments and not is_whole:
+                a, b = phases.rec_span(full_duration, fv_loads) or (
+                    0.0, full_duration)
+                a, b = min(a, bounds[0][2]), max(b, bounds[-1][3])
+                tramo_completo = (
+                    max(0, round(a * fs)), min(len(emg_raw), round(b * fs)))
+                env_completo_1 = process_offline(
+                    emg_raw[tramo_completo[0]:tramo_completo[1]], fs,
+                    f_low=self._f_low, f_high=self._f_high,
+                    f_notch=self._f_notch, f_env=self._f_env,
+                    rms_window_ms=self._rms_window_ms,
+                )["emg_envelope"]
+                fragmentos_completo = [
+                    (seg_a - a, seg_b - a, nombre or "")
+                    for (_i0, _i1, seg_a, seg_b, nombre) in bounds
+                ]
+            # The task maximum is read on the recording phase uncut — from
+            # REC start to the end of the file, or the whole file when there
+            # are no phases — whatever fragments or window were chosen: a
+            # maximum of the phase, not of the selection. Read on the
+            # concatenation, two fragments cut inside their contractions and
+            # glued together lifted the envelope above either real peak (five
+            # points on one recording), and a burst outside the fragments —
+            # a movement on letting go — was not seen at all.
+            fase = phases.rec_span(full_duration, fv_loads) or (0.0, full_duration)
+            tramo_fase = (max(0, round(fase[0] * fs)),
+                          min(len(emg_raw), round(fase[1] * fs)))
+            es_la_fase = (
+                len(bounds) == 1
+                and bounds[0][0] == tramo_fase[0]
+                and bounds[0][1] == tramo_fase[1]
+            )
+            env_fase_1 = None
+            env_fase_2 = None
+            if not es_la_fase:
+                env_fase_1 = (
+                    env_completo_1 if tramo_completo == tramo_fase
+                    else process_offline(
+                        emg_raw[tramo_fase[0]:tramo_fase[1]], fs,
+                        f_low=self._f_low, f_high=self._f_high,
+                        f_notch=self._f_notch, f_env=self._f_env,
+                        rms_window_ms=self._rms_window_ms,
+                    )["emg_envelope"]
+                )
+            if not is_whole:
+                emg_raw = np.concatenate(
+                    [emg_raw[i0:i1] for (i0, i1, _, _, _) in bounds])
+                times = np.arange(len(emg_raw), dtype=np.float64) / fs
+                new_markers: list[tuple[float, str]] = []
+                new_loads: list[tuple[float, float]] = []
+                # The kept fragments in the concatenated timeline, with
+                # their names: these are the contractions the table gets,
+                # one row each, numbered as the editor numbered them.
+                fragmentos_concat = []
+                cargas_por_fragmento = markers_by_span(
+                    fv_loads, [(a, b) for (_i0, _i1, a, b, _n) in bounds])
+                offset = 0.0
+                for j, (i0, i1, seg_a, seg_b, nombre) in enumerate(bounds):
+                    fragmentos_concat.append(
+                        Segment(offset, offset + (i1 - i0) / fs, label=nombre or ""))
+                    # A named fragment opens a window of the co-activation
+                    # table, at its own start in the concatenated timeline.
+                    # This is the whole mechanism: the operator says "this one
+                    # is the grip" over a trace they can see, and the table
+                    # that could only ever say "whole recording" gets its rows.
+                    # Repeats are not filtered here — coactivation_by_window
+                    # merges consecutive equal names, so the same rule holds
+                    # for a tuned file reopened from disk.
+                    if nombre:
+                        new_markers.append((offset, nombre))
+                    for t, label in markers:
+                        if seg_a <= t < seg_b:
+                            new_markers.append((offset + (t - seg_a), label))
+                    # The load markers move with the signal they mark, so a
+                    # contraction in concatenated time still finds its load.
+                    # A marker sits at the start of its window, half a
+                    # second or more before the effort it announces, so a
+                    # fragment cut tight round the effort leaves it outside:
+                    # it goes to the one fragment it announced (see
+                    # markers_by_span), at that fragment's start.
+                    for t, kg in cargas_por_fragmento.get(j, []):
+                        new_loads.append((offset + max(0.0, t - seg_a), kg))
+                    offset += (i1 - i0) / fs
+                markers = sorted(new_markers)
+                fv_loads = sorted(new_loads)
+                if len(bounds) == 1:
+                    self.log.emit(
+                        tr("Region of interest: {a:.2f}-{b:.2f} s ({d:.2f} s).").format(
+                            a=kept_segments[0][0],
+                            b=kept_segments[0][1],
+                            d=kept_segments[0][1] - kept_segments[0][0],
+                        )
+                    )
+                else:
+                    kept_total = sum(b - a for a, b in kept_segments)
+                    self.log.emit(
+                        tr(
+                            "Analysing {n} selected fragments "
+                            "({d:.2f} s of {full:.2f} s)."
+                        ).format(n=len(bounds), d=kept_total, full=full_duration)
+                    )
+
+            roi_start_s = kept_segments[0][0]
+            roi_end_s = kept_segments[-1][1]
+            duration = float(times[-1])
+            self.log.emit(
+                tr("Channel «{name}» — {fs:.0f} Hz — {dur:.1f} s").format(
+                    name=self._channel_name, fs=fs, dur=duration
+                )
+            )
+            self.progress.emit(15)
+
+            # 2) Acquisition diagnostics on the raw signal
+            diag = detect_acquisition_problems(emg_raw, fs)
+            for warning in diag["warnings"]:
+                self.log.emit(warning)
+
+            n_plot = (
+                int(self._plot_duration_s * fs)
+                if self._plot_duration_s > 0
+                else len(emg_raw)
+            )
+            n_plot = min(n_plot, len(emg_raw))
+            t_plot = times[:n_plot]
+
+            # 3) Full DSP pipeline
+            self.log.emit(tr("Applying the processing pipeline (DSP)…"))
+            proc = process_offline(
+                emg_raw,
+                fs,
+                f_low=self._f_low,
+                f_high=self._f_high,
+                f_notch=self._f_notch,
+                f_env=self._f_env,
+                rms_window_ms=self._rms_window_ms,
+            )
+            self.progress.emit(45)
+            if self._cancelled:
+                return
+
+            # 4) Spectral analysis
+            self.log.emit(tr("Computing PSD, MNF and MDF…"))
+            psd_result = compute_psd_mnf_mdf(
+                proc["emg_filtered"], fs, f_low=self._f_low, f_high=self._f_high
+            )
+            # The same spectrum before the filter, over the whole band the
+            # sampling allows. Drawn faintly behind the filtered one so the
+            # student sees what the band-pass and the notch took away — the
+            # mains line at 50 Hz, the movement below 20 Hz — instead of being
+            # told that a filter was applied.
+            psd_bruto = compute_psd_mnf_mdf(
+                emg_raw, fs, f_low=0.0, f_high=fs / 2.0
+            )
+            self.log.emit(
+                f"MNF = {psd_result['mnf']:.1f} Hz   "
+                f"MDF = {psd_result['mdf']:.1f} Hz"
+            )
+            self.progress.emit(60)
+            if self._cancelled:
+                return
+
+            # 5) Segment-wise RMS and MDF
+            self.log.emit(tr("Computing segment-wise RMS and MDF…"))
+            segs = compute_segments(
+                proc["emg_filtered"],
+                fs,
+                seg_len_s=self._seg_len_s,
+                overlap=self._overlap,
+                f_low=self._f_low,
+                f_high=self._f_high,
+            )
+            self.progress.emit(75)
+            if self._cancelled:
+                return
+
+            # 6) Fatigue fit: linear MDF-vs-time regression (primary index).
+            # Fitted over the segments where the muscle was working, not over
+            # the whole selection: the median frequency of a resting segment is
+            # the median frequency of the amplifier, and mixing the two
+            # populations manufactures a slope out of nothing. The curves are
+            # still drawn across every segment.
+            self.log.emit(tr("Fitting MDF-vs-time regression…"))
+            activos = active_segments(
+                segs["rms_seg"], self._profile.fatigue_active_ratio
+            )
+            n_activos = int(np.count_nonzero(activos))
+            if n_activos < activos.size:
+                self.log.emit(
+                    tr(
+                        "MDF trend fitted over {n} of {total} segments "
+                        "(the rest were below the contraction threshold)."
+                    ).format(n=n_activos, total=int(activos.size))
+                )
+            fat_time = fit_mdf_vs_time(
+                segs["t_seg"][activos], segs["mdf_seg"][activos],
+                t_eval=segs["t_seg"],
+            )
+            fat_rms = fit_rms_vs_mdf(
+                segs["mdf_seg"][activos], segs["rms_seg"][activos]
+            )
+            verdict = fatigue_verdict(
+                fat_time["slope_sign"], fat_time["r_squared"], n_activos,
+                min_r2=self._profile.fatigue_min_r2,
+                min_segments=self._profile.fatigue_min_segments,
+            )
+
+            if verdict == FATIGUE:
+                self.log.emit(
+                    tr(
+                        "Fatigue trend: MDF slope {slope:.3f} Hz/s "
+                        "({decline:.1f}% decline, R²={r2:.2f})."
+                    ).format(
+                        slope=fat_time["slope"],
+                        decline=fat_time["pct_decline"],
+                        r2=fat_time["r_squared"],
+                    )
+                )
+            elif verdict == NO_FATIGUE:
+                self.log.emit(
+                    tr(
+                        "No fatigue: MDF slope {slope:+.3f} Hz/s "
+                        "(R²={r2:.2f})."
+                    ).format(slope=fat_time["slope"], r2=fat_time["r_squared"])
+                )
+            else:
+                # Not "no fatigue": the recording does not answer the question.
+                # Saying so is the whole point — a line drawn through a cloud
+                # of resting segments used to come out as a red verdict.
+                self.log.emit(
+                    tr(
+                        "MDF trend not conclusive: slope {slope:+.3f} Hz/s but "
+                        "R²={r2:.2f} over {n} segment(s). Fatigue needs a "
+                        "contraction held long enough for the trend to show."
+                    ).format(
+                        slope=fat_time["slope"], r2=fat_time["r_squared"],
+                        n=n_activos,
+                    )
+                )
+            self.progress.emit(90)
+
+            # 7) Pack result
+            idx_1 = _channel_position(self._channel_name, emg_channels)
+            # The preparation pause, if this session has one: signal that is
+            # in the file, outside the analysed span, and quiet by design.
+            # Exactly what a resting baseline needs to be — but its *end*, not
+            # its beginning: the pause opens on the subject letting go of the
+            # last maximal effort, and that tail is not rest. On the session
+            # that showed it, the extensor's first second of pause measured
+            # 47 µV with a spread of 34, and its last second 6.9 µV with 0.9.
+            env_pausa = _cola_de_la_pausa(
+                env_calibracion, fs, phases, self._profile
+            )
+            ref_1, fuente_1 = _ref_for(
+                self._channel_name, emg_channels, phases=phases,
+                envelope=env_calibracion, fs=fs, cached=mvc_refs,
+                profile=self._profile, keep=self._cal_keep,
+            )
+            rms_global = float(np.sqrt(np.mean(proc["emg_filtered"] ** 2)))
+            iemg = float(trapezoid(proc["emg_rectified"], dx=1.0 / fs))
+            # Primary fatigue index: slope of the linear MDF-vs-time regression.
+            mdf_slope = float(fat_time["slope"])
+
+            result = {
+                # time-domain arrays (full length)
+                "emg_raw": emg_raw,
+                "emg_filtered": proc["emg_filtered"],
+                "emg_rectified": proc["emg_rectified"],
+                "emg_envelope": proc["emg_envelope"],
+                "rms_sliding": proc["rms_sliding"],
+                "emg_envelope_normalised": proc["emg_envelope_normalised"],
+                "emg_contracted": _contracted(
+                    proc["emg_envelope"], fs, self._profile,
+                    baseline=env_pausa),
+                "emg_baseline_usable": _baseline_is_usable(
+                    proc["emg_envelope"], fs, self._profile,
+                    baseline=env_pausa),
+                # {channel_index_0based: reference_mV}; empty when the
+                # recording carries no calibration.
+                "mvc_refs": mvc_refs,
+                "mvc_ref": ref_1,
+                #: Where that reference came from, as a token from
+                #: emgteach.phases. The interface branches on this and words
+                #: it with reference_source_text(); it must never branch on
+                #: translated text.
+                "mvc_ref_source": fuente_1,
+                #: The calibration repetitions the file carries, per channel
+                #: index. Empty for a recording made before the two-phase
+                #: flow, which is exactly when they cannot be edited.
+                "cal_reps": {
+                    c: phases.reps_for(c) for c in phases.channels()
+                },
+                "rec_start_s": phases.rec_start_s,
+                #: What each repetition was worth, in the order performed,
+                #: so the analysis tab can offer them to keep or discard.
+                "cal_rep_values": (
+                    {idx_1: rep_values(
+                        idx_1, phases=phases, envelope=env_calibracion,
+                        fs=fs, percentile=self._profile.mvc_percentile,
+                        window_s=self._profile.mvc_peak_window_s)}
+                    if idx_1 is not None and env_calibracion is not None
+                    else {}
+                ),
+                #: Which muscle each of those indices is, so the report can
+                #: say a name rather than a channel number.
+                "cal_channel_names": (
+                    {idx_1: self._channel_name} if idx_1 is not None else {}
+                ),
+                "cal_keep": self._cal_keep,
+                # plot axis
+                "t_plot": t_plot,
+                "n_plot": n_plot,
+                "times": times,
+                # spectral
+                "frequencies": psd_result["frequencies"],
+                "psd": psd_result["psd"],
+                "frequencies_raw": psd_bruto["frequencies"],
+                "psd_raw": psd_bruto["psd"],
+                "mnf": psd_result["mnf"],
+                "mdf": psd_result["mdf"],
+                # segments
+                "t_seg": segs["t_seg"],
+                "rms_seg": segs["rms_seg"],
+                "mdf_seg": segs["mdf_seg"],
+                # fatigue fits
+                "fat_fitted": fat_time["fitted"],
+                "fat_linear_fitted": fat_time["linear_fitted"],
+                "fat_slope_sign": fat_time["slope_sign"],
+                "fat_r_squared": fat_time["r_squared"],
+                "fat_pct_decline": fat_time["pct_decline"],
+                "fat_verdict": verdict,
+                "fat_n_seg": n_activos,
+                "fat_slope_per_min": fat_time["slope_per_min"],
+                "rms_mdf_range": fat_rms["mdf_range"],
+                "rms_mdf_fitted": fat_rms["fitted"],
+                # The windows the trend is fitted on: panel 8 draws its
+                # path over them.
+                "fat_active": activos,
+                # summary metrics
+                "rms_global": rms_global,
+                "duration": duration,
+                "mdf_slope": mdf_slope,
+                "iemg": iemg,
+                # metadata
+                "fs": fs,
+                "f_high": self._f_high,
+                "roi_start_s": roi_start_s,
+                "roi_end_s": roi_end_s,
+                "roi_segments": kept_segments,
+                # Where each kept piece of the file lands in the analysed
+                # signal, as (start_s, end_s, offset_s): what takes a stretch
+                # measured here back to the file (guided.measured_in_file).
+                "kept_pieces": piezas,
+                "full_duration_s": full_duration,
+                "edf_path": self._edf_path,
+                "channel_name": self._channel_name,
+                "markers": markers,
+                "fv_loads": fv_loads,
+                "guided_session": sesion,
+                # The detection settings the contractions are found with. Part
+                # of the result, not of the plumbing: the rows, and with them
+                # the co-activation windows, move with k.
+                "detection": dict(self._detection),
+                # DSP/analysis parameters actually used, so a report can show
+                # the "configuration used" without re-deriving it.
+                "config": {
+                    "f_low": self._f_low,
+                    "f_high": self._f_high,
+                    "f_notch": self._f_notch,
+                    "f_env": self._f_env,
+                    "rms_window_ms": self._rms_window_ms,
+                    "seg_len_s": self._seg_len_s,
+                    "overlap": self._overlap,
+                },
+            }
+
+            # Optional second channel: its envelope is overlaid with the first
+            # (agonist/antagonist). Same file, so it reuses the fragment bounds;
+            # a failure here only drops the overlay, it never fails the run.
+            if self._channel_name_2 and self._channel_name_2 != self._channel_name:
+                try:
+                    edf2 = read_edf_mne(self._edf_path, self._channel_name_2)
+                    emg_raw_2 = edf2["emg_raw"]
+                    # Same reasoning as the first channel: the calibration is
+                    # outside the analysed span, so its envelope is taken
+                    # before the trimming.
+                    env_calibracion_2 = (
+                        process_offline(
+                            emg_raw_2, fs,
+                            f_low=self._f_low, f_high=self._f_high,
+                            f_notch=self._f_notch, f_env=self._f_env,
+                            rms_window_ms=self._rms_window_ms,
+                        )["emg_envelope"]
+                        if phases.cal_reps else None
+                    )
+                    # The uncut recording phase of this muscle too, for the
+                    # co-activation table; see the first channel.
+                    env_completo_2 = None
+                    if tramo_completo is not None:
+                        env_completo_2 = process_offline(
+                            emg_raw_2[tramo_completo[0]:tramo_completo[1]], fs,
+                            f_low=self._f_low, f_high=self._f_high,
+                            f_notch=self._f_notch, f_env=self._f_env,
+                            rms_window_ms=self._rms_window_ms,
+                        )["emg_envelope"]
+                    # And its recording phase uncut, for the task maximum;
+                    # see the first channel.
+                    if env_fase_1 is not None:
+                        env_fase_2 = (
+                            env_completo_2 if tramo_completo == tramo_fase
+                            else process_offline(
+                                emg_raw_2[tramo_fase[0]:tramo_fase[1]], fs,
+                                f_low=self._f_low, f_high=self._f_high,
+                                f_notch=self._f_notch, f_env=self._f_env,
+                                rms_window_ms=self._rms_window_ms,
+                            )["emg_envelope"]
+                        )
+                    if not is_whole:
+                        emg_raw_2 = np.concatenate(
+                            [emg_raw_2[i0:i1] for (i0, i1, _, _, _) in bounds]
+                        )
+                    proc2 = process_offline(
+                        emg_raw_2, fs,
+                        f_low=self._f_low, f_high=self._f_high,
+                        f_notch=self._f_notch, f_env=self._f_env,
+                        rms_window_ms=self._rms_window_ms,
+                    )
+                    # The raw trace of the second muscle, not just its
+                    # envelope: the agonist/antagonist practical shows both
+                    # raw traces in panel 1, each against its own axis,
+                    # before overlaying the two envelopes.
+                    result["emg_raw_2"] = emg_raw_2
+                    result["emg_filtered_2"] = proc2["emg_filtered"]
+                    result["emg_envelope_2"] = proc2["emg_envelope"]
+                    result["emg_envelope_normalised_2"] = (
+                        proc2["emg_envelope_normalised"]
+                    )
+                    # The fatigue trend of the second muscle too, so the
+                    # agonist/antagonist practical can put both on panel 7:
+                    # a flexor that tires while its extensor does not is a
+                    # finding this practical can make and no other.
+                    segs2 = compute_segments(
+                        proc2["emg_filtered"], fs,
+                        seg_len_s=self._seg_len_s, overlap=self._overlap,
+                        f_low=self._f_low, f_high=self._f_high,
+                    )
+                    activos2 = active_segments(
+                        segs2["rms_seg"], self._profile.fatigue_active_ratio
+                    )
+                    fat2 = fit_mdf_vs_time(
+                        segs2["t_seg"][activos2], segs2["mdf_seg"][activos2],
+                        t_eval=segs2["t_seg"],
+                    )
+                    result["t_seg_2"] = segs2["t_seg"]
+                    result["mdf_seg_2"] = segs2["mdf_seg"]
+                    result["rms_seg_2"] = segs2["rms_seg"]
+                    result["fat_fitted_2"] = fat2["fitted"]
+                    result["mdf_slope_2"] = float(fat2["slope"])
+                    # The rest of what the first muscle gets, so the report
+                    # and the CSV can print the two side by side.
+                    result["fat_r_squared_2"] = fat2["r_squared"]
+                    result["fat_pct_decline_2"] = fat2["pct_decline"]
+                    result["fat_slope_sign_2"] = fat2["slope_sign"]
+                    result["fat_slope_per_min_2"] = fat2["slope_per_min"]
+                    result["fat_verdict_2"] = fatigue_verdict(
+                        fat2["slope_sign"], fat2["r_squared"],
+                        int(np.count_nonzero(activos2)),
+                        min_r2=self._profile.fatigue_min_r2,
+                        min_segments=self._profile.fatigue_min_segments,
+                    )
+                    result["rms_global_2"] = float(
+                        np.sqrt(np.mean(proc2["emg_filtered"] ** 2)))
+                    result["iemg_2"] = float(
+                        trapezoid(proc2["emg_rectified"], dx=1.0 / fs))
+                    # And its spectrum, so panel 3 can show the two muscles
+                    # side by side in the same practical.
+                    psd2 = compute_psd_mnf_mdf(
+                        proc2["emg_filtered"], fs,
+                        f_low=self._f_low, f_high=self._f_high,
+                    )
+                    result["frequencies_2"] = psd2["frequencies"]
+                    result["psd_2"] = psd2["psd"]
+                    result["mnf_2"] = psd2["mnf"]
+                    result["mdf_2"] = psd2["mdf"]
+                    # Same stretch of time, second channel.
+                    env_pausa_2 = _cola_de_la_pausa(
+                        env_calibracion_2, fs, phases, self._profile
+                    )
+                    result["emg_contracted_2"] = _contracted(
+                        proc2["emg_envelope"], fs, self._profile,
+                        baseline=env_pausa_2,
+                    )
+                    ref_2, fuente_2 = _ref_for(
+                        self._channel_name_2, emg_channels, phases=phases,
+                        envelope=env_calibracion_2, fs=fs, cached=mvc_refs,
+                        profile=self._profile, keep=self._cal_keep,
+                    )
+                    result["mvc_ref_2"] = ref_2
+                    result["mvc_ref_source_2"] = fuente_2
+                    # Both envelopes are in hand here, which is what the
+                    # per-repetition cross-talk needs: what the *other* muscle
+                    # reached while this one was at its maximum.
+                    result["cal_rep_values"] = {
+                        i: rep_values(
+                            i, phases=phases, envelope=env, fs=fs,
+                            percentile=self._profile.mvc_percentile,
+                            window_s=self._profile.mvc_peak_window_s,
+                            other_envelope=otro_env, other_reference=otra_ref,
+                        )
+                        for i, env, otro_env, otra_ref in (
+                            (_channel_position(self._channel_name, emg_channels),
+                             env_calibracion, env_calibracion_2, ref_2),
+                            (_channel_position(self._channel_name_2, emg_channels),
+                             env_calibracion_2, env_calibracion, ref_1),
+                        )
+                        if i is not None and env is not None
+                    }
+                    result["cal_channel_names"] = {
+                        i: n
+                        for i, n in (
+                            (_channel_position(self._channel_name, emg_channels),
+                             self._channel_name),
+                            (_channel_position(self._channel_name_2, emg_channels),
+                             self._channel_name_2),
+                        )
+                        if i is not None
+                    }
+                    # Co-activation needs both envelopes as a percentage of
+                    # *their own* muscle's maximum; without a reference for
+                    # each, the pair cannot be compared at all and no index is
+                    # computed rather than one being computed on millivolts.
+                    ref1, ref2 = result.get("mvc_ref"), result["mvc_ref_2"]
+                    if ref1 and ref2:
+                        # Automatic onset markers are events the program found,
+                        # not phases the operator declared. Left in, a recording
+                        # with auto-onset on produces one table row per burst —
+                        # dozens of them — and each row looks like a result.
+                        fases = [
+                            m for m in markers if "(auto)" not in str(m[1])
+                        ]
+                        if env_completo_1 is not None and env_completo_2 is not None:
+                            # Chosen fragments: each named one is a window
+                            # read where it lies on the uncut recording
+                            # phase, in that phase's own seconds — the clock
+                            # of an analysis without fragments, not of the
+                            # concatenated signal the panels draw.
+                            table, from_marks = coactivation_by_fragments(
+                                env_completo_1 / float(ref1) * 100.0,
+                                env_completo_2 / float(ref2) * 100.0,
+                                fs, fragmentos_completo,
+                                floor_pct=self._profile.coact_floor_pct,
+                                name_1=self._channel_name or "",
+                                name_2=self._channel_name_2 or "",
+                            )
+                        else:
+                            table, from_marks = coactivation_by_window(
+                                proc["emg_envelope"] / float(ref1) * 100.0,
+                                proc2["emg_envelope"] / float(ref2) * 100.0,
+                                fs, fases,
+                                floor_pct=self._profile.coact_floor_pct,
+                                t0=float(times[0]) if len(times) else 0.0,
+                                name_1=self._channel_name or "",
+                                name_2=self._channel_name_2 or "",
+                            )
+                        result["coactivation"] = table
+                        result["coactivation_from_markers"] = from_marks
+
+
+                    # An ``else`` here would belong to the ``for`` above, not
+                    # to the ``if ref1 and ref2`` it was written under, and a
+                    # ``for … else`` runs whenever the loop is not broken out
+                    # of — which is always. The reason was being recorded on
+                    # every recording, including the ones that do have an
+                    # index; only the ``elif`` in the report kept it off the
+                    # page.
+                    if not (ref1 and ref2):
+                        result["coactivation_reason"] = tr(
+                            "not reported — no MVC reference for one of the channels"
+                        )
+                    result["emg_baseline_usable_2"] = _baseline_is_usable(
+                        proc2["emg_envelope"], fs, self._profile,
+                        baseline=env_pausa_2,
+                    )
+                    for usable, contracted, name in (
+                        (result["emg_baseline_usable"],
+                         result["emg_contracted"], self._channel_name),
+                        (result["emg_baseline_usable_2"],
+                         result["emg_contracted_2"], self._channel_name_2),
+                    ):
+                        if not usable:
+                            self.log.emit(tr(
+                                "⚠ «{name}»: the recording starts with the "
+                                "muscle already active, so no resting baseline "
+                                "could be measured and contraction onsets were "
+                                "not detected. Record a couple of quiet seconds "
+                                "before the first contraction."
+                            ).format(name=name))
+                        elif not contracted:
+                            self.log.emit(tr(
+                                "No contraction detected in «{name}»: it never "
+                                "left its baseline."
+                            ).format(name=name))
+                    result["channel_name_2"] = self._channel_name_2
+                    self.log.emit(
+                        tr("2nd channel «{name}» overlaid.").format(
+                            name=self._channel_name_2
+                        )
+                    )
+                except Exception as exc:
+                    self.log.emit(
+                        tr("Could not analyse the 2nd channel «{name}»: {err}")
+                        .format(name=self._channel_name_2, err=exc)
+                    )
+
+            # A reference that was never a maximum: the task beats it. The
+            # reference *is* the peak of a maximal effort, so this is a
+            # definition rather than a heuristic, and it holds for
+            # one channel as well as for two — which is why it lives out here
+            # and not inside the pair. It lived inside it until a single-muscle
+            # practical went through with a calibration a third of what the
+            # muscle produced and nothing was said.
+            #
+            # Read on the recording phase uncut (env_fase_1/2, above) when the
+            # analysed span is not that phase: a maximum of the phase, not of
+            # the fragments or the window chosen.
+            for ref, env, musculo in (
+                (result.get("mvc_ref"),
+                 env_fase_1 if env_fase_1 is not None else result.get("emg_envelope"),
+                 self._channel_name),
+                (result.get("mvc_ref_2"),
+                 env_fase_2 if env_fase_2 is not None else result.get("emg_envelope_2"),
+                 self._channel_name_2),
+            ):
+                if not ref or env is None:
+                    continue
+                # Like with like: the task is measured the way the reference
+                # is — through the profile's mvc_peak_window_s, which makes
+                # both the envelope's peak — because two different statistics
+                # move the ratio by themselves. On one recording, when the
+                # reference was a running mean and the task was not, that
+                # difference alone made a 234 % into a 384 %.
+                pct = _sustained(
+                    env, fs, self._profile.mvc_peak_window_s
+                ) / float(ref) * 100.0
+                pico = float(pct.max())
+                # Always reported, not only when it crosses the line. A task
+                # well past 100 % but under the limit used to get no word,
+                # and the student saw an axis running past 100 % with no
+                # number to hang it on. The figure goes in the summary; the
+                # limit decides only whether it becomes a warning.
+                result.setdefault("task_peak_pct", {})[musculo] = pico
+                if pico > self._profile.mvc_implausible_pct:
+                    result["mvc_implausible"] = max(
+                        pico, result.get("mvc_implausible", 0.0))
+                    self.log.emit(tr(
+                        "⚠ «{name}» reaches {peak:.0f} % MVC, and spends "
+                        "{share:.0f} % of the recording above {limit:.0f} %. "
+                        "The calibration did not capture a maximum — the task "
+                        "beat it — so every percentage here is too high."
+                    ).format(name=musculo, peak=pico,
+                             limit=self._profile.mvc_implausible_pct,
+                             share=100.0 * float(np.mean(
+                                 pct > self._profile.mvc_implausible_pct))))
+            #: Where the task maximum was read, in seconds of the file: the
+            #: recording phase uncut, whatever was analysed.
+            result["task_peak_span_s"] = (float(fase[0]), float(fase[1]))
+
+            # Optional accelerometer channel: the MMG (mechanical) envelope and
+            # the tremor spectrum. A failure only drops the ACC panels.
+            if self._acc_channel:
+                try:
+                    from emgteach.dsp import (
+                        mmg_envelope,
+                        movement_envelope,
+                        tremor_spectrum,
+                    )
+
+                    # The accelerometer is in g, not mV: read it with pyedflib
+                    # (physical units as-is) rather than read_edf_mne, which
+                    # multiplies by 1000 to turn MNE's volts back into mV.
+                    acc_idx = list_edf_channels(self._edf_path).index(
+                        self._acc_channel
+                    )
+                    acc_raw = read_edf_pyedflib(
+                        self._edf_path, channel_index=acc_idx
+                    )["emg_raw"]
+                    if not is_whole:
+                        acc_raw = np.concatenate(
+                            [acc_raw[i0:i1] for (i0, i1, _, _, _) in bounds]
+                        )
+                    mmg_env = mmg_envelope(acc_raw, fs)
+                    move_env = movement_envelope(acc_raw, fs)
+                    tf, tpsd, tpeak = tremor_spectrum(acc_raw, fs)
+                    result["acc_raw"] = acc_raw
+                    result["acc_mmg_envelope"] = mmg_env
+                    result["acc_mmg_rms"] = float(np.sqrt(np.mean(mmg_env ** 2)))
+                    result["acc_movement_envelope"] = move_env
+                    # The segment's velocity, for the contraction table and
+                    # its chart by load: the force-velocity study's own
+                    # estimate, contraction by contraction.
+                    result["acc_velocity"] = velocity_from_acc(acc_raw, fs)
+                    result["acc_tremor_freqs"] = tf
+                    result["acc_tremor_psd"] = tpsd
+                    result["acc_tremor_peak_hz"] = tpeak
+                    result["acc_channel_name"] = self._acc_channel
+                    result["acc_placement"] = self._acc_placement
+                    self.log.emit(
+                        tr("Accelerometer «{name}» — tremor peak {hz:.1f} Hz.")
+                        .format(name=self._acc_channel, hz=tpeak)
+                    )
+                except Exception as exc:
+                    self.log.emit(
+                        tr("Could not analyse the accelerometer «{name}»: {err}")
+                        .format(name=self._acc_channel, err=exc)
+                    )
+
+            # One row per contraction, from the same proposer the fragment
+            # editor uses. Kept out of the analysis proper: a table that
+            # fails to build must not take the panels with it.
+            try:
+                filas = contraction_table(
+                    fs=fs,
+                    emg_raw=emg_raw,
+                    emg_filtered=proc["emg_filtered"],
+                    envelope=proc["emg_envelope"],
+                    mvc_ref=result.get("mvc_ref"),
+                    emg_raw_2=result.get("emg_raw_2"),
+                    emg_filtered_2=result.get("emg_filtered_2"),
+                    envelope_2=result.get("emg_envelope_2"),
+                    mvc_ref_2=result.get("mvc_ref_2"),
+                    name_1=self._channel_name,
+                    name_2=self._channel_name_2 or "",
+                    both_label=tr("Co-activation"),
+                    **self._detection,
+                    # The fragments the operator accepted are the rows: the
+                    # editor numbered them, and re-detecting inside their
+                    # concatenation renumbered them and split or merged a few.
+                    # Failing those, in the kinematics practical, one row per
+                    # lift of the guided wizard, from its load markers: the
+                    # detector cut a lift with a weight into two, three or
+                    # four windows, and the chart by load counted them all.
+                    # And in a guided session, one row per effort it marked.
+                    segments=(fragmentos_concat if self._roi_segments
+                              else self._tramos_de_sesion(sesion, piezas)
+                              or self._ventanas_de_carga(fv_loads, fs, len(emg_raw))),
+                    # For the onset, a fast trace of the movement, not the
+                    # smoothed envelope the panel draws (see
+                    # movement_onset_signal).
+                    movement=(
+                        movement_onset_signal(result["acc_raw"], fs)
+                        if self._acc_placement == "limb" and "acc_raw" in result
+                        else None
+                    ),
+                    velocity=(
+                        result.get("acc_velocity")
+                        if self._acc_placement == "limb" else None
+                    ),
+                    f_low=self._f_low, f_high=self._f_high,
+                    f_notch=self._f_notch, f_env=self._f_env,
+                    window_s=self._profile.mvc_peak_window_s,
+                    # The fragments the operator accepted are rows however
+                    # weak: they were chosen (7 November 2026).
+                    chosen=bool(self._roi_segments),
+                )
+                result["contractions"] = filas
+                result["grad_steps"] = gradation_steps(
+                    sesion, piezas, fs=fs, emg_filtered=proc["emg_filtered"],
+                    envelope=proc["emg_envelope"], mvc_ref=result.get("mvc_ref"),
+                    f_low=self._f_low, f_high=self._f_high,
+                )
+                if result["grad_steps"]:
+                    self.log.emit(tr("Graded contractions: {n} steps measured.").format(
+                        n=len(result["grad_steps"])))
+                # The train, and the window the fragment editor proposes for
+                # it. With fragments chosen, from the first to the last of
+                # them inside it, read on the whole file: glued, fragments
+                # chosen one per contraction keep no rest between them, and
+                # the floor and the rate are measured there.
+                result["train_span"] = self._tramo_tren
+                result["train_piece"] = None
+                result["train_note"] = None
+                tramo_tren = (fragments_hull(sesion, [(b[2], b[3]) for b in bounds], "train")
+                              if self._roi_segments and self._filtrado_sesion is not None
+                              else None)
+                if tramo_tren is not None and self._filtrado_sesion is not None:
+                    result["train"] = rapid_train(
+                        sesion, [(tramo_tren[0], tramo_tren[1], tramo_tren[0])], fs=fs,
+                        emg_filtered=self._filtrado_sesion)
+                    result["train_piece"] = tramo_tren
+                else:
+                    result["train"] = rapid_train(
+                        sesion, piezas, fs=fs, emg_filtered=proc["emg_filtered"])
+                if (result["train"] is None and self._roi_segments
+                        and sesion is not None and sesion.family == "FAST"):
+                    result["train_note"] = tr(
+                        "The chosen fragments do not cover the train: choose them from its "
+                        "first contraction to its last, or the whole recording, to see it.")
+                # The held load is the analysed span itself (_carga_sostenida):
+                # its spectrum window by window, its lines and its verdict,
+                # which is the summary's too. With fragments chosen, the
+                # longest piece of the load they keep (guided.load_piece),
+                # said in the view; with none, a note instead of nothing.
+                result["load"] = None
+                result["load_piece"] = None
+                result["load_note"] = None
+                # The window the load is read in, in file time; and the row
+                # the fragment editor proposes for it, the whole contraction.
+                result["load_span"] = tramo_carga
+                result["load_row"] = self._fila_carga
+                if tramo_carga and not self._roi_segments:
+                    result["load"] = load_fatigue(
+                        proc["emg_filtered"], fs, f_low=self._f_low, f_high=self._f_high)
+                elif tramo_carga and self._filtrado_sesion is not None:
+                    filtrado = self._filtrado_sesion
+                    trozo = load_piece(tramo_carga, [(b[2], b[3]) for b in bounds])
+                    if trozo is None:
+                        result["load_note"] = tr(
+                            "None of the chosen fragments keeps 3 s of the held load: "
+                            "choose one inside it, or the whole recording, to see the "
+                            "MDF over time.")
+                    else:
+                        result["load"] = load_fatigue(
+                            filtrado[round(trozo[0] * fs):round(trozo[1] * fs)], fs,
+                            f_low=self._f_low, f_high=self._f_high)
+                        result["load_piece"] = trozo
+                result["rest_mv"] = self._reposo_sesion
+                # How far the held effort rose above that rest, over the
+                # stretch the load was read on: below guided.LOAD_MIN_RATIO
+                # the signal is too weak to read fatigue in.
+                result["load_ratio"] = None
+                leida = result["load_piece"] or (
+                    tramo_carga if result["load"] is not None else None)
+                if leida is not None and self._envolvente_sesion is not None:
+                    result["load_ratio"] = effort_ratio(
+                        self._envolvente_sesion[round(leida[0] * fs):round(leida[1] * fs)],
+                        self._reposo_sesion)
+                carga = result["load"]
+                if carga is not None and carga.mdf_trend is not None:
+                    # The summary card and the report read the held load's
+                    # line, not the general fit over the windows at work.
+                    tend = carga.mdf_trend
+                    result["fat_verdict"] = carga.verdict
+                    result["mdf_slope"] = tend.slope
+                    result["fat_r_squared"] = tend.r2
+                    result["fat_pct_decline"] = -(tend.change_pct or 0.0)
+                result["emd_ms_mean"] = mean_emd_ms(filas)
+                # The rule the rows were labelled under, so the chart can
+                # draw the same wedge the labels came from.
+                result["detection"] = dict(self._detection)
+                if filas:
+                    self.log.emit(
+                        tr("{n} contractions found; see the table.")
+                        .format(n=len(filas))
+                    )
+            except Exception as exc:
+                result["contractions"] = []
+                result["emd_ms_mean"] = None
+                result["grad_steps"] = []
+                result["load"] = None
+                result["load_piece"] = None
+                result["load_note"] = None
+                result["load_ratio"] = None
+                result["load_span"] = None
+                result["load_row"] = None
+                result["train_span"] = None
+                result["train_piece"] = None
+                result["train_note"] = None
+                result["rest_mv"] = None
+                result["train"] = None
+                self.log.emit(
+                    tr("The contraction table could not be built: {err}")
+                    .format(err=exc)
+                )
+
+            self.progress.emit(100)
+            self.result_ready.emit(result)
+
+        except Exception as exc:
+            self.error.emit(str(exc))

@@ -1,0 +1,388 @@
+# emgteach
+
+> Open-source teaching platform for surface electromyography (sEMG)
+> acquisition and analysis, designed for undergraduate physiology
+> laboratories.
+
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Python: 3.10–3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](https://www.python.org/downloads/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21002297.svg)](https://doi.org/10.5281/zenodo.21002297)
+
+`emgteach` is a Python package that provides a unified PySide6 desktop
+application for real-time acquisition, offline analysis and maximum
+voluntary contraction (MVC) normalisation of surface EMG signals. It
+supports two interchangeable hardware backends: **BITalino (revolution)**
+over Bluetooth and an **Arduino RedBoard Plus + MyoWare 2.0** over USB
+serial. Output files follow the **EDF+** standard with reliable
+buffered writing, free of the silent corruption pitfall described in
+[Agis-Torres (2026)](https://doi.org/10.5281/zenodo.20042878).
+
+The package is intended for use in the practical teaching laboratory of
+the Department of Physiology (Faculty of Pharmacy), Universidad
+Complutense de Madrid, and is freely available for any group wishing
+to introduce hands-on biopotential acquisition into their teaching.
+
+## Status
+
+`emgteach` v3.11.0 shows what is measured: after a recording the review
+draws a **teal bar** for each contraction the fragment editor will propose
+and, in the one-muscle practical, once analysed, the **light green stretch**
+each number was measured on; a fragment there **follows its contraction's
+fall to rest**, a gradation is proposed **one row per step**, and a weak
+contraction among strong ones is measured; a recording never ends without its
+review **in silence**; and the classroom link carries **the address the
+phones can reach**, which a station can fix in `difusion.txt`. 3.7.0 remains
+the version the article describes. See
+[`docs/RELEASE_NOTES_v3.11.0.md`](docs/RELEASE_NOTES_v3.11.0.md).
+
+v3.10.1 is a patch of v3.10.0, the guided sessions after the
+bench: each step of the gradation is **reached slowly**, its band rising on
+the bar over 1.5 s; the fatigue's 10 % fall is **read on the MDF's line**, as
+its verdict is; the train **ends where its last contraction does**, and a
+contraction with two humps is one; the fatigue with a fixed load is done **on
+the forearm**, the biceps a variant; and in the one-muscle practical a
+fragment **ends where the muscle is back at rest** for a second and starts
+half a second before it leaves it. 3.7.0 remains the version the article
+describes. See [`docs/RELEASE_NOTES_v3.10.1.md`](docs/RELEASE_NOTES_v3.10.1.md).
+
+v3.10.0 guides three sessions of the one-muscle practical, chosen
+beside «Calibrate MVC»: **graded contractions** (five steps from 20 to 100 %
+of the bar, after a calibration), **fatigue with a fixed load** (a weight
+held with the biceps, elbow at 90°, for 90 s or until the space bar ends it,
+read in the fall of the MDF), and **quick repeated contractions** (10 s as
+fast as possible). The
+application times each phase, marks it in the EDF+ file and stops the
+recording at the end; the analysis takes the session's own spans, with a view,
+a section of the report and a summary for the phones. An optional tone
+announces every phase change of every guided flow, and the instructions say
+«contraction» and «intense». Nothing computed changes for a free recording.
+See [`docs/RELEASE_NOTES_v3.10.0.md`](docs/RELEASE_NOTES_v3.10.0.md).
+
+v3.9.1 is a patch of v3.9.0: the live view keeps following the
+signal after a wheel zoom — the wheel sets how many seconds are shown, and «A»
+gives the whole window back —, closing the window while «Retry» waits for the
+board's port no longer starts a recording with a «Save as» dialog nobody asked
+for, and in Spanish the unit reads «% CVM». Nothing computed changes. See
+[`docs/RELEASE_NOTES_v3.9.1.md`](docs/RELEASE_NOTES_v3.9.1.md).
+
+v3.9.0 brings back marking by hand while recording: beside the
+list of the last marks, a label to choose — contraction start, contraction
+end, fatigue, rest, other — and «Mark (M)», or the M key, put a mark in the
+EDF+ file and the event log at the moment it is pressed, and the analysis
+draws those marks apart, as a solid teal line with their label. It is
+optional, for experiments that need their own events marked. Nothing computed
+changes. See [`docs/RELEASE_NOTES_v3.9.0.md`](docs/RELEASE_NOTES_v3.9.0.md).
+
+v3.8.0 brings over what the bench of the sister applications,
+ecgteach and eegteach, found in code they share with emgteach: a phone that
+joins the classroom broadcast late now gets the report (a fault of the
+published 3.7.2), the event log is written line by line so a crash keeps it,
+the default file name carries the seconds, a recording whose file disappears
+stops at once and says so, the save dialog does not open in a folder that is
+gone, and after a recording with the BITalino the status says to switch it off
+and on. Nothing computed changes. See
+[`docs/RELEASE_NOTES_v3.8.0.md`](docs/RELEASE_NOTES_v3.8.0.md).
+
+v3.7.2 moves the classroom broadcast to ports 8080 (page) and
+8443 (data), and lets a laboratory change them in a `difusion.txt` next to the
+application, since which ports get through depends on the network; a busy
+port is named in the warning. Nothing computed changes. See
+[`docs/RELEASE_NOTES_v3.7.2.md`](docs/RELEASE_NOTES_v3.7.2.md).
+
+v3.7.1 is a bug fix of v3.7.0 for the November practicals: a
+corrupted BITalino frame no longer ends the recording, a gap in the link is
+marked in the file, and saving the tuned recording says why it cannot instead
+of an unexpected error. Nothing computed changes. See
+[`docs/RELEASE_NOTES_v3.7.1.md`](docs/RELEASE_NOTES_v3.7.1.md).
+
+v3.7.0 is **the version the article describes**, and the one the
+November practicals run on. The guided session goes on into the task, with a
+row of boxes that maps each phase and a grip made closing the hand on a ball; the
+fragment editor proposes each row from where its contraction leaves rest to
+where it returns, and one row per lift the force-velocity wizard marked; the
+pair practical names its pair, with one reference electrode on the olecranon;
+and a recording says it is connecting until the board answers. A Windows
+executable is attached to the release — see *Install* below. See
+[`docs/RELEASE_NOTES_v3.7.0.md`](docs/RELEASE_NOTES_v3.7.0.md).
+
+v3.6.0 made **the simulated board obey the calibration**: the
+wizard tells the device when it is asking for a maximum, and the simulated
+board gives it, so a session rehearsed without it reads in % MVC as
+a real one does — about 53 % for the alternating gestures and a grip that
+co-activates — instead of above 100 % of its own maximum. Nothing computed
+changes. See
+[`docs/RELEASE_NOTES_v3.6.0.md`](docs/RELEASE_NOTES_v3.6.0.md).
+
+v3.5.0 was **the kit for the laboratory**: a BITalino the
+application simulates, so a practical can be prepared and taught where the
+board is not at hand; a connection diagnostic that answers why a station
+does not connect; the event log of every recording saved beside it, and a
+recovery for a recording whose process died before it could be closed. The
+session report and the CSV export are repaired — the table of contractions
+was losing four of its seven columns off the page — and the interface writes
+one decimal mark, the point, in both languages. See
+[`docs/RELEASE_NOTES_v3.5.0.md`](docs/RELEASE_NOTES_v3.5.0.md).
+
+v3.4.0 made the **analysis panels say how to read them**: each title
+carries, on a second line, what it means that the curve rises or falls, and
+names the muscle when the panel shows one. The panels are numbered 1 to 12
+from one table, the same in every practical. See
+[`docs/RELEASE_NOTES_v3.4.0.md`](docs/RELEASE_NOTES_v3.4.0.md).
+
+v3.3.0 read the **task maximum on the whole recording phase** —
+from the start of the recording to the end of the file, whatever fragments
+are chosen: a maximum of the phase, not of the selection — and drew
+**panel 3 with each spectrum scaled to unit area**, so the two muscles are
+compared by shape and not by a height that only compares skin and electrode
+placement. See
+[`docs/RELEASE_NOTES_v3.3.0.md`](docs/RELEASE_NOTES_v3.3.0.md).
+
+v3.2.0 took the **MVC reference as the envelope's peak**: each
+calibration repetition is worth the highest point its envelope reaches, not
+the highest 0.2 s running mean, and the task maximum, each contraction's peak
+and the live bars are measured the same way. The co-activation floor is 4.5 %
+of that reference, and each fatigue segment's MDF is computed over the
+analysis band. **A recording reanalysed with 3.2.0 gives % MVC figures
+different from those of 3.1.2.** See
+[`docs/RELEASE_NOTES_v3.2.0.md`](docs/RELEASE_NOTES_v3.2.0.md).
+
+v3.1.2 changed what the calibration asks for: a **brief, intense
+maximal contraction** of each muscle's own movement — in the agonist/antagonist
+practical, wrist flexion with the fist clenched for the flexor and wrist
+extension with the hand open for the extensor — instead of a sustained push
+against something fixed. Nothing that is computed changes. See
+[`docs/RELEASE_NOTES_v3.1.2.md`](docs/RELEASE_NOTES_v3.1.2.md).
+
+v3.1.1 is a patch on one measurement: the **co-activation of a
+named window is read on the uncut recording**, with each muscle's resting
+level taken from the whole recording phase, so choosing fragments no longer
+subtracts from the antagonist a «rest» measured on a signal with no rest in
+it. See [`docs/RELEASE_NOTES_v3.1.1.md`](docs/RELEASE_NOTES_v3.1.1.md).
+
+v3.1.0 is about **handling at the laboratory bench**. The
+fragment editor becomes a procedure of three steps that says which one it is
+on, counts the marked contractions against what the protocol asks for,
+offers the stretches under the threshold as candidates, and lets each row be
+kept, dropped, split or dragged where it stands; the detection sensitivity is
+set per practical and written into the report. A second launch brings the
+running window forward instead of opening a second copy, saving never fails
+on a missing folder, the guided tour shows where the electrodes go and what
+the calibration asks for, and a sheet for each station puts the
+agonist/antagonist practical on one page. See
+[`docs/RELEASE_NOTES_v3.1.0.md`](docs/RELEASE_NOTES_v3.1.0.md).
+
+Since v3.0.0 `emgteach` is **configured by choosing the practical rather
+than by setting controls one at a time**: three practicals — one muscle,
+agonist/antagonist and muscle kinematics — fix the channel count and the
+accelerometer, and each tab offers only the measurements that suit the
+practical. The **session is one file with its phases marked inside it**
+(warm-up, calibration, preparation, recording), so the maximum every
+percentage is measured against travels with the signal, and the two tabs
+can no longer disagree about the same recording. v3.0.0 also added a
+**guided tour** over the interface, a **«?» on every box**, **one analysis
+row per contraction** with its electromechanical delay, an
+**agonist/antagonist co-activation index** (Falconer-Winter, per marked
+phase and in % MVC), a **rehearsal** of the force-velocity procedure that
+runs with no hardware and a derived **tuned recording** that carries the
+decisions taken on screen, and corrected the BITalino front-end gain in the
+conversion to millivolts. See
+[`docs/RELEASE_NOTES_v3.0.0.md`](docs/RELEASE_NOTES_v3.0.0.md).
+
+v2.0.0 added a **kinematic dimension** through the BITalino
+accelerometer: guided force-velocity acquisition, a force-velocity study
+turning one recording of known loads into load-velocity, Hill, power and
+recruitment curves, EMG-vs-MMG, tremor and movement-vs-EMG analysis
+panels and a channel-quality check when a recording is opened. Since
+v3.0.0 the accelerometer's input is a stated convention — muscle on A1,
+accelerometer on A2 — rather than a selectable channel. v1.4.0 introduced the **classroom
+broadcast**: students follow the live session in their own phone
+browsers, with a per-session access code and a scan-to-join QR; since
+v3.7.2 on ports 8080 and 8443, which a laboratory can change in a
+`difusion.txt` next to the application. v1.1.0
+added an **assisted fragment editor**, **CSV export** and a **live
+signal-quality check**; v1.0.0 reimplemented the BITalino backend over
+`pyserial` (no PyBluez) and added a recipe for a standalone Windows
+executable.
+
+The package ships a Qt-free analytic core (io, dsp, fatigue, mvc, apda,
+coactivation, phases, force_velocity, fv_rehearsal, profiles, selection, exports,
+reports, i18n, modes), a Qt layer (workers + three-tab PySide6 GUI), and a
+test suite of **1860 tests** passing on Linux and Windows across Python
+3.10–3.12. See
+[`CHANGELOG.md`](CHANGELOG.md) for the full history.
+
+## Highlights
+
+- **Three-tab GUI** (Acquisition, Analysis, MVC normalisation) wrapping a
+  reusable acquisition library
+- **Bilingual interface (English / Spanish)** with automatic start-up
+  language detection and an in-app language switch
+- **Hardware-agnostic core** through the `AcquisitionDevice` interface;
+  swap BITalino for Arduino+MyoWare with a single setting
+- **Two-channel acquisition** for agonist/antagonist studies, with an
+  editable label per channel; the data layer is generic over N channels
+- **Stacked two-channel live view** that gives each channel its own
+  vertical lane (raw and filtered) for clearer agonist/antagonist reading
+- **Automatic onset detection** (baseline + k·SD threshold) that flags
+  contraction onsets in real time and stores them as EDF+ annotations
+- **One-click PDF session reports**: signal plot with annotations,
+  metrics table, configuration used and a reproducible footer
+- **EDF+ output with event annotations**, suitable for downstream
+  analysis in MNE-Python, EDFbrowser and similar tools
+- **Buffered-write pattern** for EDF that avoids the silent corruption
+  artefact characterised in [Agis-Torres (2026)](https://doi.org/10.5281/zenodo.20042878)
+- **Robust connectivity**: BITalino watchdog releases blocked
+  Bluetooth reads in ~50 ms after disconnection
+- **Open-source firmware** for the Arduino+MyoWare side, included in
+  the repository
+
+## Install
+
+Requires **Python 3.10, 3.11 or 3.12** on Windows, macOS or Linux.
+Python 3.13+ is not currently supported because the pinned scientific
+stack does not yet ship pre-built wheels for it.
+
+The package is not on PyPI; install it from source:
+
+```bash
+git clone https://github.com/aagisto-maker/emgteach.git
+cd emgteach
+pip install -e ".[dev]"
+```
+
+### Windows executable
+
+From v3.7.0 each release carries a standalone Windows executable,
+`emgteach-vX.Y.Z-windows-x64.exe`: no Python, no install, no administrator
+rights. It is built by GitHub Actions from the release's commit, not on
+anybody's computer, so it is exactly the code of that version — and, after
+3.8.0, it is the very file that was tried at the bench before the tag, not a
+second build.
+
+- **It is not signed.** Windows may show «Windows protected your PC»
+  («Windows protegió su PC»): choose *More info → Run anyway* («Más
+  información → Ejecutar de todos modos»).
+- **Check it is the published file**: the release notes give its SHA-256. In
+  PowerShell, `Get-FileHash .\emgteach-v3.11.0-windows-x64.exe -Algorithm SHA256`
+  has to print the same value.
+- **Check where it was built**: with the GitHub CLI,
+  `gh attestation verify emgteach-v3.11.0-windows-x64.exe --repo aagisto-maker/emgteach`
+  confirms it came out of this repository's workflow, from that version's
+  commit.
+- **The classroom broadcast needs incoming connections**: on a computer whose
+  firewall is managed by its organisation, allow emgteach's incoming
+  connections (by default TCP 8080 and 8443, set in `difusion.txt`).
+
+The executable is not part of the Zenodo record, which archives the source
+code of the tag. The recipe to build it yourself is in
+[`packaging/`](packaging/README.md).
+
+On **Windows 11** the easiest way to install Python 3.12 is via
+**Microsoft Store** (search "Python 3.12"). It installs without
+administrator privileges and configures the PATH automatically.
+
+### Hardware backends
+
+Both backends work out of the box, on every supported Python version.
+Neither needs an optional extra or a compiler: both speak their device
+over `pyserial`, which is a hard dependency.
+
+**BITalino (revolution)** — Bluetooth. The BITalino is Bluetooth Classic
+(SPP), so pair it in the operating system first; on Windows it then
+appears as a virtual COM port. Identify it in the app by its **MAC
+address**, which is the same on every PC, rather than by a COM number,
+which is not. Leaving the field empty autodetects it.
+
+**Arduino RedBoard Plus + MyoWare 2.0** — USB serial. Flash the sketch in
+[`firmware/emgteach_arduino`](firmware/emgteach_arduino) once, then pick
+its COM port in the app.
+
+Recording, analysis and EDF+ output are identical whichever you use, and
+the choice is a single setting in the acquisition tab — so a class can
+run on whatever hardware it has.
+
+## Quickstart
+
+```bash
+emgteach          # launch the GUI
+```
+
+Or programmatically (without the GUI):
+
+```python
+import numpy as np
+from emgteach import ArduinoDevice, BufferedEdfWriter, ChannelInfo
+
+device = ArduinoDevice(port="COM4", fs=1000)
+device.open()
+try:
+    blocks = [device.read(100) for _ in range(100)]   # 100 x 100 ms = 10 s
+finally:
+    device.close()
+
+samples = np.concatenate(blocks)
+ch = ChannelInfo("EMG", sample_frequency=1000)
+with BufferedEdfWriter("session.edf", channels=[ch]) as writer:
+    writer.add_samples(samples)
+```
+
+## Documentation
+
+The manuals are in [`docs/`](docs/): the user manual in English
+(`manual_emgteach.md`) and Spanish (`manual_emgteach_es.md`), the practical
+guides and the evaluation rubric. The docstrings of `src/emgteach/` are the
+API reference.
+
+## Citation
+
+If you use this software, please cite the package (a `CITATION.cff` file
+is provided for automatic citation export) and, where relevant, the
+methodological article on the buffered-write pattern it implements:
+
+- Agis-Torres, Á., Fernandes, V. S., Navarro-Dorado, J., Muñoz-Picos, M.,
+  Climent, B., & Hernández, M. (2026). *emgteach: an open-source teaching
+  platform for surface electromyography* (software). Zenodo.
+  https://doi.org/10.5281/zenodo.21002297 (all versions; each release has
+  its own DOI on that page)
+- Agis-Torres, Á. (2026). *Silent corruption of EDF recordings during
+  real-time biopotential streaming: a buffered-write solution.*
+  Manuscript; reproducibility package:
+  https://doi.org/10.5281/zenodo.20042878
+
+A dedicated software paper is in preparation. Author contributions are
+recorded in [`AUTHORS.md`](AUTHORS.md) using the
+[CRediT](https://credit.niso.org/) taxonomy.
+
+## Contributing
+
+Contributions are welcome — bug reports, documentation, tests, hardware
+backends and features. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
+development setup, the test/lint commands, the branch and commit
+conventions, and how to add or translate user-facing strings (the UI is
+bilingual: English-canonical source plus a Spanish translation map).
+
+## Related work
+
+- [edf-buffered-write](https://doi.org/10.5281/zenodo.20042878) —
+  minimal reproducibility package for the buffered-write pattern
+- [BITalino](https://www.bitalino.com/) — commercial Bluetooth
+  biopotential acquisition device
+- [SparkFun MyoWare 2.0](https://www.sparkfun.com/products/21265) —
+  open-hardware sEMG sensor
+
+## How this software was developed
+
+emgteach began in 2025 as a set of Python programs written by the author on top of
+open-source libraries and the boards' own interfaces, which already acquired, filtered
+and analysed the signal separately. Bringing them together into a single application,
+and the development since, were carried out with the assistance of an AI coding tool
+(Claude Code, Anthropic). The author defined the physiological and teaching
+requirements, wrote the functional specifications, selected the signal-processing methods and their parameters from the
+published literature, reviewed every change and validated the application on hardware.
+The specifications that guided development are in `docs/` (files named `ESPEC-*.md`),
+and the automated test suite is part of the repository.
+
+The anatomical base of the electrode-placement figure and of the guided tour's pictures
+(`tools/recorrido/base_brazos_v2.png`) is an AI-generated image of two forearms, made
+without text or electrodes; the muscles, electrodes and labels are drawn over it by the
+figure script, to a scale measured on the image itself.

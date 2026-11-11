@@ -1,0 +1,4537 @@
+"""
+AcquisitionTab — tab 1: real-time EMG acquisition with BITalino.
+
+Controls:
+  - BITalino Bluetooth virtual COM port (persisted with QSettings)
+  - Destination folder for the EDF (persisted with QSettings)
+  - Connect / Disconnect button
+  - Start / Stop recording button
+
+Channels:
+  - 1 or 2 simultaneous channels (e.g. agonist/antagonist), with an
+    editable label per channel. Each channel is drawn overlaid in its own colour.
+
+Visualisation (pyqtgraph):
+  - Raw EMG signal
+  - Envelope
+
+The filtered signal (notch + band-pass) is still computed for the envelope
+and written pipeline, but it is not shown on screen: for physiology students
+the intermediate filtered trace is not relevant to their study.
+
+Scale controls (gui/acquisition/plots.py, with the plots and the review):
+  - Vertical scale: ▲▼ buttons per plot (×1.5 factor, 0.01×–100× of the initial limits)
+  - Time scale: factor dropdown + ◀▶ buttons (sliding window over the
+    ring buffer; lets you see from 0.5 s up to its thirty seconds)
+
+The tab never blocks the UI: all acquisition runs in AcquisitionWorker (QThread).
+"""
+
+from __future__ import annotations
+
+import html
+import math
+import os
+import re
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import TextIO, cast
+
+import numpy as np
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from emgteach import __version__, cue
+from emgteach.apda import OnlineLoad
+from emgteach.broadcast import BroadcastServer
+from emgteach.charts import COLOUR_1, COLOUR_2
+from emgteach.devices import (
+    BACKEND_ARDUINO,
+    BACKEND_BITALINO,
+    create_device,
+)
+from emgteach.difusion import PORTS_FILE
+from emgteach.dsp import LiveQualityMonitor
+from emgteach.fragments import recording_proposal
+from emgteach.gui.acquisition import ClassroomBox, ConnectionBox, FlowStage, LivePlots
+from emgteach.gui.imagenes import imagen
+from emgteach.gui.session_runner import SessionRunner
+from emgteach.gui.widgets.decimal_spin import DecimalSpinBox
+from emgteach.gui.widgets.help_button import add_help
+from emgteach.gui.widgets.load_bar import LoadBar
+from emgteach.gui.widgets.logger import LoggerWidget
+from emgteach.gui.widgets.manual_marker import (
+    ManualMarker,
+    give_back_focus,
+    hand_the_m_over,
+)
+from emgteach.gui.widgets.mvc_overlay import MvcOverlay
+from emgteach.guided import (
+    LOAD_RATIO_AT_S,
+    LOAD_RATIO_FROM_S,
+    REST_WARN_MV,
+    effort_ratio,
+    measured_in_file,
+    weak_signal_warning,
+)
+from emgteach.i18n import tr
+from emgteach.io import (
+    RecordingMetadata,
+)
+from emgteach.modes import (
+    DEFAULT_MODE,
+    MODE_KINEMATICS,
+    MODE_PAIR,
+    MODE_SINGLE,
+    mode_channels,
+    mode_detection_k,
+    mode_fixed_labels,
+    mode_protocol,
+    mode_requires_calibration,
+    mode_rest_fraction,
+    mode_uses_acc,
+    normalise_mode,
+)
+from emgteach.mvc import mvc_from_reps, mvc_ref_marker
+from emgteach.pairs import (
+    DEFAULT_PAIR,
+    PAIRS,
+    normalise_pair,
+    pair_calibration_cue,
+    pair_coactivation_cue,
+    pair_hint,
+    pair_image,
+    pair_label,
+    pair_protocol_suffix,
+    pair_warning,
+)
+from emgteach.phases import (
+    cal_end_marker,
+    cal_start_marker,
+    prep_start_marker,
+    rec_start_marker,
+    warmup_start_marker,
+)
+from emgteach.profiles import EMG_PROFILE
+from emgteach.sessions import (
+    EFFORT,
+    READY,
+    MeasuredSpan,
+    SessionPhase,
+    SessionScript,
+    gradation_script,
+    load_script,
+    rapid_script,
+)
+from emgteach.workers import AcquisitionWorker
+from emgteach.workers.acquisition import mensaje_fallo_guardado
+
+#: What the event log of a recording is called beside it:
+#: ``P07_2026-09-10_16-32.eventos.txt`` next to the EDF, as the marks'
+#: mirror is ``.marcas.txt`` (see emgteach.recovery).
+EVENTS_SUFFIX = ".eventos.txt"
+
+
+def events_path(edf_path: str | Path) -> Path:
+    """The event log written beside *edf_path* while its recording runs."""
+    p = Path(edf_path)
+    return p.with_name(p.stem + EVENTS_SUFFIX)
+
+
+def _escribir_linea(f: TextIO, linea: str) -> bool:
+    """Append *linea* to the open event log and push it to disk; ``False``
+    when the file can no longer be written."""
+    try:
+        f.write(linea + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+FS = EMG_PROFILE.sample_frequency  # nominal Hz (taken from the signal profile)
+
+# Maximum number of simultaneous channels the interface offers. The data
+# layer supports N, but the UI is limited to 2 for now (agonist/antagonist).
+MAX_CHANNELS = 2
+
+# Guided MVC-calibration wizard timing.
+MVC_TICK_MS = 100   # state-machine tick
+MVC_READY_S = 3.0   # "get ready" countdown before each contraction
+#: And the first of each muscle, which is the one that carries the
+#: pictogram of the gesture. Three seconds is enough to get ready and not
+#: enough to look at a drawing and then get ready: the picture went by
+#: before it could be read. Nothing recorded moves with this — the ``CAL``
+#: span opens when the effort does, not when the count starts.
+MVC_READY_PRIMERA_S = 7.0
+MVC_REST_S = 2.0    # relax pause between reps / muscles
+
+#: The free manoeuvres of the pair practical: six contractions led by one
+#: muscle, then six led by the other, **at the student's own pace**. The
+#: wizard counts them and never sets their rhythm: a guided rhythm would
+#: give cleaner data and would change the protocol the article describes,
+#: and free movement is what a reciprocal pattern needs — a wrist pushing
+#: against something brings the antagonist in to stabilise it.
+MANIOBRAS_POR_MUSCULO = 6
+
+#: How often the **simulated** subject performs one of them, when it is
+#: asked for them at all. A person sets their own pace and this says
+#: nothing about it; a board ignores it. The guide asks for about a second
+#: each with a couple of seconds between, so six take some twenty.
+MANIOBRA_CADA_S = 3.0
+
+#: How long the muscle has to stay quiet, once its last box is filled, for
+#: the wizard to move on by itself. Moving on at the instant the last onset
+#: is detected would cut that contraction's own tail off; a second of rest
+#: after it is also the quiet the guide asks for between manoeuvres, and it
+#: costs a lone false positive its effect.
+MANIOBRA_REPOSO_S = 1.0
+
+#: What counts as a manoeuvre: the muscle over this share of **its own
+#: maximum**, and **held there** for ``MANIOBRA_MINIMA_S``. The effort is
+#: over when the envelope drops under seven tenths of the floor **or stays
+#: under the floor for** ``MANIOBRA_SALIDA_S``, so one effort is one box
+#: however it wobbles in the middle.
+#:
+#: Both numbers are measured on the first rehearsal with the real board,
+#: which is also why this stopped being the ``OnsetDetector``'s job. That
+#: detector sets its threshold at the resting level plus k standard
+#: deviations of the **first second of the phase**; on a real forearm it
+#: counted **six onsets for four contractions**, because the envelope dips
+#: in the middle of an effort and half a second of refractory does not
+#: cover it. Six boxes filled with four manoeuvres, and then the phase
+#: waited for two it had already counted.
+#:
+#: **Amplitude alone cannot do it, and the kinematics recording of the
+#: same afternoon proves it without depending on anybody's memory.** Its
+#: six cued lifts are marked in the file, so which excursion is which is
+#: not a matter of opinion:
+#:
+#: ===================  ===============  ==============
+#: over 10 % MVC        held             peak
+#: ===================  ===============  ==============
+#: the six marked       0.72 to 0.80 s   66 to 91 % MVC
+#: everything else      0.06 to 0.26 s   12 to 29 % MVC
+#: ===================  ===============  ==============
+#:
+#: The leftovers reach **29 % MVC** — over the 20 % floor that was
+#: proposed first — while a free flexion, the weakest gesture of the
+#: practical with no resistance on purpose, can be gentler than that. A
+#: floor cannot separate them. Their **duration** can, by a factor of
+#: three either way, and 0.30 s sits in the middle of that gap.
+#:
+#: There is **no refractory**: the rule is an excursion, so it counts once
+#: per crossing however long the effort runs. One was proposed at 1.5 s and
+#: withdrawn — the manoeuvres of that rehearsal came 1.83 s apart and the
+#: student sets the pace, so a refractory that long is a trap, not a guard.
+#: **De qué son porcentaje estos porcentajes.** De la referencia que esa
+#: sesión midió, no del máximo real del músculo, y las dos cosas pueden no
+#: coincidir: en el registro donde se midieron todo esto, una flexión
+#: **libre y sin resistencia** llegó al 103,6 % de la referencia, y las
+#: otras tres al 65, 69 y 81 %. Por la regla que la propia aplicación
+#: escribe junto a la constante en ``profiles.py`` —la referencia *es* el
+#: pico de un esfuerzo máximo, así que si la tarea lo supera el esfuerzo no
+#: fue máximo—, esa referencia se quedó corta. El orden de las cosas no
+#: cambia y la regla sigue siendo la buena, pero **el margen medido no es
+#: el margen real**: con una referencia a dos tercios del máximo, este
+#: suelo del 10 % es un 6,7 % y el rebote del 12,2 % es un 8 %. Por eso el
+#: ensayo que se repita con la placa **solo vale si su calibración pasa**
+#: ``_mvc_check_is_a_maximum``.
+MANIOBRA_MINIMO_PCT = 10.0
+MANIOBRA_MINIMA_S = 0.30
+
+#: And how long under the floor ends an effort, whatever the level. The exit
+#: was only the amplitude one — seven tenths of the floor, 7 % — and the
+#: resting level **during** the task, measured on the one forearm this has
+#: been tried on (the author's right, 20 September 2026), ran from 3 to 8 %:
+#: **the exit fell inside the rest.** Somebody who rests at the top of that
+#: band never goes back under 7 % between two manoeuvres, the excursion never
+#: ends, and only the first of the six is counted — the twelve seconds of
+#: ``MANIOBRA_SIN_NOVEDAD_S`` then close a phase with one box in six.
+#:
+#: Measuring each person's rest and placing the thresholds above it was
+#: proposed, from the quiet second and a half that opens each muscle's turn.
+#: It is the mistake the ``OnsetDetector`` already made here: the rest before
+#: the task is not the rest during it — 1.5 % against 3 to 8 % in the same
+#: recording, see ``MANIOBRA_REPOSO_PCT``. Narrowing the hysteresis to fit
+#: between the rest and the floor (an exit at 9 %) would only move the bet
+#: from 7 to 9. A time does not bet on a level at all: whatever the rest is,
+#: if it is under the floor, a pause between two manoeuvres is under it for
+#: a second or more, and the dip in the middle of one effort is not. On the
+#: real recording the two rules fill the same boxes at the same instants, 4
+#: for the flexor and 6 for the extensor — the rest there stayed mostly under
+#: 7 % — and with the reference shrunk to 0.6 of itself, which lifts the whole
+#: rest band by two thirds, they still do.
+#:
+#: The same 0.30 s as ``MANIOBRA_MINIMA_S``: held that long above the floor
+#: to count, that long under it to end.
+MANIOBRA_SALIDA_S = 0.30
+
+#: And what «at rest» means for moving on, in the same units — because the
+#: resting level **during** the task is not the one measured before it. In
+#: that rehearsal the phase opened at 1.5 % MVC and the task ran between
+#: 3 and 8 %, so a threshold built from the opening second was never crossed
+#: downwards again and the phase could not end by itself. Under a tenth of
+#: the maximum there were stretches of two and of five seconds.
+#:
+#: **The margin is two points, and it was measured on one forearm** — the
+#: author's right, on 20 September 2026: the rest reached 8 % and this is
+#: 10 %. The count no longer depends on it (``MANIOBRA_SALIDA_S``), but moving
+#: on does. What says whether it holds is how long the phase takes to move on
+#: after the sixth box: **one second** is this rest, which is right; **twelve**
+#: is ``MANIOBRA_SIN_NOVEDAD_S``, the net, and means the rest never came under
+#: this line — then it is this number that has to move, before November.
+MANIOBRA_REPOSO_PCT = 10.0
+
+#: And the line that makes «the phase can never fail to end» true instead of
+#: merely possible. The button lets a student end it; this ends it. After
+#: this long with **nothing new counted** — the map full or not, **and
+#: whether or not the muscle is at rest** — the session moves on. Asking
+#: for rest here as well would hang the timeout on the same nail that came
+#: loose: rest that never comes is the failure this is the net for.
+#:
+#: It is the answer to what a stricter count would otherwise cost: a rule
+#: that counts well can still leave the phase waiting for a contraction it
+#: never counts, and then the hang has only moved from the rest to the
+#: count. It is also the net under the case where the calibration was not a
+#: real maximum (``_mvc_check_is_a_maximum``): a share of a maximum that
+#: was not one may never be crossed, and the phase still has to end.
+#:
+#: Twelve seconds is about five times the pace of that rehearsal, where the
+#: manoeuvres came 1.8 to 2.3 s apart.
+MANIOBRA_SIN_NOVEDAD_S = 12.0
+
+#: And the manoeuvre that works both at once, last so its fatigue does not
+#: reach the others: **one hold of about eight seconds**.
+#:
+#: Measured, not chosen. The wizard guided three holds of five seconds for
+#: a day, because the practical guide offers that as a way of getting more
+#: signal; but the bench recording the article's co-activation figures come
+#: from has **one** grip window — 92.9 to 100.2 s of
+#: ``P01_2026-09-06_09-53 2``, both muscles together the whole way — and
+#: the manuscript and the ethics committee's forms both describe one hold
+#: of about eight seconds. Guiding three would have been guiding a
+#: different protocol from the one that produced the numbers.
+#:
+#: Repeating it is still what the guide says it is: consecutive fragments
+#: with the same name are grouped into one window by the analysis, so a
+#: second hold costs nothing. It is one number here the day that changes.
+COACT_REPS = 1
+COACT_HOLD_S = 8.0
+COACT_REST_S = 2.0
+
+#: The band the grip is aimed at, as a share of each muscle's own maximum:
+#: «firme pero submáximo, guiándose por la barra de carga hacia el 50–60 %».
+COACT_ZONA = (0.50, 0.60)
+
+#: The co-activation manoeuvre's colour in the map of the phase. The two
+#: muscles have theirs (``_CHANNEL_COLORS``) and this belongs to neither;
+#: orange is free and collides with nothing on this screen.
+COLOR_COACT = (230, 126, 34)
+#: Blocks of data (~10 per second) the armed session flow keeps trying for
+#: before handing the calibration back to the operator.
+MVC_FLOW_MAX_TRIES = 30
+# How a repetition is summarised — its peak, the profile's
+# mvc_peak_window_s — lives in SignalProfile, so the acquisition and the
+# analysis judge a reference by the same measure.
+
+# Guided force-velocity: the opening MVC maximum is a *sustained* effort (a few
+# seconds to reach the true maximum), whereas each loaded rep is a *quick lift*
+# — the point is the shortening velocity, which a long isometric hold does not
+# show (and the accelerometer barely registers). The per-load lift duration is
+# taken from the plan dialog; the MVC hold is fixed here.
+FV_MVC_HOLD_S = 3.0
+# Longer recovery pause between the (maximal) MVC and the first loaded lift, so
+# the subject recovers from the maximum and sets up the first load in peace.
+FV_MVC_TO_LOADS_REST_S = 5.0
+#: Seconds the kinematics session announces the loads before cueing the
+#: first, once the calibration and the preparation pause are behind.
+FV_INTRO_S = 4.0
+#: The plan the dialog opens with, and what the recording assumes when no
+#: plan has been saved yet. Three lifts per load, because one lift is one
+#: number per load with nothing to say how much of it is the attempt; six
+#: seconds to get the next weight in hand and set up with it; and one second
+#: of lift, because the lift is what is measured and it is quick — a longer
+#: window only adds the rest that follows it to the row.
+#: What the **simulated** subject is asked for during a cued lift. A board
+#: ignores it and a person does what the weight asks; it is here so that a
+#: rehearsal of this study records lifts instead of a flat line.
+FV_NIVEL_SIMULADO = 0.6
+
+FV_REPS_DEF = 3
+FV_PREP_DEF_S = 6.0
+FV_LIFT_DEF_S = 1.0
+
+# Style per live signal-quality status code (green ok / red saturation /
+# amber flat-disconnected).
+_QUALITY_STYLES = {
+    "ok": "color: #1a7f37; font-weight: bold;",
+    "saturation": "color: #b00020; font-weight: bold;",
+    "flat": "color: #b06a00; font-weight: bold;",
+}
+
+# Per-channel colour, consistent across the three plots: a colour always
+# identifies the same sensor (blue = channel 1, red = channel 2).
+_CHANNEL_COLORS = [(65, 105, 225), (214, 39, 40)]
+_CHANNEL_COLOR_HEX = [COLOUR_1, COLOUR_2]
+_CHANNEL_DEFAULT_LABELS = ["EMG1", "EMG2"]
+#: What the empty boxes suggest, and what a recording gets when they are
+#: left empty. A name a student can read back — «agonist», «antagonist» —
+#: rather than a channel number; the anatomical one is still theirs to
+#: type. Callables so tr() runs in the language of the moment.
+_LABEL_FALLBACKS = [lambda: tr("Agonist"), lambda: tr("Antagonist")]
+# Defaults used in earlier versions; they are migrated to the ones above if
+# still stored in QSettings (this does not overwrite names chosen by the user,
+# only the old defaults). One tuple of superseded defaults per channel.
+_OLD_DEFAULT_LABELS = [("Canal 1", "EMG"), ("Canal 2", "EMG 2")]
+
+#: The analogue input the accelerometer is wired to, as an index: A2. The
+#: muscle takes A1. A convention the tab states rather than a setting it
+#: offers (see the kinematics block of _apply_mode).
+_ACC_INPUT = 1
+
+#: Longest prefix taken from the test identifier for a file name. Long enough
+#: for a subject code or «bench 3, attempt 2», short enough that the date and
+#: time after it stay readable in a file dialogue.
+MAX_ID_EN_NOMBRE = 24
+
+
+def nombre_por_defecto(codigo: str, sello: str, sesion: str = "") -> str:
+    """The file name the save dialogue opens with.
+
+    With the identifier typed into its box the recording still came out as
+    ``emg_<date>.edf`` and had to be renamed by hand — which is exactly the
+    moment to get it wrong. When there
+    is an identifier the file carries it, so the recording and its screenshots
+    share a name from the start.
+
+    The identifier is free text, so only what a file name can hold survives:
+    letters, digits, dash, underscore and dot; anything else becomes a dash,
+    runs collapse, and the result is trimmed. An identifier that leaves
+    nothing usable — punctuation only — falls back to the old name rather
+    than to something unreadable.
+
+    *sesion* is the guided session's short name, when one was chosen, so a
+    gradation and a fatigue recorded in a row are told apart by their names.
+    """
+    limpio = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(codigo)).strip("-._")
+    limpio = limpio[:MAX_ID_EN_NOMBRE].strip("-._")
+    if sesion:
+        sello = f"{sesion}_{sello}"
+    return f"{limpio}_{sello}.edf" if limpio else f"emg_{sello}.edf"
+
+
+def _documentos() -> str:
+    """The user's Documents folder as Qt names it; it need not exist."""
+    return QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DocumentsLocation
+    )
+
+
+def carpeta_por_defecto() -> str:
+    """Where recordings go until someone picks a folder: the user's Documents,
+    or the home folder where there is no Documents folder.
+
+    Not the working directory. An executable started from a shortcut can have
+    a system folder there, where a student cannot write, and the failure then
+    arrives at the first recording rather than at start-up. And not a
+    Documents path that is only a name: a Linux without XDG folders reports
+    one that does not exist, and a save dialogue opened on it opens nowhere.
+    """
+    for candidata in (_documentos(), str(Path.home())):
+        if candidata and Path(candidata).is_dir():
+            return candidata
+    return "."
+
+
+def preparar_carpeta(ruta: str) -> str | None:
+    """Make sure the recording's folder exists; say why when it cannot.
+
+    The save dialogue opens on the folder the last recording went to, and on a
+    classroom computer that folder can be gone — a pen drive taken out, a
+    directory tidied away. The dialogue still hands the path back, and the
+    writer then failed on a folder that did not exist. It is created here when
+    it can be; when it cannot, the reason comes back in words the operator can
+    act on, before a single sample is lost. Returns ``None`` when ready.
+    """
+    carpeta = Path(ruta).parent
+    try:
+        carpeta.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return mensaje_fallo_guardado(ruta, exc)
+    return None
+
+
+def aviso_puertos_no_validos(linea: str, pagina: int, datos: int) -> str:
+    """Said once at start when a line of difusion.txt cannot be used."""
+    return tr(
+        "The line «{line}» of {file} is not valid; the broadcast uses ports "
+        "{page} and {data}."
+    ).format(line=linea, file=PORTS_FILE, page=pagina, data=datos)
+
+#: The guided sessions of the one-muscle practical, in the order the chooser
+#: offers them: key → the function that builds the script
+#: (:mod:`emgteach.sessions`). The chooser is hidden while this is empty.
+GUIDED_SESSIONS: dict[str, Callable[[], SessionScript]] = {
+    "gradacion": gradation_script,
+    "fatiga": load_script,
+    "rapidas": rapid_script,
+}
+
+#: Where the «Tone» box is remembered between sessions. On by default, as in
+#: ecgteach: a box that has to be remembered is a box that gets forgotten.
+SESSION_TONE_KEY = "sesiones/tono"
+
+
+class AcquisitionTab(QWidget):
+    #: Emitted with the path of the EDF just written. The other tabs pick it
+    #: up so the recording does not have to be hunted for three times: what a
+    #: student almost always wants is to analyse the one they just made.
+    recording_saved = Signal(str)
+
+    #: One step of the kinematics sequence: (title, body, the control it
+    #: points at). Emitted rather than shown here because the floating panel
+    #: belongs to the window — it dims everything outside the control it
+    #: explains, which a tab cannot do to its siblings. Same signal, same
+    #: panel and same rule as the analysis tab's.
+    coach_step = Signal(str, str, object)
+
+    #: What became of a guided session's tone (:func:`emgteach.cue.set_tone_report`),
+    #: told from the tone's own thread and logged from this one.
+    _tono_informado = Signal(str, float)
+
+    def __init__(self, logger: LoggerWidget, settings: QSettings, parent=None,
+                 broadcast: BroadcastServer | None = None):
+        super().__init__(parent)
+        self._logger = logger
+        self._settings = settings
+        self._worker: AcquisitionWorker | None = None
+        self._profile = EMG_PROFILE
+
+        # Number of active channels (1 or 2), persisted in QSettings.
+        saved_n = int(cast("int | str", self._settings.value("adquisicion/n_channels", 1)))
+        self._n_channels = min(max(saved_n, 1), MAX_CHANNELS)
+
+        # Optional BITalino accelerometer (A4): a single extra raw channel,
+        # kept out of the EMG channel machinery (load monitor, MVC wizard,
+        # stacking) and shown in its own auto-scaled plot.
+        self._acc_enabled = cast(bool, self._settings.value(
+            "adquisicion/acc", False, type=bool
+        ))
+        # Whether the channel-config controls are currently editable (idle, not
+        # recording). Used together with the ACC placement to gate the channel
+        # count (MMG placement forces a single muscle).
+        self._channel_controls_enabled = True
+        #: The EDF this tab is recording into, or the one it is showing after
+        #: a recording. Screenshots are named after it, so a picture taken
+        #: during a manoeuvre files itself beside the signal it belongs to
+        #: instead of under a generic name nobody can match up afterwards.
+        self._ruta_registro: str = ""
+
+        # Live-load zone thresholds (% MVC). Default from the signal profile,
+        # but adjustable in the UI once an MVC is calibrated and remembered
+        # across sessions (QSettings). warning < danger is always enforced.
+        self._load_warning = float(cast(float, self._settings.value(
+            "adquisicion/load_warning", self._profile.apda_warning_limit, type=float)))
+        self._load_danger = float(cast(float, self._settings.value(
+            "adquisicion/load_danger", self._profile.apda_danger_limit, type=float)))
+        if self._load_danger <= self._load_warning:
+            self._load_danger = self._load_warning + 1.0
+
+        # ── Online muscle-load monitor (live MVC) ──
+        # Per-channel MVC reference (mV) from a quick calibration, an OnlineLoad
+        # accumulator and a calibration buffer; the live bars update per block
+        # and the static/median/peak readout on a slower timer.
+        self._mvc_ref: list[float | None] = [None] * MAX_CHANNELS
+        self._online: list[OnlineLoad] = [
+            OnlineLoad(self._load_warning, self._load_danger)
+            for _ in range(MAX_CHANNELS)
+        ]
+        # ── Guided MVC-calibration wizard (per-muscle, sequential) ──
+        # A small state machine driven by a 100 ms tick and the live envelope
+        # stream: for each active channel it runs a 3-2-1 countdown, a fixed
+        # maximal-contraction window, then a relax pause, optionally repeated
+        # (best of N). The reference is the best per-rep P95 of the envelope.
+        self._mvc_active = False
+        self._mvc_phase = ""          # "ready" | "contract" | "rest" | "done"
+        self._mvc_muscle = 0
+        self._mvc_rep = 0
+        self._mvc_reps = 1
+        self._mvc_elapsed = 0.0       # seconds spent in the current phase
+        self._mvc_peak = 0.0          # running peak of the current contraction
+        self._mvc_cur = 0.0           # current (recent) effort of the contraction
+        self._mvc_cur_buf: list[float] = []                  # current rep envelope
+        self._mvc_capture: list[list] = [[] for _ in range(MAX_CHANNELS)]
+        self._mvc_rest_buf: list[float] = []
+        #: The *other* channels' envelope during the current repetition, and the
+        #: same accumulated per repetition. This is what tells a two-muscle
+        #: montage apart from two electrode pairs reading the same muscle.
+        self._mvc_cross_buf: dict[int, list[float]] = {}
+        self._mvc_cross: list[dict[int, list]] = [{} for _ in range(MAX_CHANNELS)]
+        #: Channels whose calibration did not look like a maximum.
+        self._mvc_no_maximas: list[str] = []
+        self._mvc_raw_peak = [0.0] * MAX_CHANNELS   # for post-calibration autoscale
+        self._mvc_timer = QTimer(self)
+        self._mvc_timer.setInterval(MVC_TICK_MS)
+        self._mvc_timer.timeout.connect(self._mvc_tick)
+
+        # The two-phase session. When the practical needs a calibration the
+        # record button runs the whole flow — calibration, a preparation pause,
+        # then the recording proper — and the acquisition never stops in
+        # between, so the file is continuous and the phases are annotations in
+        # it. `_mvc_flow_auto` is what tells the wizard it is part of that flow
+        # rather than a calibration someone asked for in the middle of a
+        # recording; only the flow writes PREP/REC, because only in the flow is
+        # the calibration at the start of the file.
+        #
+        #: The practical this tab is set up for. apply_mode keeps it up to date,
+        #: but it has to exist before anyone calls that — and _flow_needs_
+        #: calibration reads it on every press of the record button.
+        self._mode = DEFAULT_MODE
+        #: Which pair the agonist/antagonist practical is on. Content
+        #: only — the examples, the pictures, the hint in each label box —
+        #: and no threshold moves with it (:mod:`emgteach.pairs`).
+        self._par = normalise_pair(
+            self._settings.value("adquisicion/par", DEFAULT_PAIR))
+        #: Which step of the kinematics sequence the floating panel last
+        #: offered, so it is offered once and not after every event.
+        self._paso_mostrado = ""
+        self._mvc_flow_auto = False
+        self._mvc_flow_pending = False    # start it on the first block of data
+        #: The kinematics session's second phase — the loads — waiting for
+        #: the recording phase to begin (see _iniciar_grabacion).
+        self._fv_flow_pending = False
+        #: The one-muscle practical's guided session chosen for this
+        #: recording, and whether it is still to start (it starts when the
+        #: recording phase begins, after the calibration if it needs one).
+        self._session_script: SessionScript | None = None
+        self._session_flow_pending = False
+        self._session_runner: SessionRunner | None = None
+        #: How many of the running session's measured efforts are done, and
+        #: whether the phase now running is one (the boxes of the panel).
+        self._sesion_hechas = 0
+        self._sesion_en_esfuerzo = False
+        self._sesion_reposo: list[float] = []
+        #: The rest the session measured (mV), the held effort's envelope
+        #: from its second 2 to 5, and the weak-signal warning once checked.
+        self._sesion_reposo_mv: float | None = None
+        self._sesion_esfuerzo_env: list[float] = []
+        self._senal_revisada = False
+        self._aviso_senal: str | None = None
+        #: Why the running session is being stopped: «esc» or «stop».
+        self._session_motivo = ""
+        #: Blocks of data seen while the flow was armed and could not start.
+        #: The flow is a convenience; failing to run it must never leave the
+        #: session with no way to calibrate at all.
+        self._mvc_flow_tries = 0
+        #: The calibration's verdict, carried into the preparation countdown.
+        #: A weak calibration is the one result nobody must scroll past, and
+        #: the countdown is what is on screen for the next five seconds.
+        self._prep_aviso = ""
+        self._prep_elapsed = 0.0
+        self._prep_timer = QTimer(self)
+        #: Which phase of the guided session is running, if any:
+        #: ``""`` | ``"cal"`` | ``"maniobras"`` | ``"coact"``.
+        self._guia_fase = ""
+        #: The manoeuvres phase: which muscle leads now, how many of each
+        #: muscle's have been detected, and how many samples the signal
+        #: has been back at rest for since the last one. The counts fill
+        #: the map, and a full map plus that rest is what moves the phase
+        #: on. Samples and not seconds: a second added up out of tenths
+        #: never quite reaches one.
+        self._man_grupo = 0
+        self._man_hechas = [0, 0]
+        self._man_quieto_n = 0
+        #: Muestras por encima del suelo en la excursión en curso, por
+        #: canal (el conteo es por excursión sostenida), y muestras seguidas
+        #: por debajo, que son las que la dan por acabada.
+        self._man_alto_n = [0] * MAX_CHANNELS
+        self._man_bajo_n = [0] * MAX_CHANNELS
+        self._man_sin_novedad_n = 0
+        self._coact_rep = 0
+        #: What each muscle is reading right now, as a % of its own
+        #: reference. The load bars show it, and so does the guide's box
+        #: while it is floating over them.
+        self._carga_inst = [0.0] * MAX_CHANNELS
+        #: The envelope this block, in mV, and the highest it has been in the
+        #: running effort of a guided session: what its panel's bar shows
+        #: when there is no calibration to give a % MVC.
+        self._env_inst = [0.0] * MAX_CHANNELS
+        self._sesion_pico = 0.0
+        self._coact_fase = ""
+        self._coact_elapsed = 0.0
+        self._coact_timer = QTimer(self)
+        self._coact_timer.setInterval(MVC_TICK_MS)
+        self._coact_timer.timeout.connect(self._coact_tick)
+        self._prep_timer.setInterval(MVC_TICK_MS)
+        self._prep_timer.timeout.connect(self._prep_tick)
+        self._tono_informado.connect(self._on_tono)
+        # Floating guide drawn over the plots during the wizard.
+        self._mvc_overlay = MvcOverlay(self)
+
+        # Guided force-velocity acquisition wizard: steps through a list of
+        # known loads, one short recording window each, auto-marking every
+        # window with its load so the F-V study reads the loads directly. Shares
+        # the floating overlay with the MVC wizard (they never run together).
+        # Phases: an MVC maximum first (no load) — "mvc_ready"/"mvc_contract"/
+        # "mvc_rest" — then, per load and per rep, a discrete contraction:
+        # "ready" (prepare countdown) → "contract" (contract with this load) →
+        # "rest", ending in "done".
+        self._fv_active = False
+        self._fv_phase = ""
+        self._fv_loads: list[float] = []
+        self._fv_idx = 0              # index into _fv_loads
+        self._fv_rep = 0              # current repetition within the load
+        self._fv_reps = 1             # contractions to perform per load
+        self._fv_prep_s = 5.0         # "prepare" countdown before each contraction
+        self._fv_window_s = 6.0       # duration of each contraction window
+        self._fv_elapsed = 0.0        # seconds spent in the current phase
+        self._fv_fila_de = -1         # which load the top row belongs to
+        self._fv_mvc_buf: list[float] = []   # envelope during the MVC maximum
+        self._fv_mvc_peak = 0.0
+        self._fv_mvc_cur = 0.0
+        self._fv_timer = QTimer(self)
+        self._fv_timer.setInterval(MVC_TICK_MS)
+        self._fv_timer.timeout.connect(self._fv_tick)
+
+        self._load_timer = QTimer(self)
+        self._load_timer.setInterval(400)
+        self._load_timer.timeout.connect(self._update_load_readout)
+
+        #: The box that says a file could not be written mid-recording.
+        self._aviso_guardado: QMessageBox | None = None
+        #: A new recording was asked for while the previous attempt was
+        #: still inside the port's opening; it starts when that ends.
+        self._esperando_puerto = False
+
+        # Local logger: own instance shown in this tab. Messages are mirrored
+        # to the shared logger (self._logger) so the analysis tab also receives
+        # them if it needs them.
+        self._local_log = LoggerWidget()
+        # The lines this tab writes while a recording runs, as plain text
+        # with the time, and the file they belong to. Each line also goes to
+        # <name>.eventos.txt as it is written, so a recording whose process
+        # dies keeps its log (_abrir_eventos); ``None`` between recordings.
+        self._eventos: list[str] | None = None
+        self._eventos_ruta = ""
+        self._eventos_archivo: TextIO | None = None
+        #: The recording is being stopped because the guided session ended:
+        #: the cancels it runs leave the «Task recorded» panel and its map
+        #: on screen for their five seconds (see _parar_al_terminar_sesion).
+        self._conservar_panel = False
+
+        # Classroom broadcast: re-streams the live monitor to student browsers
+        # over the local network (the operator PC owns the single BITalino link).
+        # Shared with the Analysis tab when given by MainWindow.
+        self._broadcast = broadcast if broadcast is not None else BroadcastServer(parent=self)
+
+        self._build_ui()
+        # What every guided flow asks of the subject, the file, the tone and
+        # the line under the panel (gui/acquisition/stage.py).
+        self._escenario = FlowStage(
+            worker=lambda: self._worker,
+            n_channels=lambda: self._n_channels,
+            tone_on=self._chk_tono.isChecked,
+            info_label=self._lbl_load_info,
+            parent=self,
+        )
+        # Out of a text field and back to the M: Enter, Esc or a click
+        # anywhere else (see emgteach.gui.widgets.manual_marker).
+        give_back_focus(self)
+        # The live plots keep no focus, so a click in them leaves the M to
+        # the tab (bench of 15 October 2026, on Windows).
+        hand_the_m_over(self._trazado.plot_widgets(), self._marcador)
+
+    # ------------------------------------------------------------------
+    # Log helpers — write to the local logger AND the shared one
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str) -> None:
+        self._local_log.append_log(msg)
+        self._logger.append_log(msg)
+        self._anotar_evento(msg)
+
+    def _err(self, msg: str) -> None:
+        self._local_log.append_error(msg)
+        self._logger.append_error(msg)
+        self._anotar_evento(f"{tr('Error:')} {msg}")
+
+    def _anotar_evento(self, msg: str) -> None:
+        """Keep one line for the recording's event log, if one is running."""
+        if self._eventos is None:
+            return
+        texto = html.unescape(re.sub(r"<[^>]+>", "", str(msg))).strip()
+        linea = f"{datetime.now():%H:%M:%S}  {texto}"
+        self._eventos.append(linea)
+        f = getattr(self, "_eventos_archivo", None)
+        if f is not None and not _escribir_linea(f, linea):
+            # A file that cannot take one more line (a stick taken out) is
+            # dropped; what it holds stays, and the end writes the whole log
+            # again if it can.
+            self._eventos_archivo = None
+
+    def _abrir_eventos(self) -> None:
+        """Start <name>.eventos.txt with the lines kept so far.
+
+        Ported from ecgteach 0.4.0 (bench of 5 October 2026, E7): with the
+        process killed mid-way, the marks survived in .marcas.txt and the
+        event log — written only at the end — did not, so the one file meant
+        to say what happened was the one missing. It is now written as the
+        recording runs, line by line, each one pushed to disk. Opened for
+        writing (``"w"``), it also replaces the log of an earlier recording
+        of the same name. If it cannot be opened, the log is written at the
+        end as before.
+        """
+        anterior, self._eventos_archivo = self._eventos_archivo, None
+        if anterior is not None:
+            try:
+                anterior.close()
+            except OSError:
+                pass
+        if not self._eventos or not self._eventos_ruta:
+            return
+        try:
+            f = open(events_path(self._eventos_ruta), "w", encoding="utf-8")
+        except OSError:
+            return
+        if all(_escribir_linea(f, linea) for linea in self._eventos):
+            self._eventos_archivo = f
+        else:
+            f.close()
+
+    def _guardar_eventos(self) -> None:
+        """Close the recording's event log beside it, ``<name>.eventos.txt``.
+
+        The log on screen dies with the application, and it is what tells
+        what happened when something went wrong without an exception —
+        the lines a teacher would send. Since 3.8.0 it is written line by
+        line as the recording runs (_abrir_eventos), and here it is only
+        closed; if that file could not be opened or stopped taking lines,
+        the whole log is written now, well or badly. A file that cannot be
+        written is said in the log and changes nothing else.
+        """
+        eventos, self._eventos = self._eventos, None
+        escrito = getattr(self, "_eventos_archivo", None)
+        self._eventos_archivo = None
+        if escrito is not None:
+            try:
+                escrito.close()
+            except OSError:
+                escrito = None
+        if not eventos or not self._eventos_ruta:
+            return
+        destino = events_path(self._eventos_ruta)
+        try:
+            if escrito is None:
+                destino.write_text("\n".join(eventos) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._err(tr("The event log could not be saved in {path}: {error}")
+                      .format(path=destino, error=exc))
+            return
+        self._log(tr("Event log saved: {path}").format(path=destino))
+
+    # ------------------------------------------------------------------
+    # Interface construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        # The styling (gray background, steel-blue boxes, title margins) is
+        # centralised in gui/app.py and applied to all tabs. Here we only tag
+        # the plot frame with the objectName "plotsBox" so it stays white
+        # (below).
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        # ══ Top row: Configuration (left) | Event log (right) ══
+        row_top = QHBoxLayout()
+        row_top.setSpacing(4)
+
+        # — Device configuration (half width) —
+        grp_config = QGroupBox(tr("Device configuration"))
+        add_help(grp_config, "acq.device")
+        cfg_outer = QVBoxLayout(grp_config)
+        cfg_outer.setContentsMargins(6, 3, 6, 3)
+        cfg_outer.setSpacing(3)
+
+        # Row 1: device type + connection (COM port for both backends).
+        # The device row, the Connect button and the LED, and the watch on the
+        # link while a recording runs (gui/acquisition/connection.py). The
+        # button and the LED go in the control row below.
+        self._conexion = ConnectionBox(self._settings, worker=lambda: self._worker)
+        self._conexion.logged.connect(self._log)
+        self._conexion.warned.connect(self._err)
+        self._conexion.device_type_changed.connect(self._seguir_el_dispositivo)
+        self._conexion.link_lost.connect(self._desconectar)
+        self._conexion.no_answer.connect(self._detener_grabacion)
+        self._conexion.retry_requested.connect(self._reintentar_tras_aviso)
+        cfg_outer.addWidget(self._conexion)
+
+        # Row 2: destination folder + Browse
+        cfg_row2 = QHBoxLayout()
+        cfg_row2.setSpacing(6)
+        # With a folder saved, the placeholder never shows, and the row was a
+        # bare text box beside a Browse button: a field nobody could name.
+        cfg_row2.addWidget(QLabel(tr("Output path and file:")))
+        self._edit_dir = QLineEdit()
+        self._edit_dir.setPlaceholderText(tr("EDF destination folder"))
+        self._edit_dir.setText(
+            cast(str, self._settings.value("adquisicion/save_dir", carpeta_por_defecto()))
+        )
+        cfg_row2.addWidget(self._edit_dir, stretch=1)
+        btn_dir = QPushButton(tr("Browse…"))
+        btn_dir.setFixedWidth(84)
+        btn_dir.clicked.connect(self._seleccionar_directorio)
+        cfg_row2.addWidget(btn_dir)
+        cfg_outer.addLayout(cfg_row2)
+
+        # Row 3: number of channels and per-channel labels
+        ch_row = QHBoxLayout()
+        ch_row.setSpacing(6)
+        # Channel-count block in its own container: the basic level hides it
+        # together with its label, keeping the per-channel names visible.
+        self._box_nchan = QWidget()
+        nchan_l = QHBoxLayout(self._box_nchan)
+        nchan_l.setContentsMargins(0, 0, 0, 0)
+        nchan_l.setSpacing(6)
+        nchan_l.addWidget(QLabel(tr("Channels:")))
+        self._combo_n_channels = QComboBox()
+        self._combo_n_channels.addItem(tr("1 (single sensor)"))
+        self._combo_n_channels.addItem(tr("2 (agonist / antagonist)"))
+        # Capped: the second item is long, and left to size itself it starves
+        # the channel-name boxes next to it. The full text stays in the popup.
+        self._combo_n_channels.setMaximumWidth(150)
+        self._combo_n_channels.setToolTip(
+            tr("How many EMG sensors are being recorded.")
+        )
+        self._combo_n_channels.setCurrentIndex(self._n_channels - 1)
+        self._combo_n_channels.currentIndexChanged.connect(self._on_n_channels_changed)
+        nchan_l.addWidget(self._combo_n_channels)
+        ch_row.addWidget(self._box_nchan)
+
+        # Named container: a practical that fixes its channel names hides the
+        # whole thing, caption included, rather than leaving "Labels:" over an
+        # empty stretch of row.
+        self._box_labels = QWidget()
+        labels_row = QHBoxLayout(self._box_labels)
+        labels_row.setContentsMargins(0, 0, 0, 0)
+        # «Muscle:» with one muscle (apply_mode): «Labels:» left a student
+        # writing the muscle in the test identifier, on the next row, and
+        # the channel kept the previous recording's name (the final bench).
+        self._lbl_labels = QLabel(tr("Labels:"))
+        labels_row.addWidget(self._lbl_labels)
+        self._edit_labels: list[QLineEdit] = []
+        for i in range(MAX_CHANNELS):
+            edit = QLineEdit()
+            edit.setMaxLength(16)  # EDF channel-label limit
+            edit.setToolTip(
+                tr(
+                    "Name of this channel's muscle/sensor (max. 16 characters; "
+                    "used as the channel label in the EDF file)."
+                )
+            )
+            stored = cast(str, self._settings.value(f"adquisicion/label_{i}", ""))
+            # A stored default is not a name the operator gave: the box
+            # starts empty, with a hint of what goes in it. «EMG1» in the
+            # practical whose whole point is telling two muscles apart was
+            # the wrong answer pre-filled.
+            if stored in _OLD_DEFAULT_LABELS[i] or stored == _CHANNEL_DEFAULT_LABELS[i]:
+                stored = ""
+            edit.setText(stored)
+            edit.setPlaceholderText(pair_hint(self._par, i))
+            # Room for the 16 characters the EDF label allows: these are the
+            # muscle names, the one thing on this row the student really reads.
+            edit.setMinimumWidth(130)
+            edit.textChanged.connect(self._on_label_changed)
+            self._edit_labels.append(edit)
+            labels_row.addWidget(edit, stretch=1)
+        # Which pair this practical is on. In the labels row on purpose:
+        # that is where the muscles are named, and it keeps the selector
+        # away from the load bars, which is what the article's live figure
+        # shows and cannot be taken again.
+        self._lbl_par = QLabel(tr("Pair:"))
+        labels_row.addWidget(self._lbl_par)
+        self._combo_par = QComboBox()
+        for par in PAIRS:
+            self._combo_par.addItem(pair_label(par), par)
+        self._combo_par.setCurrentIndex(PAIRS.index(self._par))
+        self._combo_par.setToolTip(tr(
+            "Which pair of muscles this practical is being run on. It "
+            "changes what the interface shows and says — the examples, the "
+            "pictures — and nothing it computes: the limits are the same for "
+            "every pair, and they were measured on the forearm."
+        ))
+        self._combo_par.currentIndexChanged.connect(self._on_par_changed)
+        labels_row.addWidget(self._combo_par)
+        ch_row.addWidget(self._box_labels, stretch=1)
+        # Whole accelerometer block in one container, shown only by the
+        # kinematics mode. Its caption is a plain label so that hiding the
+        # container takes it along.
+        self._box_acc = QWidget()
+        acc_l = QHBoxLayout(self._box_acc)
+        acc_l.setContentsMargins(0, 0, 0, 0)
+        acc_l.setSpacing(6)
+        acc_l.addWidget(QLabel(tr("Accelerometer:")))
+        # The mode decides whether the accelerometer is recorded, so this
+        # checkbox is never shown: it exists to drive the slots that enable the
+        # rest of the block, and is set from apply_mode. Leaving it on screen
+        # would offer the user a way to contradict the mode they chose.
+        self._chk_acc = QCheckBox(tr("ACC"))
+        self._chk_acc.setVisible(False)
+        self._chk_acc.setToolTip(
+            tr(
+                "Also record the BITalino accelerometer (A2) in its own plot and "
+                "EDF channel. Useful to relate muscle activation to movement, "
+                "flag motion artefacts, or show tremor. BITalino only."
+            )
+        )
+        self._chk_acc.setChecked(bool(self._acc_enabled))
+        self._chk_acc.toggled.connect(self._on_acc_toggled)
+        acc_l.addWidget(self._chk_acc)   # hidden; drives the slots
+        # Where the accelerometer is placed decides which analyses make sense
+        # (muscle → MMG; moving segment → kinematics/tremor). Stored in the ACC
+        # channel label so the Analysis tab knows.
+        self._combo_acc_place = QComboBox()
+        self._combo_acc_place.addItem(tr("on the muscle (MMG)"), "muscle")
+        self._combo_acc_place.addItem(tr("on the moving segment (tremor)"), "limb")
+        saved_place = self._settings.value("adquisicion/acc_placement", "muscle")
+        self._combo_acc_place.setCurrentIndex(1 if saved_place == "limb" else 0)
+        self._combo_acc_place.setEnabled(bool(self._acc_enabled))
+        self._combo_acc_place.setToolTip(
+            tr("Where the accelerometer is stuck — sets which ACC analyses apply.")
+        )
+        self._combo_acc_place.currentIndexChanged.connect(self._on_acc_place_changed)
+        acc_l.addWidget(self._combo_acc_place)
+        # The wiring is a convention, not a setting: the muscle on A1, the
+        # accelerometer on A2. It used to be a selector with a «find it»
+        # diagnostic beside it, and the diagnostic found nothing while the
+        # convention was right all along.
+        self._lbl_acc_wiring = QLabel(tr("Muscle on A1 · accelerometer on A2"))
+        self._lbl_acc_wiring.setStyleSheet("color: #6B7580; font-size: 11px;")
+        acc_l.addWidget(self._lbl_acc_wiring)
+        # Which analogue input the accelerometer is wired to. The BITalino packs
+        # enabled channels consecutively, so this must be the physical input.
+        # The practical fixes it to A2 (muscle on A1) and the selector is never
+        # shown; the recording reads it from here.
+        self._combo_acc_channel = QComboBox()
+        for idx in range(6):
+            self._combo_acc_channel.addItem(f"A{idx + 1}", idx)
+        saved_acc_ch = cast(int, self._settings.value("adquisicion/acc_channel", _ACC_INPUT, type=int))
+        self._combo_acc_channel.setCurrentIndex(
+            saved_acc_ch if 0 <= saved_acc_ch < 6 else _ACC_INPUT
+        )
+        self._combo_acc_channel.setEnabled(bool(self._acc_enabled))
+        self._combo_acc_channel.setToolTip(
+            tr("Analogue input the accelerometer is connected to; the "
+               "practical sets it to A2.")
+        )
+        self._combo_acc_channel.currentIndexChanged.connect(
+            self._on_acc_channel_changed
+        )
+        # Which analogue input the sensor is wired to: a one-off wiring detail,
+        # like the port. Own container, never shown (see apply_mode).
+        self._box_acc_wiring = QWidget()
+        wiring_l = QHBoxLayout(self._box_acc_wiring)
+        wiring_l.setContentsMargins(0, 0, 0, 0)
+        wiring_l.setSpacing(6)
+        wiring_l.addWidget(QLabel(tr("ACC ch:")))
+        wiring_l.addWidget(self._combo_acc_channel)
+        acc_l.addWidget(self._box_acc_wiring)
+        acc_l.addStretch()
+        cfg_outer.addLayout(ch_row)
+        # The accelerometer gets its own line. Sharing one with the channel
+        # names left both cramped, and the muscle names are what matter here.
+        cfg_outer.addWidget(self._box_acc)
+
+        # Row 4: the test identifier, written to the EDF+ header, sharing the
+        # line with the classroom broadcast.
+        # An identifier, and only that. The name used to be asked for here
+        # and written into the EDF header as ``patientname``, which meant
+        # every recording carried it out of the laboratory — into the marking
+        # pile, into whatever is shared with a colleague, into an archive. It
+        # is called a *test* identifier rather than a student code because
+        # that is what it names: one student's recording, a pair's, a whole
+        # bench's, or the third attempt of the same person.
+        self._edit_student_code = QLineEdit()
+        self._edit_student_code.setFixedWidth(120)
+        self._edit_student_code.setPlaceholderText(tr("e.g. bench 3, attempt 2"))
+        self._edit_student_code.setToolTip(tr(
+            "Goes into the EDF header and the report. One student, a pair, "
+            "a bench or a repeat — whatever tells this recording apart."
+        ))
+        self._edit_student_code.setText(
+            cast(str, self._settings.value("adquisicion/student_code", ""))
+        )
+        self._edit_student_code.textChanged.connect(
+            lambda v: self._settings.setValue("adquisicion/student_code", v)
+        )
+        # No protocol field. It asked the operator to type what the
+        # application already knew — the practical is chosen at the top of the
+        # window — and let the header disagree with the mode it was recorded
+        # in. It is written from the mode now; see modes.mode_protocol().
+
+        # Classroom broadcast — students follow on their phone browser — on
+        # the same line as the identifier. Named container: the basic level
+        # hides the whole row, status label included.
+        self._box_aula = QWidget()
+        aula_row = QHBoxLayout(self._box_aula)
+        aula_row.setContentsMargins(0, 0, 0, 0)
+        aula_row.setSpacing(6)
+        aula_row.addWidget(QLabel(tr("Test identifier:")))
+        aula_row.addWidget(self._edit_student_code)
+        aula_row.addSpacing(14)
+        self._aula = ClassroomBox(self._broadcast)
+        self._aula.logged.connect(self._log)
+        self._aula.warned.connect(self._err)
+        self._aula.started.connect(self._aula_configurar)
+        aula_row.addWidget(self._aula, stretch=1)
+        cfg_outer.addWidget(self._box_aula)
+
+        row_top.addWidget(grp_config, stretch=1)
+
+        # — Event log (shares the row with the configuration) —
+        grp_log = QGroupBox(tr("Event log"))
+        log_layout = QVBoxLayout(grp_log)
+        log_layout.setContentsMargins(4, 4, 4, 4)
+        # The top row (Configuration + Log) is ~3 rows tall; the log fills that
+        # box and the remaining window space goes to the real-time plots.
+        self._local_log.setMaximumHeight(90)
+        log_layout.addWidget(self._local_log)
+        row_top.addWidget(grp_log, stretch=1)
+
+        root.addLayout(row_top)
+
+        # ══ Actions row: Control | Markers (one line each) ══
+        row_actions = QHBoxLayout()
+        row_actions.setSpacing(4)
+
+        # — Acquisition control (single line) —
+        grp_control = QGroupBox(tr("Acquisition control"))
+        add_help(grp_control, "acq.control")
+        ctrl_layout = QHBoxLayout(grp_control)
+        ctrl_layout.setContentsMargins(6, 3, 6, 3)
+        ctrl_layout.setSpacing(6)
+
+        self._conexion.connect_button.clicked.connect(self._toggle_conexion)
+        ctrl_layout.addWidget(self._conexion.connect_button)
+
+        self._btn_grabar = QPushButton(tr("Start recording"))
+        self._btn_grabar.setCheckable(True)
+        self._btn_grabar.setEnabled(False)
+        self._btn_grabar.clicked.connect(self._toggle_grabacion)
+        ctrl_layout.addWidget(self._btn_grabar)
+        # The way out of a guided procedure — the calibration, the
+        # force-velocity plan — before it ends on its own. Shown only while
+        # one runs; Esc does the same from anywhere on the tab. Before, there
+        # was no way out but to wait for the six efforts to pass.
+        # The way out of a phase the application must not time. The six
+        # manoeuvres are free, so the phase ends when they have been
+        # counted or when the student says so — what it may never do is
+        # fail to end, and this button is what makes sure of that the day
+        # the detector misses one. Shown only while that phase runs, so
+        # the row is the one it always was the rest of the time.
+        self._btn_paso_hecho = QPushButton(tr("Done — next (Space)"))
+        self._btn_paso_hecho.setVisible(False)
+        self._btn_paso_hecho.setToolTip(
+            tr("Go on now, without waiting for the count."))
+        self._btn_paso_hecho.clicked.connect(self._paso_siguiente)
+        ctrl_layout.addWidget(self._btn_paso_hecho)
+        # A held load the student cannot keep up any longer ends here, or
+        # with the space bar (sessions.SessionPhase.early_stop).
+        self._btn_no_puedo = QPushButton(tr("I can't go on (Space)"))
+        self._btn_no_puedo.setVisible(False)
+        self._btn_no_puedo.setToolTip(
+            tr("End the held effort now; the session goes on to its last rest."))
+        self._btn_no_puedo.clicked.connect(self._no_puedo_mas)
+        ctrl_layout.addWidget(self._btn_no_puedo)
+        atajo_paso = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        atajo_paso.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        atajo_paso.activated.connect(self._paso_siguiente)
+        self._btn_cancelar_guia = QPushButton(tr("Cancel guide (Esc)"))
+        self._btn_cancelar_guia.setVisible(False)
+        self._btn_cancelar_guia.setToolTip(
+            tr("Stop the guided procedure now; the recording goes on."))
+        self._btn_cancelar_guia.clicked.connect(self._cancelar_guiado)
+        ctrl_layout.addWidget(self._btn_cancelar_guia)
+        atajo_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        atajo_esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        atajo_esc.activated.connect(self._cancelar_guiado)
+
+        ctrl_layout.addWidget(self._conexion.led)
+        self._lbl_estado = QLabel(tr("Status: disconnected"))
+        ctrl_layout.addWidget(self._lbl_estado)
+        ctrl_layout.addStretch()
+
+        # Live signal-quality indicator (updated per acquired block).
+        self._lbl_calidad = QLabel("")
+        self._lbl_calidad.setToolTip(
+            tr("Live signal quality: saturation or a flat (disconnected) signal.")
+        )
+        self._lbl_calidad.setVisible(False)
+        ctrl_layout.addWidget(self._lbl_calidad)
+        self._quality_monitor: LiveQualityMonitor | None = None
+
+        row_actions.addWidget(grp_control, stretch=1)
+
+        # — Muscle load (live MVC), between Control and Markers —
+        row_actions.addWidget(self._build_load_panel(), stretch=2)
+
+        # — Event markers —
+        #
+        # Two rows: the detection the application does by itself — a
+        # checkbox and its threshold — and beside the short list of what has
+        # been marked, the marking by hand. That went in 3.0.0 for a feature
+        # nobody pressed, in the tab where vertical space is worth the most;
+        # it is back in 3.9.0 for experiments that need their own events
+        # marked, as in ecgteach and eegteach. It shares the list's row, so
+        # the box is no taller than before; there is no Delete button and no
+        # list to scroll, the two things that made it a table.
+        grp_markers = QGroupBox(tr("Event markers"))
+        add_help(grp_markers, "acq.markers")
+        markers_outer = QVBoxLayout(grp_markers)
+        markers_outer.setContentsMargins(6, 3, 6, 3)
+        markers_outer.setSpacing(4)
+        markers_layout = QHBoxLayout()
+        markers_layout.setSpacing(6)
+
+        self._box_autoonset = QWidget()
+        auto_l = QHBoxLayout(self._box_autoonset)
+        auto_l.setContentsMargins(0, 0, 0, 0)
+        auto_l.setSpacing(6)
+        self._chk_auto = QCheckBox(tr("Auto-onset"))
+        self._chk_auto.setToolTip(
+            tr(
+                "Automatically marks the contraction onset when the envelope "
+                "exceeds the threshold (baseline + k·SD of the resting period)."
+            )
+        )
+        self._chk_auto.setChecked(
+            cast(bool, self._settings.value("adquisicion/auto_detect", False, type=bool))
+        )
+        self._chk_auto.toggled.connect(self._on_auto_toggled)
+        auto_l.addWidget(self._chk_auto)
+        # The sensitivity lives in a container of its own so the practicals
+        # can hide it: a student does not know what k is and should not be
+        # deciding it. The fine controls of the advanced practical show it.
+        self._box_k = QWidget()
+        k_l = QHBoxLayout(self._box_k)
+        k_l.setContentsMargins(0, 0, 0, 0)
+        k_l.setSpacing(6)
+        k_l.addWidget(QLabel("k:"))
+        self._spin_k = DecimalSpinBox()
+        self._spin_k.setRange(1.0, 10.0)
+        self._spin_k.setSingleStep(0.5)
+        self._spin_k.setValue(
+            cast(float, self._settings.value(
+                "adquisicion/onset_k", self._profile.onset_k, type=float
+            ))
+        )
+        self._spin_k.setFixedWidth(60)
+        self._spin_k.setToolTip(
+            tr(
+                "Threshold in standard deviations above the resting period "
+                "(lower = more sensitive)."
+            )
+        )
+        self._spin_k.valueChanged.connect(
+            lambda v: self._settings.setValue("adquisicion/onset_k", v)
+        )
+        self._spin_k.setEnabled(self._chk_auto.isChecked())
+        k_l.addWidget(self._spin_k)
+        auto_l.addWidget(self._box_k)
+        markers_layout.addWidget(self._box_autoonset)
+        # What k is, in the box and not only in the «?»: the help text named
+        # it, the box did not show it, and a knob that is explained but
+        # absent is worse than either. Beside the control it explains rather
+        # than on a line of its own — two lines is what this box is worth in
+        # the tab that holds the live plots.
+        self._lbl_k_explica = QLabel(tr("threshold = rest + k × noise (3 is usual)"))
+        self._lbl_k_explica.setStyleSheet("font-size: 10px; color: #6B7580;")
+        self._lbl_k_explica.setWordWrap(True)
+        self._lbl_k_explica.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        markers_layout.addWidget(self._lbl_k_explica, stretch=1)
+        markers_outer.addLayout(markers_layout)
+
+        # The last two onsets found, so the detection is visibly working
+        # without going to the log for it. Two lines: it is a sign of life,
+        # not a table — the whole list is in the recording, and the analysis
+        # is where it gets read.
+        self._list_markers = QListWidget()
+        self._list_markers.setFixedHeight(44)
+        self._list_markers.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self._list_markers.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Two lines, not one and a scroll bar: since it shares its row with
+        # the marking, a long line no longer fit and the horizontal bar took
+        # the second line's place (bench of 15 October 2026). Long lines end
+        # in «…»; the whole list is in the recording.
+        self._list_markers.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_markers.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_markers.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._list_markers.setToolTip(
+            tr("The most recent marks. They all travel in the EDF.")
+        )
+        marks_row = QHBoxLayout()
+        marks_row.setSpacing(6)
+        marks_row.addWidget(self._list_markers, stretch=1)
+        # The label, «Mark» and the M key: emgteach.gui.widgets.manual_marker.
+        self._marcador = ManualMarker(self)
+        self._marcador.marked.connect(self._on_marca_manual)
+        marks_row.addWidget(self._marcador)
+        markers_outer.addLayout(marks_row)
+        markers_outer.addStretch()
+
+        row_actions.addWidget(grp_markers, stretch=1)
+
+        root.addLayout(row_actions)
+
+
+        # ── Plots + scale controls (gui/acquisition/plots.py) ──
+        self._trazado = LivePlots(
+            fs=FS, colours=_CHANNEL_COLORS, colour_hex=_CHANNEL_COLOR_HEX,
+            profile=lambda: self._profile,
+            n_channels=lambda: self._n_channels,
+            acc_enabled=lambda: self._acc_enabled,
+            labels=self._active_labels,
+        )
+        self._trazado.logged.connect(self._log)
+        root.addWidget(self._trazado, stretch=1)
+
+        # Show only the active channels and paint the legend
+        self._apply_channel_visibility()
+        self._trazado.update_legend()
+        # Configure the plot mode (overlaid or stacked) according to the
+        # persisted number of channels — with the raw range set to the saved
+        # device's full scale first, which applies the stacking on its way.
+        self._trazado.follow_device(self._conexion.device_index(), recording=False)
+        # Apply the ACC-placement channel-count constraint to the initial state
+        # (MMG placement forces a single muscle).
+        self._apply_acc_placement_constraints()
+
+    # ------------------------------------------------------------------
+    # Device-control slots
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _seleccionar_directorio(self) -> None:
+        directorio = QFileDialog.getExistingDirectory(
+            self, tr("Select destination folder"),
+            self._edit_dir.text() or ".",
+        )
+        if directorio:
+            self._edit_dir.setText(directorio)
+            self._settings.setValue("adquisicion/save_dir", directorio)
+
+    def report_ports_problem(self, line: str) -> None:
+        """Say once, where the operator reads, that difusion.txt has a bad line."""
+        pagina, datos = self._broadcast.ports()
+        QTimer.singleShot(
+            0, lambda: self._err(aviso_puertos_no_validos(line, pagina, datos))
+        )
+
+    # ------------------------------------------------------------------
+    # Channels (1 or 2: agonist/antagonist)
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _on_n_channels_changed(self, index: int) -> None:
+        self._n_channels = index + 1
+        self._settings.setValue("adquisicion/n_channels", self._n_channels)
+        self._apply_channel_visibility()
+        self._trazado.update_legend()
+        # Switching 1↔2 channels reconfigures the plots (stacked vs overlaid)
+        # and resets the stacking gain.
+        self._trazado.restack()
+        self._aula_configurar()
+
+    @Slot()
+    def _protocolo(self) -> str:
+        """What the EDF header records this recording as.
+
+        The practical, and — in the pair one — which pair it was run on, so
+        that the analysis and the report of a file recorded months ago do
+        not have to guess.
+        """
+        base = mode_protocol(self._mode)
+        if self._mode != MODE_PAIR:
+            return base
+        return f"{base} ({pair_protocol_suffix(self._par)})"
+
+    def imagen_del_par(self, nombre: str) -> str | None:
+        """The picture *nombre* of the pair in use, or ``None``.
+
+        None because the pair has no pictures — «another pair» is any pair,
+        and a figure of somebody else's arm is worse than none — or because
+        the ones for it are still to be drawn.
+        """
+        clave = pair_image(self._par, nombre)
+        return imagen(clave) if clave else None
+
+    def _on_par_changed(self) -> None:
+        """The pair changed: what the interface says follows, nothing else.
+
+        The hints are placeholders, so a name already typed is left alone;
+        and what the teacher has to know before using a pair is said in the
+        log, which is where someone setting a station up is looking.
+        """
+        self._par = normalise_pair(self._combo_par.currentData())
+        self._settings.setValue("adquisicion/par", self._par)
+        for i, edit in enumerate(self._edit_labels):
+            edit.setPlaceholderText(pair_hint(self._par, i))
+        self._log(tr("Pair: {name}").format(name=pair_label(self._par)))
+        aviso = pair_warning(self._par)
+        if aviso:
+            self._log(aviso)
+        if not self.imagen_del_par("calibracion"):
+            self._log(tr("There are no pictures for this pair."))
+
+    def _on_label_changed(self) -> None:
+        for i, edit in enumerate(self._edit_labels):
+            self._settings.setValue(f"adquisicion/label_{i}", edit.text())
+        self._trazado.update_legend()
+        if hasattr(self, "_load_name_labels"):
+            labels = self._active_labels()
+            for c in range(self._n_channels):
+                self._load_name_labels[c].setText(labels[c])
+        self._aula_configurar()
+
+    def _active_labels(self) -> list[str]:
+        """Names of the active channels: the practical's, or the operator's.
+
+        A practical that fixes its channel names answers here rather than by
+        writing into the boxes. Writing into them looked simpler and was
+        wrong twice over: the name stayed behind on the next practical — an
+        agonist/antagonist recording came out labelled "Muscle" and "EMG2" —
+        and it went through ``_on_label_changed`` into QSettings, so choosing
+        the single-muscle practical once overwrote the muscle name the
+        operator had saved.
+        """
+        fijas = mode_fixed_labels(self._mode)
+        labels = []
+        for i in range(self._n_channels):
+            if i < len(fijas):
+                labels.append(tr(fijas[i]))
+                continue
+            text = self._edit_labels[i].text().strip()
+            # One muscle has no agonist: its generic name is «Muscle».
+            if text:
+                labels.append(text)
+            elif self._n_channels == 1:
+                labels.append(tr("Muscle"))
+            else:
+                labels.append(_LABEL_FALLBACKS[i]())
+        return labels
+
+    def _apply_channel_visibility(self) -> None:
+        """Show only the widgets and curves of the active channels."""
+        for i, edit in enumerate(self._edit_labels):
+            edit.setVisible(i < self._n_channels)
+        self._trazado.set_channels(self._n_channels)
+        if hasattr(self, "_load_rows"):
+            labels = self._active_labels()
+            for c in range(MAX_CHANNELS):
+                vis = c < self._n_channels
+                self._load_rows[c].setVisible(vis)
+                self._load_name_labels[c].setText(labels[c] if vis else "")
+
+    # ------------------------------------------------------------------
+    # Stacked mode (2 channels) on raw / filtered
+    # ------------------------------------------------------------------
+
+    def _set_channel_controls_enabled(self, enabled: bool) -> None:
+        self._channel_controls_enabled = enabled
+        for edit in self._edit_labels:
+            edit.setEnabled(enabled)
+        # ACC is only available on the BITalino backend and is fixed for the
+        # duration of a recording.
+        is_bitalino = self._conexion.device_index() == 0
+        self._chk_acc.setEnabled(enabled and is_bitalino)
+        self._combo_acc_place.setEnabled(
+            enabled and is_bitalino and self._acc_enabled
+        )
+        # The channel-count combo also depends on the ACC placement (MMG = 1).
+        self._apply_acc_placement_constraints()
+
+    @Slot(bool)
+    def _on_acc_toggled(self, checked: bool) -> None:
+        """Show/hide the accelerometer plot and remember the choice."""
+        self._acc_enabled = bool(checked)
+        self._settings.setValue("adquisicion/acc", self._acc_enabled)
+        self._trazado.show_accelerometer(self._acc_enabled)
+        self._combo_acc_place.setEnabled(self._acc_enabled)
+        self._combo_acc_channel.setEnabled(self._acc_enabled)
+        self._apply_acc_placement_constraints()
+        self._update_fv_button()
+
+    @Slot(int)
+    def _on_acc_place_changed(self, _index: int) -> None:
+        """Persist the ACC placement and apply its channel-count constraint."""
+        self._settings.setValue(
+            "adquisicion/acc_placement", self._combo_acc_place.currentData()
+        )
+        self._apply_acc_placement_constraints()
+        self._update_fv_button()
+
+    @Slot(int)
+    def _on_acc_channel_changed(self, _index: int) -> None:
+        """Persist which analogue input carries the accelerometer."""
+        self._settings.setValue(
+            "adquisicion/acc_channel", self._combo_acc_channel.currentData()
+        )
+
+    def _refresh_fv_config_label(self) -> None:
+        """Show the last-used guided-F-V reps and loads next to the button."""
+        loads = self._settings.value("adquisicion/fv_loads", "", type=str)
+        reps = self._settings.value("adquisicion/fv_reps", FV_REPS_DEF, type=int)
+        if loads:
+            self._lbl_fv_config.setText(
+                tr("{reps}× · loads: {loads} kg").format(reps=reps, loads=loads)
+            )
+        else:
+            self._lbl_fv_config.setText(tr("(loads not set)"))
+
+    def _update_fv_button(self) -> None:
+        """Enable the guided force-velocity button while no wizard is running.
+
+        Placement is not gated — the plan dialog warns if the ACC is not on
+        the moving segment.
+        """
+        busy = self._mvc_active or self._fv_active
+        # The plan needs no hardware: it is set before anything is
+        # connected and kept for the recording.
+        self._btn_fv_guided.setEnabled(not busy)
+
+    def _apply_acc_placement_constraints(self) -> None:
+        """Force a single EMG channel when the accelerometer is on a muscle.
+
+        An MMG accelerometer measures one muscle's vibration, so it can only be
+        paired with one EMG channel; two channels would be ambiguous. The
+        channel-count selector is therefore locked to 1 while the ACC is on and
+        placed on the muscle, and restored otherwise.
+        """
+        mmg = self._acc_enabled and self._combo_acc_place.currentData() == "muscle"
+        if mmg and self._combo_n_channels.currentIndex() != 0:
+            self._combo_n_channels.setCurrentIndex(0)  # 1 channel
+        self._combo_n_channels.setEnabled(
+            self._channel_controls_enabled and not mmg
+        )
+
+    @Slot(bool)
+    def _on_auto_toggled(self, checked: bool) -> None:
+        self._spin_k.setEnabled(checked)
+        self._settings.setValue("adquisicion/auto_detect", checked)
+
+    def _set_auto_controls_enabled(self, enabled: bool) -> None:
+        self._chk_auto.setEnabled(enabled)
+        self._spin_k.setEnabled(enabled and self._chk_auto.isChecked())
+
+    @Slot()
+    def _toggle_conexion(self) -> None:
+        if self._conexion.is_connected():
+            self._conectar()
+        else:
+            self._desconectar()
+
+    def connect_to(self, address: str) -> None:
+        """Connect to the BITalino at ``address``, as the operator would:
+        choose the BITalino, write the address, press Connect.
+        ``"simulada"`` is the simulated board."""
+        self._conexion.select_bitalino(address)
+        self._conexion.connect_button.setChecked(True)
+        self._toggle_conexion()
+
+    def _conectar(self) -> None:
+        desc = self._conexion.connect_device()
+        if desc is None:
+            return
+        self._btn_grabar.setEnabled(True)
+        self._edit_dir.setEnabled(False)
+        self._set_channel_controls_enabled(False)
+        self._lbl_estado.setToolTip("")
+        self._lbl_estado.setText(tr("Status: connected (ready to record)"))
+        self._update_fv_button()
+        self._log(tr("Device configured: {desc}. Press 'Start recording'.").format(desc=desc))
+        self._actualizar_paso_guiado()
+
+    def _desconectar(self) -> None:
+        self._conexion.stop_watchdog()
+        if self._worker and self._worker.isRunning():
+            self._detener_grabacion()
+        self._conexion.disconnect_device()
+        self._btn_grabar.setEnabled(False)
+        self._btn_grabar.setChecked(False)
+        self._btn_grabar.setText(tr("Start recording"))
+        self._edit_dir.setEnabled(True)
+        self._set_channel_controls_enabled(True)
+        self._esperando_puerto = False
+        self._lbl_estado.setToolTip("")
+        self._lbl_estado.setText(tr("Status: disconnected"))
+        self._update_fv_button()
+        self._log(tr("Device disconnected."))
+
+    @Slot()
+    def _toggle_grabacion(self) -> None:
+        if self._btn_grabar.isChecked():
+            self._iniciar_grabacion()
+        else:
+            self._detener_grabacion()
+
+    def _iniciar_grabacion(self) -> None:
+        if self._esperar_al_puerto():
+            return
+        self._conexion.recording_requested()
+        self._conservar_panel = False
+        self._lbl_estado.setToolTip("")
+        # The kinematics session needs its plan before it starts: the record
+        # button runs the calibration and then cues the loads, and there is
+        # no moment after this one to ask for them.
+        if self._mode == MODE_KINEMATICS and self._plan_fv_guardado() is None:
+            if not self._on_fv_params():
+                self._btn_grabar.setChecked(False)
+                self._log(tr(
+                    "No force-velocity plan: set the loads in «F-V parameters…» first."))
+                return
+        # Ask where and under what name to save the EDF (same UX as the
+        # "Save figure" dialogs), pre-filled with the destination folder and a
+        # timestamped default name. Cancelling aborts the recording start.
+        save_dir = self._edit_dir.text().strip() or "."
+        if not Path(save_dir).is_dir():
+            # The folder of the last recording is gone — a memory stick taken
+            # out. The dialog opens where recordings go by default, and the
+            # field says so, instead of starting from a place that is not
+            # there (3.8.0, from ecgteach 0.4.0).
+            falta, save_dir = save_dir, carpeta_por_defecto()
+            self._edit_dir.setText(save_dir)
+            self._log(tr(
+                "The folder {folder} is no longer there; the recording is "
+                "proposed in {default}."
+            ).format(folder=falta, default=save_dir))
+        # With the seconds (3.8.0, from ecgteach 0.4.0): two recordings in
+        # the same minute proposed the same name.
+        self._session_script = self._sesion_elegida()
+        default_name = nombre_por_defecto(
+            self._edit_student_code.text(), f"{datetime.now():%Y-%m-%d_%H-%M-%S}",
+            self._session_script.slug if self._session_script else "",
+        )
+        ruta, _ = QFileDialog.getSaveFileName(
+            self, tr("Save EDF recording as…"),
+            str(Path(save_dir) / default_name),
+            tr("EDF files (*.edf *.EDF)"),
+        )
+        if not ruta:
+            self._btn_grabar.setChecked(False)
+            return
+        if not ruta.lower().endswith(".edf"):
+            ruta += ".edf"
+        motivo = preparar_carpeta(ruta)
+        if motivo:
+            # Said before anything starts, in a box as well as in the log: at
+            # this moment the student is looking at the subject, not the log.
+            self._err(motivo)
+            QMessageBox.warning(self, tr("The recording cannot be saved"), motivo)
+            self._btn_grabar.setChecked(False)
+            return
+        save_path = ruta
+        # Named now, before a single sample arrives: a screenshot taken during
+        # the calibration has to carry the same base name as the recording.
+        self._ruta_registro = ruta
+        # The event log of this recording starts here, and is written
+        # beside it as it runs.
+        self._eventos_ruta = ruta
+        self._eventos = [
+            f"# emgteach {__version__} — {Path(ruta).name} — "
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+        ]
+        self._abrir_eventos()
+        save_dir = str(Path(ruta).parent)
+        self._edit_dir.setText(save_dir)
+        self._settings.setValue("adquisicion/save_dir", save_dir)
+
+        # A stop is a request: the thread finishes its block, closes the
+        # device and the file, and only then is gone. Started again inside
+        # that gap, the new recording shared the screen with the old one's
+        # ending — its «finished» froze the plots on the previous file
+        # while the new one went on writing. Wait for it; a second at most.
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            if not self._worker.wait(3000):
+                self._worker.stop_forced()
+                self._worker.wait(2000)
+
+        self._trazado.clear()
+        self._list_markers.clear()
+        self._trazado.reset_y_scales()
+
+        n = self._n_channels
+        labels = self._active_labels()
+        for i, lbl in enumerate(labels):
+            self._settings.setValue(f"adquisicion/label_{i}", lbl)
+
+        # The accelerometer is BITalino-only; when on, the device appends an ACC
+        # channel and the worker needs a matching trailing "ACC" label.
+        use_acc = self._acc_enabled and self._conexion.device_index() == 0
+        # Encode the placement in the ACC channel label (ASCII, ≤16 chars) so
+        # the Analysis tab can pick the right ACC analysis on load.
+        acc_label = (
+            "ACC (limb)"
+            if self._combo_acc_place.currentData() == "limb"
+            else "ACC (muscle)"
+        )
+        worker_labels = [*labels, acc_label] if use_acc else list(labels)
+
+        if self._conexion.device_index() == 0:
+            # The EMG channels take the first analogue inputs, skipping the one
+            # the accelerometer is on (they must not collide). So with the ACC
+            # on A1, a single EMG channel lands on A2, etc.
+            acc_ch = self._combo_acc_channel.currentData()
+            if use_acc:
+                emg_channels = [c for c in range(6) if c != acc_ch][:n]
+            else:
+                emg_channels = list(range(n))
+            if use_acc:
+                emg_ports = ", ".join(f"A{c + 1}" for c in emg_channels)
+                self._log(tr(
+                    "Channels: EMG on {emg}, accelerometer on A{acc}."
+                ).format(emg=emg_ports, acc=acc_ch + 1))
+            device = create_device(
+                BACKEND_BITALINO,
+                port=self._conexion.address(),
+                fs=FS,
+                channels=emg_channels,
+                acc=use_acc,
+                acc_channel=acc_ch,
+            )
+        else:
+            device = create_device(
+                BACKEND_ARDUINO,
+                port=self._conexion.serial_port(),
+                fs=FS,
+                n_channels=n,
+            )
+        self._settings.setValue("adquisicion/auto_detect", self._chk_auto.isChecked())
+        self._settings.setValue("adquisicion/onset_k", self._spin_k.value())
+        metadata = RecordingMetadata(
+            # Both fields carry the code: EDF+ writes 'X' into an empty
+            # patientname, and a file whose patient block is 'X' with a
+            # code beside it says less than one that says the code twice.
+            student_name=self._edit_student_code.text().strip(),
+            student_code=self._edit_student_code.text().strip(),
+            protocol=self._protocolo(),
+            equipment=device.name,
+        )
+        # Live quality check against the device's true physical rails.
+        self._quality_monitor = LiveQualityMonitor(
+            device.physical_min, device.physical_max
+        )
+        self._lbl_calidad.setVisible(True)
+        self._worker = AcquisitionWorker(
+            device=device,
+            save_dir=save_dir,
+            save_path=save_path,
+            sensor_labels=worker_labels,
+            auto_detect=self._chk_auto.isChecked(),
+            onset_k=self._spin_k.value(),
+            metadata=metadata,
+        )
+        self._worker.data_ready.connect(self._on_data_ready)
+        self._worker.log.connect(self._log)
+        # Each slot is told which worker spoke: a thread that ends after
+        # the next one started must not restore the controls of the one
+        # that is recording.
+        worker = self._worker
+        worker.error.connect(lambda msg, w=worker: self._on_error(msg, w))
+        worker.finished_ok.connect(lambda path, w=worker: self._on_finished(path, w))
+        worker.escritura_fallida.connect(self._on_escritura_fallida)
+        self._worker.marker_added.connect(self._on_marker_added)
+        self._worker.start()
+        self._trazado.leave_review()
+        self._trazado.start_live()
+        # The watchdog starts in _on_data_ready after the first sample is read;
+        # not here, so it does not fire during device.open() (can take ~3 s).
+
+        self._btn_grabar.setText(tr("Stop recording"))
+        # «recording…» comes with the first block (_on_data_ready): until
+        # then nothing is being recorded, and a student who reads it
+        # believes otherwise.
+        self._lbl_estado.setText(tr("Status: connecting to the board…"))
+        self._conexion.recording_started()
+        self._aula.status(True)
+        self._set_auto_controls_enabled(False)
+        # Live muscle-load monitor: ready to calibrate while recording.
+        self._reset_load_monitor()
+        self._update_fv_button()
+        self._load_timer.start()
+
+        # Armed here and fired on the first block of data: the device can take
+        # seconds to open, and a countdown that starts before the samples do
+        # measures no resting level to judge the calibration against.
+        self._mvc_flow_pending = self._flow_needs_calibration()
+        self._mvc_flow_tries = 0
+        self._btn_calibrar.setEnabled(not self._mvc_flow_pending)
+        # The guided session, if one was chosen: it starts with the recording
+        # phase, after the calibration when it needs one (_prep_tick).
+        self._session_flow_pending = self._session_script is not None
+        self._combo_sesion.setEnabled(False)
+        # The kinematics session's second phase, the loads, is armed with
+        # the first: it fires once the recording phase begins (after the
+        # calibration and its pause) or, with the maximum already
+        # calibrated in this session, on the first block of data.
+        self._fv_flow_pending = self._mode == MODE_KINEMATICS
+        self._log(tr("Recording to {file}.").format(file=save_path))
+        if self._fv_flow_pending:
+            plan = self._plan_fv_guardado()
+            if plan is not None:
+                loads, reps, _p, _w = plan
+                resumen = tr("{reps}× · loads: {loads} kg").format(
+                    reps=reps, loads=", ".join(f"{v:g}" for v in loads))
+                self._log(
+                    tr("First the calibration of the maximum; then the "
+                       "force-velocity study: {plan}.").format(plan=resumen)
+                )
+        # Said out loud, with the three things the answer depends on. Three
+        # sessions came back with no calibration and no way to tell,
+        # from the file alone, whether the flow had declined to arm or armed
+        # and failed to start. One line here separates them.
+        self._log(tr(
+            "Session flow: practical={mode}, {n} channel(s), references={refs} "
+            "→ calibrate first: {yes}."
+        ).format(
+            mode=self._mode, n=self._n_channels,
+            refs=sum(1 for r in self._mvc_ref[: self._n_channels] if r),
+            yes=self._mvc_flow_pending,
+        ))
+        if self._session_script is not None:
+            self._log(tr("Guided session: {title}, {secs:.0f} s.").format(
+                title=tr(self._session_script.title),
+                secs=self._session_script.total_seconds))
+        if self._mvc_flow_pending:
+            # Those seconds are the whole reason the button used to be
+            # pressed by hand: say what is happening in them.
+            self._escenario.info(tr(
+                "Starting the session — the calibration begins as soon as the "
+                "signal arrives."
+            ))
+            self._log(tr(
+                "This practical calibrates first: waiting for the signal to "
+                "start the session."
+            ))
+
+    def _detener_grabacion(self) -> None:
+        # A session stopped in the middle of its own flow leaves a CAL span
+        # with no end, which the reader drops: half a maximal effort is not
+        # a maximal effort.
+        self._mvc_flow_pending = False
+        self._mvc_flow_tries = 0
+        self._fv_flow_pending = False
+        # A guided session stopped with the recording is stopped by
+        # _stop_load_monitor below, before the file closes, so its end mark
+        # gets in.
+        self._session_flow_pending = False
+        self._combo_sesion.setEnabled(True)
+        # Calibrating needs a recording in progress, so the button follows
+        # the recording rather than being left wherever the flow put it.
+        self._btn_calibrar.setEnabled(False)
+        self._prep_timer.stop()
+        self._conexion.stop_watchdog()
+        self._conexion.mark_if_no_answer()
+        self._trazado.stop_live()
+        self._stop_load_monitor()
+        self._aula.status(False)
+        if self._worker:
+            self._worker.stop()
+        self._btn_grabar.setText(tr("Start recording"))
+        self._btn_grabar.setChecked(False)
+        self._conexion.recording_finished()
+        self._lbl_estado.setText(self._estado_en_reposo())
+        self._set_auto_controls_enabled(True)
+
+    def _estado_en_reposo(self) -> str:
+        """What the status line says when nothing is being recorded; its
+        tooltip goes on the line. The connection decides it
+        (ConnectionBox.idle_status)."""
+        texto, ayuda = self._conexion.idle_status()
+        self._lbl_estado.setToolTip(ayuda)
+        return texto
+
+    # ------------------------------------------------------------------
+    # Worker slots
+    # ------------------------------------------------------------------
+
+    @Slot(dict)
+    def _on_data_ready(self, data: dict) -> None:
+        # The first block: the board answered, and from here the recording
+        # is one.
+        # The connection stops waiting for the board, and starts the watchdog.
+        if self._conexion.block_arrived():
+            self._lbl_estado.setText(tr("Status: recording…"))
+            # Marking by hand from the first block, not from the button:
+            # before it there is no recording for a mark to be in.
+            self._marcador.set_recording(True)
+            self._log(tr("Press M to mark quickly with the selected label."))
+        # Samples are flowing, so the session's opening phase can begin. Armed
+        # in _iniciar_grabacion; fired here so the wizard's first countdown has
+        # a real resting level to measure.
+        #
+        # The flag is cleared by _iniciar_calibracion once it is past its
+        # guards, not here. Clearing it before the call spends the session's
+        # one chance on an attempt that may bounce — and when it did, the
+        # recording came back with no calibration at all and the button left
+        # disabled, which is a worse state than either outcome. Retrying on
+        # the next block costs nothing: this runs ten times a second.
+        # A kinematics session whose maximum is already calibrated skips
+        # straight to the loads, on the first block, as the calibration
+        # would have. Never while the calibration or its pause runs: those
+        # hand over to the loads themselves, at the recording phase.
+        if (self._fv_flow_pending and not self._mvc_flow_pending
+                and not self._mvc_active and not self._fv_active
+                and not self._prep_timer.isActive()):
+            self._lanzar_estudio_fv()
+        # A guided session that needs no calibration goes straight to the
+        # countdown, and from it to the recording phase, as the calibration
+        # would have handed over (_prep_tick launches it).
+        if (self._session_flow_pending and not self._mvc_flow_pending
+                and not self._mvc_active and not self._prep_timer.isActive()):
+            self._prep_aviso = tr(
+                "The guided session starts when the count reaches 0.")
+            self._mvc_enter_prep()
+        if self._mvc_flow_pending and not self._mvc_active:
+            self._iniciar_calibracion(auto_flow=True)
+            if self._mvc_flow_pending:
+                # It bounced. Retrying is nearly free, but not for ever: an
+                # armed flow that never starts used to leave the Calibrate
+                # button disabled with no calibration and no way to ask for
+                # one, which is a worse outcome than either.
+                self._mvc_flow_tries += 1
+                if self._mvc_flow_tries >= MVC_FLOW_MAX_TRIES:
+                    self._mvc_flow_pending = False
+                    self._btn_calibrar.setEnabled(True)
+                    self._escenario.info("")
+                    self._log(tr(
+                        "The session could not start the calibration on its "
+                        "own. Press «Calibrate MVC» when you are ready — the "
+                        "phases will be written just the same."
+                    ))
+        # data_ready carries one array per channel; the plots keep their own.
+        raw = data["raw_mv"]
+        env = data["envelope"]
+        self._trazado.append(raw, env)
+        # During the wizard's contraction window, track the raw peak so the
+        # plots can auto-scale to this subject once calibration finishes.
+        if self._mvc_active and self._mvc_phase == "contract":
+            for c in range(min(len(raw), self._n_channels, MAX_CHANNELS)):
+                if raw[c].size:
+                    self._mvc_raw_peak[c] = max(
+                        self._mvc_raw_peak[c], float(np.max(np.abs(raw[c])))
+                    )
+        # Live signal-quality indicator (worst status across channels).
+        if self._quality_monitor is not None and raw:
+            self._update_quality(raw)
+        # Live muscle-load monitor (calibration or per-block load update).
+        self._process_load(env)
+        # And the map of the free manoeuvres, if one is being asked for.
+        self._guia_detecta(env)
+        # Re-broadcast to classroom followers, with the load they show.
+        if self._aula.is_running():
+            self._aula.live(env, self._n_channels, self._carga_para_el_aula())
+        # Green LED: there is traffic.
+        self._conexion.traffic()
+
+    def _update_quality(self, raw: list) -> None:
+        """Show the worst per-channel quality status of the latest block."""
+        assert self._quality_monitor is not None
+        status = None
+        for c in range(min(len(raw), self._n_channels)):
+            s = self._quality_monitor.update(raw[c])
+            # Prefer a problem status over "ok"; first problem wins.
+            if s.code != "ok":
+                status = s
+                break
+            status = s
+        if status is None:
+            return
+        self._lbl_calidad.setText(status.message)
+        self._lbl_calidad.setStyleSheet(_QUALITY_STYLES.get(status.code, ""))
+
+    # ------------------------------------------------------------------
+    # Review: the finished recording, on the plots that recorded it
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Muscle-load monitor (live MVC — Jonsson APDA)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Classroom broadcast (followers watch on their phone browser)
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _aula_configurar(self) -> None:
+        """What the followers are told of the recording — the channels, their
+        names and whether a recording is on —, which only the tab knows: on
+        the broadcast's start and whenever the channels or their names
+        change."""
+        self._aula.config(self._n_channels, self._active_labels(), self.is_recording())
+
+    def _carga_para_el_aula(self) -> dict:
+        """The live load of each muscle as the followers' page shows it: the
+        thresholds and, per channel, the % MVC now and the P10/P50/P90 of the
+        recording so far, measured only once that muscle has an MVC
+        reference."""
+        ch = []
+        for c in range(self._n_channels):
+            ol = self._online[c]
+            active = bool(self._mvc_ref[c])
+            ch.append({
+                "active": active,
+                "pct": round(ol.current, 1) if active else 0.0,
+                "static": round(ol.static, 0), "median": round(ol.median, 0),
+                "peak": round(ol.peak, 0), "zone": ol.status,
+            })
+        return {"warn": self._load_warning, "danger": self._load_danger, "ch": ch}
+
+    def _build_load_panel(self) -> QGroupBox:
+        """Live muscle-load box (sits between Control and Markers in the actions
+        row): on a single line, the Calibrate button and — per active channel,
+        side by side — a load bar (tiredness / fatigue zones) and its P10/P50/P90
+        readout, with a status label at the end."""
+        grp = QGroupBox(tr("Muscle load (live MVC)"))
+        add_help(grp, "acq.load")
+        # Two lines, and only two. The first is what is set up before
+        # recording; the second is the live monitor. The box had grown to
+        # four rows of buttons and explanations, which is a page of reading
+        # in the place where the operator is looking for one control.
+        col = QVBoxLayout(grp)
+        col.setContentsMargins(6, 3, 6, 3)
+        col.setSpacing(3)
+
+        fila_sup = QHBoxLayout()
+        fila_sup.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self._btn_calibrar = QPushButton(tr("Calibrate MVC"))
+        self._btn_calibrar.setEnabled(False)
+        self._btn_calibrar.setToolTip(
+            tr("Guided MVC calibration: contract each muscle in turn at maximum "
+               "when prompted; sets the reference for the live load monitor.")
+        )
+        self._btn_calibrar.clicked.connect(self._on_calibrar)
+        # «Best of 3» used to be a checkbox here, off by default. Repeating
+        # the maximum and keeping the strongest is not an option: it is how a
+        # maximum is measured at all — the first maximal effort of a session
+        # is genuinely submaximal, and a single attempt has nothing to fall
+        # back on. The protocol said to tick it; the application now does.
+        fila_sup.addWidget(self._btn_calibrar)
+
+        # The guided sessions of the one-muscle practical, on the line of
+        # «Calibrate MVC»: that line is half empty in this practical (the
+        # force-velocity box beside it is the kinematics practical's), so
+        # the chooser takes no height. «Free recording» is what it says when
+        # the tab opens: the guided sessions are an offer, not the norm.
+        self._combo_sesion = QComboBox()
+        self._combo_sesion.setToolTip(tr(
+            "Choose a guided session before recording: «Start recording» "
+            "then runs it — the calibration if it needs one, a countdown, and "
+            "each phase announced and timed — writes its phases into the file "
+            "and stops the recording at the end. Esc stops the session and the "
+            "recording goes on."))
+        self._combo_sesion.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        fila_sup.addWidget(self._combo_sesion)
+        self._chk_tono = QCheckBox(tr("Tone"))
+        self._chk_tono.setToolTip(tr(
+            "A short tone at every phase change of the guided flows — the "
+            "calibration, the countdown, the guided task and the guided "
+            "sessions — for a student watching their hand rather than the "
+            "screen. Ticking it plays the tone, to check it can be heard."))
+        guardado = self._settings.value(SESSION_TONE_KEY, cue.DEFAULT_ENABLED)
+        # QSettings brings booleans back as «true»/«false» on some systems.
+        if isinstance(guardado, str):
+            guardado = guardado.strip().lower() in {"true", "1", "yes"}
+        self._chk_tono.setChecked(bool(guardado))
+        self._chk_tono.toggled.connect(self._on_tono_cambiado)
+        fila_sup.addWidget(self._chk_tono)
+        self._rellenar_sesiones()
+
+        # Its own box, with its own «?». The guided flow is the kinematics
+        # practical's whole procedure, not a detail of the load monitor, and
+        # the button's tooltip was the only place that said what it does —
+        # every other thing on this tab is explained from a corner «?», and a
+        # student who has learnt to look there found nothing here. The
+        # kinematics practical shows the box; the other two hide it whole.
+        # Its own box, with its own «?», because the guided flow is the
+        # kinematics practical's whole procedure and not a detail of the load
+        # monitor. One line: the parameters, the rehearsal beside them, and
+        # the plan in words. What used to be a third line — «3 · Start
+        # recording: the maximum is calibrated first, then each load is
+        # cued» — is the procedure itself, and the procedure is what the «?»
+        # is for; written here it was a sentence nobody could act on
+        # occupying a third of the box.
+        self._box_fv_guided = QGroupBox(tr("Force-velocity study"))
+        add_help(self._box_fv_guided, "acq.fv")
+        fv_row = QHBoxLayout(self._box_fv_guided)
+        fv_row.setContentsMargins(6, 3, 6, 3)
+        fv_row.setSpacing(6)
+
+        # The parameters come first because they are what has to be set; the
+        # rehearsal is second on the line although the guide teaches it
+        # first, because by the time anyone needs the box they have either
+        # rehearsed or decided not to.
+        self._btn_fv_guided = QPushButton(tr("F-V parameters…"))
+        self._btn_fv_guided.setToolTip(
+            tr("The loads in order, the lifts per load and the seconds of "
+               "preparation. Kept for the recording; nothing starts here.")
+        )
+        self._btn_fv_guided.clicked.connect(self._on_fv_params)
+        fv_row.addWidget(self._btn_fv_guided)
+
+        # Deliberately never disabled: rehearsing is what you do *before* the
+        # device is connected and the subject is holding a weight, so gating
+        # it on the hardware would put it out of reach exactly when it is
+        # useful.
+        self._btn_fv_rehearse = QPushButton(tr("Rehearse…"))
+        self._btn_fv_rehearse.setToolTip(
+            tr("Optional, and it needs no hardware: it plays the whole "
+               "procedure over a synthetic recording, with the same prompts "
+               "in the same order, and ends in the force-velocity study. "
+               "Skip it if you know the procedure.")
+        )
+        self._btn_fv_rehearse.clicked.connect(self._on_fv_rehearse)
+        fv_row.addWidget(self._btn_fv_rehearse)
+
+        # The plan in words: wrapped and with no minimum, so a long list of
+        # loads can never widen the window (see _lbl_load_info).
+        self._lbl_fv_config = QLabel("")
+        self._lbl_fv_config.setStyleSheet("font-size: 10px; color: #555555;")
+        self._lbl_fv_config.setWordWrap(True)
+        self._lbl_fv_config.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._refresh_fv_config_label()
+        fv_row.addWidget(self._lbl_fv_config, stretch=1)
+
+        fila_sup.addWidget(self._box_fv_guided, stretch=1)
+        # And a spacer behind it, for the two practicals that hide the box:
+        # with nothing else on the line asking for width, «Calibrate MVC»
+        # stretched across the whole box and read as a banner rather than a
+        # button. The spacer has no stretch factor of its own, so while the
+        # study box is there the width still goes to the box.
+        fila_sup.addStretch(0)
+        col.addLayout(fila_sup)
+        col.addLayout(row)
+
+        # Adjustable warning / danger thresholds (% MVC). Disabled until an MVC
+        # is calibrated; changing them updates the bars and the monitor live.
+        self._box_thr = QWidget()
+        thr_l = QHBoxLayout(self._box_thr)
+        thr_l.setContentsMargins(0, 0, 0, 0)
+        thr_l.setSpacing(2)
+        lbl_thr_w = QLabel(tr("Warning"))
+        lbl_thr_w.setStyleSheet("font-size: 9px; color: #E67E22;")
+        thr_l.addWidget(lbl_thr_w)
+        self._spin_warning = QSpinBox()
+        self._spin_warning.setRange(1, 99)
+        # Apply only when the edit is committed (Enter / focus-out / arrows),
+        # not on every keystroke — otherwise the warning<danger auto-correction
+        # makes the two boxes fight while you are still typing a number.
+        self._spin_warning.setKeyboardTracking(False)
+        self._spin_warning.setSuffix(" %")
+        self._spin_warning.setFixedWidth(58)
+        self._spin_warning.setValue(round(self._load_warning))
+        self._spin_warning.setEnabled(False)
+        self._spin_warning.setToolTip(
+            tr("Load (% MVC) where the warning (tiredness) zone starts.")
+        )
+        self._spin_warning.valueChanged.connect(self._on_thresholds_changed)
+        thr_l.addWidget(self._spin_warning)
+        lbl_thr_d = QLabel(tr("Danger"))
+        lbl_thr_d.setStyleSheet("font-size: 9px; color: #cc0000;")
+        thr_l.addWidget(lbl_thr_d)
+        self._spin_danger = QSpinBox()
+        self._spin_danger.setRange(2, 100)
+        self._spin_danger.setKeyboardTracking(False)
+        self._spin_danger.setSuffix(" %")
+        self._spin_danger.setFixedWidth(58)
+        self._spin_danger.setValue(round(self._load_danger))
+        self._spin_danger.setEnabled(False)
+        self._spin_danger.setToolTip(
+            tr("Load (% MVC) where the danger (fatigue) zone starts.")
+        )
+        self._spin_danger.valueChanged.connect(self._on_thresholds_changed)
+        thr_l.addWidget(self._spin_danger)
+        row.addWidget(self._box_thr)
+
+        self._load_rows: list[QWidget] = []
+        self._load_name_labels: list[QLabel] = []
+        self._load_bars: list[LoadBar] = []
+        self._load_readouts: list[QLabel] = []
+        for c in range(MAX_CHANNELS):
+            roww = QWidget()
+            rr = QHBoxLayout(roww)
+            rr.setContentsMargins(0, 0, 0, 0)
+            rr.setSpacing(4)
+            name = QLabel()
+            name.setStyleSheet(
+                f"font-size: 9px; font-weight: bold; color: {_CHANNEL_COLOR_HEX[c]};"
+            )
+            bar = LoadBar()
+            bar.set_zones(self._load_warning, self._load_danger)
+            bar.setMinimumWidth(120)
+            readout = QLabel("")
+            readout.setStyleSheet("font-size: 9px;")
+            rr.addWidget(name)
+            rr.addWidget(bar, stretch=1)
+            rr.addWidget(readout)
+            self._load_rows.append(roww)
+            self._load_name_labels.append(name)
+            self._load_bars.append(bar)
+            self._load_readouts.append(readout)
+            row.addWidget(roww, stretch=1)
+
+        # The running commentary of the two wizards. Written but never laid
+        # out: it is built with the box as its parent and left hidden.
+        #
+        # It used to sit at the end of this line and it was the most
+        # expensive widget in the window. Its sentences are long — «4 loads
+        # recorded. Stop recording, then open the study» — so on one line it
+        # widened the box, the box widened the window, and the right-hand
+        # edge of the interface went off the screen at the very moment the
+        # force-velocity wizard finished. Wrapping it moved the same problem
+        # to the other axis: given whatever width was left it wrapped to four
+        # lines and made the box three times as tall.
+        #
+        # And it was never needed. Every one of those sentences is already on
+        # the floating panel, in large type, over the plots where the person
+        # running the procedure is looking, and the ones worth keeping are in
+        # the event log as well. The wizards still set it — it costs nothing
+        # and the tests read it — and the box stays two lines whatever they
+        # say.
+        self._lbl_load_info = QLabel("", grp)
+        self._lbl_load_info.setVisible(False)
+        # Two lines at the top of the box, not two lines spread over its
+        # height: the row of boxes is as tall as the tallest of them, and
+        # without this the thresholds drifted into the middle of the empty
+        # part with the study above them and nothing between.
+        col.addStretch()
+        return grp
+
+    @Slot()
+    def _on_calibrar(self) -> None:
+        """The «Calibrate MVC» button: a calibration asked for on its own."""
+        self._iniciar_calibracion(auto_flow=False)
+
+    def _iniciar_calibracion(self, *, auto_flow: bool = False) -> None:
+        """Launch the guided, per-muscle MVC-calibration wizard.
+
+        ``auto_flow`` marks the calibration as the opening phase of a session
+        started from the record button. Only then do the preparation pause and
+        the ``REC start`` annotation follow it: a calibration run in the middle
+        of a recording sits in the middle of the file, and saying the recording
+        starts *there* would throw away everything before it.
+        """
+        if not (self._worker and self._worker.isRunning()):
+            if not auto_flow:
+                self._log(tr(
+                    "The calibration needs a recording in progress."
+                ))
+            return
+        if self._mvc_active or self._fv_active:
+            if not auto_flow:
+                self._log(tr("Another guided procedure is already running."))
+            return
+        self._mvc_active = True
+        self._btn_cancelar_guia.setVisible(True)
+        # Pressing «Calibrate MVC» while the session flow is armed is the
+        # same calibration the flow was about to run, so it adopts the flow
+        # rather than replacing it. Without this the button wins the race —
+        # the device takes seconds to open and nothing visible happens in
+        # the meantime, so pressing it is the natural thing to do — and the
+        # file comes back with its calibration marked and no recording
+        # phase, which is exactly what the flow exists to write.
+        self._mvc_flow_auto = auto_flow or self._mvc_flow_pending
+        self._mvc_flow_pending = False
+        # Three brief maximal efforts, and only those. The calibration used to
+        # ask for three held maxima as well, six repetitions in all, and the
+        # held ones earned their place: a maximum peaks at its start and then
+        # settles onto a plateau, a mean taken over the plateau is below the
+        # peak, and the task's brief efforts reach the peak — which is how a
+        # task came out at 135 % of its own "maximum". The answer to that was
+        # to measure the reference at the peak — over the strongest 0.2 s
+        # then, the envelope's highest point now — and once it is measured
+        # there the held effort adds nothing the squeeze does not
+        # already give: the same peak, four times the fatigue, and twice the
+        # calibration to sit through. Three attempts, because the first
+        # maximal effort of a session is genuinely submaximal and with one
+        # there is nothing to fall back on.
+        self._mvc_reps = self._profile.mvc_bursts
+        self._mvc_muscle = 0
+        self._mvc_rep = 0
+        self._mvc_capture = [[] for _ in range(MAX_CHANNELS)]
+        self._mvc_cross = [{} for _ in range(MAX_CHANNELS)]
+        self._mvc_no_maximas = []
+        self._mvc_raw_peak = [0.0] * MAX_CHANNELS   # for post-calibration autoscale
+        self._mvc_ref = [None] * MAX_CHANNELS
+        self._set_thresholds_enabled(False)
+        self._btn_calibrar.setEnabled(False)
+        self._btn_grabar.setEnabled(False)
+        self._update_fv_button()          # disabled while the MVC wizard runs
+        for bar in self._load_bars:
+            bar.reset()
+        self._log(
+            tr("Calibration started as the session's opening phase.")
+            if self._mvc_flow_auto
+            else tr("Calibration started on its own.")
+        )
+        self._reposition_mvc_overlay()
+        # No boxes yet: the warm-up asks for two or three easy contractions
+        # and counts none of them, and a row of empty boxes that never
+        # fills is a promise the phase does not keep. The map of the
+        # calibration appears with the first countdown, which is the first
+        # thing that fills one.
+        self._guia_mapa("")
+        self._mvc_enter_warmup()
+        self._mvc_timer.start()
+
+    def _set_thresholds_enabled(self, enabled: bool) -> None:
+        """Enable/disable the warning/danger spin-boxes (active only once an
+        MVC is calibrated)."""
+        self._spin_warning.setEnabled(enabled)
+        self._spin_danger.setEnabled(enabled)
+
+    @Slot()
+    def _on_thresholds_changed(self) -> None:
+        """Apply the warning/danger spin-boxes to the bars and the monitor.
+
+        Keeps ``warning < danger`` (nudging the danger value up if needed),
+        persists both to QSettings and refreshes the readout colours."""
+        self._spin_warning.blockSignals(True)
+        self._spin_danger.blockSignals(True)
+        w = self._spin_warning.value()
+        d = self._spin_danger.value()
+        if d <= w:
+            d = min(100, w + 1)
+            self._spin_danger.setValue(d)
+            if d <= w:                       # warning was at the top (99/100)
+                w = d - 1
+                self._spin_warning.setValue(w)
+        self._spin_warning.blockSignals(False)
+        self._spin_danger.blockSignals(False)
+
+        self._load_warning, self._load_danger = float(w), float(d)
+        self._settings.setValue("adquisicion/load_warning", self._load_warning)
+        self._settings.setValue("adquisicion/load_danger", self._load_danger)
+        for c in range(MAX_CHANNELS):
+            self._online[c].warning_limit = self._load_warning
+            self._online[c].danger_limit = self._load_danger
+            self._load_bars[c].set_zones(self._load_warning, self._load_danger)
+            self._load_bars[c].set_value(self._online[c].current,
+                                         active=bool(self._mvc_ref[c]))
+        self._update_load_readout()
+
+    def _process_load(self, env: list) -> None:
+        """Per-block hook from _on_data_ready: feed the MVC wizard during a
+        contraction window, otherwise update the live %MVC monitor."""
+        n_ch = min(len(env), self._n_channels)
+        for c in range(n_ch):
+            self._env_inst[c] = float(np.mean(env[c])) if len(env[c]) else 0.0
+        if self._mvc_active:
+            if self._mvc_phase == "contract":
+                self._mvc_feed(env)
+            elif self._mvc_phase == "ready":
+                # The countdown is rest by construction, so it costs nothing to
+                # measure what this muscle looks like when it is doing nothing.
+                # Without that there is no way to tell a maximal contraction
+                # from a distracted one: both are just a number of millivolts.
+                self._mvc_rest_feed(env)
+            return
+        if self._fv_active and self._fv_phase == "mvc_contract":
+            self._fv_mvc_feed(env)
+            return
+        # The rest of the force-velocity study — the cued lifts — falls
+        # through: the bars used to freeze for exactly the part of the
+        # session the subject was lifting, on screen and on the phones.
+        if all(r is None for r in self._mvc_ref[:n_ch]):
+            return
+        for c in range(n_ch):
+            ref = self._mvc_ref[c]
+            if not ref:
+                continue
+            pct = env[c] / ref * 100.0
+            self._online[c].add(pct)
+            # The bar tracks the instantaneous load (this block ~100 ms) so it
+            # follows the contraction force; the P10/P50/P90 readout below uses
+            # the running OnlineLoad statistics.
+            inst = float(np.mean(pct)) if pct.size else 0.0
+            self._carga_inst[c] = inst
+            self._load_bars[c].set_value(inst, active=True)
+
+    # -- Guided MVC-calibration wizard ---------------------------------------
+
+    def _mvc_label(self) -> str:
+        """Label of the muscle being calibrated (channel label, never a name)."""
+        labels = self._active_labels()
+        c = self._mvc_muscle
+        return labels[c] if c < len(labels) else tr("Muscle {n}").format(n=c + 1)
+
+    def _guia_mapa(self, fase: str) -> None:
+        """Set the phase, and with it the row of boxes that maps it.
+
+        One box per action the phase asks for, in the colour of the muscle
+        that leads it — ``_CHANNEL_COLORS``, the same colour that muscle
+        has in the traces and in its load bar, because a student who sees
+        blue in the plot and red in the wizard has been told two things.
+        The warm-up asks for nothing countable and gets no row.
+        """
+        self._guia_fase = fase
+        if fase == "cal":
+            colores = [_CHANNEL_COLORS[c]
+                       for c in range(self._n_channels)
+                       for _ in range(self._mvc_reps)]
+        elif fase == "maniobras":
+            colores = [_CHANNEL_COLORS[c]
+                       for c in range(min(2, self._n_channels))
+                       for _ in range(MANIOBRAS_POR_MUSCULO)]
+        elif fase == "coact":
+            colores = [COLOR_COACT] * COACT_REPS
+        else:
+            colores = []
+        self._mvc_overlay.set_steps(colores)
+
+    def _mvc_enter_warmup(self) -> None:
+        """A few easy contractions before the first maximal one.
+
+        The first maximal effort of a session is genuinely submaximal, and
+        best-of-three cannot rescue it: on one recording the three flexor
+        repetitions came out at 57 %, 68 % and 100 % of each other, still
+        rising at the third, so the best of them was still not a maximum.
+        Recorded and marked rather than waited out off the clock — the
+        acquisition never stops, and the file stays continuous.
+        """
+        self._mvc_phase = "warmup"
+        self._escenario.tone()
+        self._mvc_elapsed = 0.0
+        # Sin mapa hasta que haya algo que contar, y a cero por si esta es
+        # la segunda calibración de la sesión.
+        self._guia_fase = ""
+        self._mvc_overlay.set_steps([])
+        self._escenario.write_phase_marker(warmup_start_marker())
+        # Quiet from here until the wizard ends: a device that obeys is
+        # asked for nothing between efforts, so the trace shows rest while
+        # the subject is told to rest. Only the simulated board acts on it.
+        self._escenario.instruct_device(0, 0.0)
+
+    def _mvc_enter_ready(self) -> None:
+        self._mvc_phase = "ready"
+        self._escenario.tone()
+        self._mvc_elapsed = 0.0
+        self._mvc_cur_buf = []
+        self._mvc_cross_buf = {}
+        self._mvc_peak = 0.0
+
+    @Slot()
+    def _mvc_tick(self) -> None:
+        self._mvc_elapsed += MVC_TICK_MS / 1000.0
+        label = self._mvc_label()
+        if self._mvc_reps > 1:
+            rep = tr(" (rep {i}/{n})").format(i=self._mvc_rep + 1, n=self._mvc_reps)
+        else:
+            rep = ""
+        if self._mvc_phase == "warmup":
+            total = self._profile.warmup_s
+            cuenta = max(1, int(np.ceil(total - self._mvc_elapsed)))
+            titulo = tr("Warm up first")
+            # One line while something is being done; the why of it — that
+            # the first maximal effort of a session is never the strongest —
+            # is in the tour, the guide and the manual, where there is time.
+            # One muscle or two, said as it is (Ángel, 25 Oct 2026: «of each
+            # muscle» with one muscle on the board).
+            detalle = (tr("Two or three easy contractions.") if self._n_channels == 1
+                       else tr("Two or three easy contractions of each muscle."))
+            # The picture of what is coming, where there is most time to
+            # look at it: ten seconds with nothing to do but warm up.
+            self._mvc_overlay.show_ready(
+                titulo, cuenta, detalle, imagen("sacudida"),
+                waiting=min(1.0, self._mvc_elapsed / max(total, 1e-9)))
+            self._escenario.info(tr("Warming up: {n}").format(n=cuenta))
+            self._aula.calib(True, "warmup", titulo, detalle, count=cuenta)
+            if self._mvc_elapsed >= total:
+                self._mvc_enter_ready()
+            return
+
+        if self._mvc_phase == "ready":
+            total_cuenta = (MVC_READY_PRIMERA_S if self._mvc_rep == 0
+                            else MVC_READY_S)
+            if self._mvc_elapsed <= MVC_TICK_MS / 1000.0:
+                self._mvc_rest_buf = []      # one baseline per repetition
+            count = max(1, int(np.ceil(total_cuenta - self._mvc_elapsed)))
+            detalle = self._mvc_gesto(self._mvc_muscle)
+            self._mvc_overlay.show_ready(
+                tr("Get ready — {label}{rep}").format(label=label, rep=rep),
+                count,
+                detalle,
+                # The same seconds as a bar, which is read without counting.
+                # Blue, because in this panel blue is time running and green
+                # is the effort itself: two bars of one colour would be one
+                # more thing to work out while about to move.
+                # Only the first time each muscle is asked. The calibration
+                # is the one counter-intuitive gesture of the practical — a
+                # brief intense contraction, not a push you lean into — and a
+                # picture pays for itself once; by the second repetition it
+                # is a panel taller than it needs to be over the traces.
+                imagen("sacudida") if self._mvc_rep == 0 else None,
+                waiting=min(1.0, self._mvc_elapsed / total_cuenta),
+            )
+            self._escenario.info(
+                tr("Get ready — {label}{rep}: {n}").format(label=label, rep=rep, n=count)
+            )
+            self._aula.calib(
+                True, "ready",
+                tr("Get ready — {label}{rep}").format(label=label, rep=rep),
+                detalle, count=count,
+            )
+            if self._mvc_elapsed >= total_cuenta:
+                self._mvc_phase = "contract"
+                self._escenario.tone()
+                self._mvc_elapsed = 0.0
+                self._mvc_cur_buf = []
+                self._mvc_cross_buf = {}
+                self._mvc_peak = 0.0
+                self._mvc_cur = 0.0
+                # The span opens here and closes in _mvc_finish_rep. Between
+                # the two is the effort itself, which is what the analysis has
+                # to be able to recompute the reference from.
+                self._escenario.write_phase_marker(
+                    cal_start_marker(self._mvc_muscle, self._mvc_rep + 1)
+                )
+                # And the same thing said to the device: a board ignores
+                # it, the simulated one gives the maximum being asked for,
+                # so a rehearsal without hardware calibrates against a
+                # real one instead of against its own cycle.
+                self._escenario.ask_subject({self._mvc_muscle: 1.0})
+        elif self._mvc_phase == "contract":
+            # A second and a half: long enough to reach the peak, too short
+            # to settle onto the plateau that used to drag the reference down.
+            dur = self._profile.mvc_burst_s
+            secs_left = max(0.0, dur - self._mvc_elapsed)
+            progress = min(1.0, self._mvc_elapsed / dur)
+            effort = (self._mvc_cur / self._mvc_peak) if self._mvc_peak > 0 else 0.0
+            titulo = tr(
+                "Maximum, brief and intense — {label}{rep}"
+            ).format(label=label, rep=rep)
+            self._mvc_overlay.show_contract(titulo, secs_left, progress, effort)
+            self._escenario.info(
+                tr(
+                    "{label}: one intense contraction at maximal power!  ({s:.0f} s)  "
+                    "peak {pk:.2f} mV"
+                ).format(label=label, s=secs_left, pk=self._mvc_peak)
+            )
+            self._aula.calib(
+                True, "contract", titulo,
+                secs=secs_left, progress=progress, effort=effort,
+            )
+            if self._mvc_elapsed >= dur:
+                self._mvc_finish_rep()
+        elif self._mvc_phase == "rest":
+            sub = (
+                tr("Get ready for the next repetition")
+                if self._mvc_rep > 0
+                else tr("Next muscle: {label}").format(label=label)
+            )
+            self._mvc_overlay.show_relax(sub)
+            self._escenario.info(tr("Relax…"))
+            self._aula.calib(True, "rest", tr("Relax"), sub)
+            if self._mvc_elapsed >= MVC_REST_S:
+                self._mvc_enter_ready()
+
+    def _mvc_rest_feed(self, env: list) -> None:
+        """Accumulate the active muscle's envelope while it is at rest."""
+        c = self._mvc_muscle
+        if c < len(env) and env[c].size:
+            self._mvc_rest_buf.extend(env[c].tolist())
+
+    def _mvc_check_is_a_maximum(self, c: int, ref: float) -> None:
+        """Say so when the calibration did not capture a maximal contraction.
+
+        A reference only a little above the muscle's own resting level is not a
+        maximum, and it is not a harmless one: every later % MVC is wrong by
+        the same factor, the live load bars sit in the red from the first
+        contraction, and the analysis reports several hundred per cent. The
+        wizard cannot know whether the subject pushed, but it can compare what
+        it captured against what the same muscle looked like doing nothing a
+        few seconds earlier.
+        """
+        rest = np.asarray(self._mvc_rest_buf, dtype=float)
+        if not rest.size or ref <= 0:
+            return
+        nivel = float(np.percentile(rest, 95))
+        ratio = ref / nivel if nivel > 0 else float("inf")
+        if ratio >= self._profile.mvc_min_rest_ratio:
+            return
+        labels = self._active_labels()
+        name = labels[c] if c < len(labels) else str(c + 1)
+        self._mvc_no_maximas.append(name)
+        self._log(tr(
+            "⚠ «{muscle}»: the calibration reached {ref:.3f} mV, only {ratio:.1f}× "
+            "its resting level. That is not a maximal contraction — every % MVC "
+            "from now on will be too high by that factor. Calibrate again."
+        ).format(muscle=name, ref=ref, ratio=ratio))
+
+    def _mvc_feed(self, env: list) -> None:
+        """Accumulate the active muscle's envelope during its contraction.
+
+        And the other channels' at the same time: what they read while this
+        muscle is at its maximum is the only measurement the session makes of
+        whether the montage is separating two muscles at all.
+        """
+        c = self._mvc_muscle
+        if c < len(env) and env[c].size:
+            self._mvc_cur_buf.extend(env[c].tolist())
+            self._mvc_cur = float(np.mean(env[c]))
+            self._mvc_peak = max(self._mvc_peak, float(np.max(env[c])))
+        for k in range(min(len(env), self._n_channels)):
+            if k != c and env[k].size:
+                self._mvc_cross_buf.setdefault(k, []).extend(env[k].tolist())
+
+    def _mvc_finish_rep(self) -> None:
+        # Closed before anything else: a span with no end is dropped when the
+        # file is read back, which is exactly right for a recording stopped
+        # mid-effort but would be wrong for one that finished.
+        self._escenario.write_phase_marker(
+            cal_end_marker(self._mvc_muscle, self._mvc_rep + 1)
+        )
+        # One box of the map per repetition closed, and never before: the
+        # wizard sets the rhythm here, so it knows. **The map itself arrives
+        # with the first of them**, not with the countdown before it: the
+        # countdown fills no box, and a row of empty boxes under a panel
+        # that will not fill them is a promise that panel does not keep —
+        # the more so here, where the countdown already carries the picture
+        # of the gesture and the box after it is the one that visibly fills.
+        if self._guia_fase != "cal":
+            self._guia_mapa("cal")
+        self._mvc_overlay.mark_step(
+            self._mvc_muscle * self._mvc_reps + self._mvc_rep)
+        # Rest, not «do as you like»: between one effort and the next come
+        # the countdowns and the change of muscle, and a device left to
+        # itself fires during them.
+        self._escenario.ask_subject({})
+        self._mvc_capture[self._mvc_muscle].append(
+            np.asarray(self._mvc_cur_buf, dtype=float)
+        )
+        for k, muestras in self._mvc_cross_buf.items():
+            self._mvc_cross[self._mvc_muscle].setdefault(k, []).append(
+                np.asarray(muestras, dtype=float)
+            )
+        self._mvc_rep += 1
+        if self._mvc_rep < self._mvc_reps:
+            self._mvc_phase = "rest"          # rest, then repeat this muscle
+            self._escenario.tone()
+            self._mvc_elapsed = 0.0
+            return
+        self._mvc_compute_muscle(self._mvc_muscle)
+        self._mvc_rep = 0
+        if self._mvc_muscle + 1 < self._n_channels:
+            self._mvc_muscle += 1             # rest, then next muscle
+            self._mvc_phase = "rest"
+            self._escenario.tone()
+            self._mvc_elapsed = 0.0
+        else:
+            self._mvc_finish_all()
+
+    def _mvc_gesto(self, c: int) -> str:
+        """What the effort is, said while the count runs — in one line.
+
+        A brief, intense maximal contraction, not a sustained push against
+        something fixed: a reference is only a yardstick if it recruits the
+        muscle mass the task recruits, and a surface electrode sees the
+        compartment beneath it rather than one muscle. The rule is the same
+        for any pair and is said first; the gesture that illustrates it is
+        the pair's (:mod:`emgteach.pairs`), and with a pair the application
+        knows nothing about the rule stands on its own, which is the whole
+        point of stating it first.
+
+        **One line, and the gesture when there is one.** This is read in
+        the three seconds before a maximal effort, where a sentence that
+        wraps is read by nobody. The rule used to be said here too, ahead
+        of the gesture, and the two together were two lines.
+
+        The rule is not lost by leaving: the pictogram beside this line
+        says it without words — a sharp peak ticked against a plateau
+        crossed — and the effort itself, a second and a half later, is
+        titled with it (:meth:`MvcOverlay._hint_contract`). What is left
+        here is what this particular countdown is for: which movement.
+        And a pair the application knows nothing about has no gesture to
+        name, so it gets the rule, which is the one thing true of any
+        pair — the instruction never assumes a forearm.
+        """
+        regla = tr("A brief, intense contraction — not a sustained push.")
+        # A guided session names its gesture, and the calibration that opens
+        # it says the same words: the reference is measured with the movement
+        # the experiment asks for next.
+        script = getattr(self, "_session_script", None)
+        if self._mode == MODE_SINGLE and script is not None and script.gesture:
+            return tr(script.gesture)
+        if self._mode != MODE_PAIR or c not in (0, 1):
+            return regla
+        return pair_calibration_cue(self._par, c) or regla
+
+    def _ventana_cvm_s(self) -> float:
+        """The window the maximum is measured with: the guided session's own
+        when it has one (the gradation's half second, sessions.
+        GRAD_MVC_WINDOW_S), else the profile's peak."""
+        script = getattr(self, "_session_script", None)
+        if self._mode == MODE_SINGLE and script is not None and script.mvc_window_s:
+            return float(script.mvc_window_s)
+        return float(self._profile.mvc_peak_window_s)
+
+    def _mvc_compute_muscle(self, c: int) -> None:
+        window = max(1, round(self._ventana_cvm_s() * FS))
+        ref = mvc_from_reps(
+            self._mvc_capture[c], self._profile.mvc_percentile,
+            window_samples=window,
+        )
+        self._mvc_ref[c] = ref if ref > 0 else None
+        self._mvc_check_is_a_maximum(c, ref)
+        self._online[c].reset()
+        self._load_bars[c].set_value(0.0, active=bool(self._mvc_ref[c]))
+        self._write_mvc_ref_marker(c)
+
+    def _flow_needs_calibration(self) -> bool:
+        """Whether pressing record has to run the calibration first.
+
+        A practical that compares two muscles has nothing to compare without
+        both references, so the record button runs the whole session rather
+        than leaving the calibration to be remembered. Every recording is a
+        session of its own: the references are cleared when it starts, so
+        the file it writes carries its own calibration and nothing that was
+        measured with the electrodes as they were placed for another one.
+        """
+        quiere = mode_requires_calibration(self._mode) or bool(
+            self._session_script is not None and self._session_script.needs_mvc)
+        return quiere and not any(self._mvc_ref[: self._n_channels])
+
+    def _mvc_enter_prep(self) -> None:
+        """Between the two phases: a countdown, recorded but not analysed.
+
+        The acquisition is deliberately not stopped here. Stopping would force
+        the file to represent a gap — which EDF+ handles badly — or two
+        files to be written and then merged. A few seconds of signal nobody
+        looks at costs some kilobytes and saves all of that.
+        """
+        if not (self._worker and self._worker.isRunning()):
+            self._log(tr(
+                "The recording ended before the preparation phase could "
+                "start, so this file has no recording phase marked."
+            ))
+            self._mvc_overlay.hide_overlay()
+            self._aula.calib(False)
+            return
+        self._worker.add_marker(prep_start_marker())
+        self._escenario.tone()
+        self._prep_elapsed = 0.0
+        self._prep_timer.start()
+
+    @Slot()
+    def _prep_tick(self) -> None:
+        total = self._profile.prep_countdown_s
+        self._prep_elapsed += MVC_TICK_MS / 1000.0
+        cuenta = max(1, int(np.ceil(total - self._prep_elapsed)))
+        titulo = tr("Get ready to record")
+        detalle = self._prep_aviso or tr(
+            "The recording starts when the count reaches 0. "
+            "The calibration is already saved."
+        )
+        self._mvc_overlay.show_ready(
+            titulo, cuenta, detalle,
+            waiting=min(1.0, self._prep_elapsed / max(total, 1e-9)))
+        self._escenario.info(tr("Get ready to record: {n}").format(n=cuenta))
+        self._aula.calib(True, "prep", titulo, detalle, count=cuenta)
+        if self._prep_elapsed < total:
+            return
+
+        self._prep_timer.stop()
+        assert self._worker is not None     # the countdown runs while recording
+        self._worker.add_marker(rec_start_marker())
+        # The recording phase starts from rest — the countdown was rest by
+        # construction. The onset detector measures its threshold again
+        # here (the stream's first second was the warm-up), and the live
+        # P10/P50/P90 start counting here instead of carrying the
+        # countdown's five seconds of rest into the task's distribution.
+        rearm = getattr(self._worker, "rearm_onsets", None)
+        if rearm is not None:
+            rearm()
+        for c in range(MAX_CHANNELS):
+            self._online[c].reset()
+        self._update_load_readout()
+        self._mvc_overlay.hide_overlay()
+        self._aula.calib(False)
+        self._escenario.info(tr("Recording — the calibration is behind you."))
+        # And the session goes on. Until now the wizard stopped here and
+        # left the student alone in the part that produces the data.
+        if self._mode == MODE_PAIR and not self._fv_flow_pending:
+            self._guia_maniobras(0)
+            return
+        self._log(tr(
+            "Recording phase started. Everything before this point — the "
+            "calibration and this pause — stays out of the analysis."
+        ))
+        if self._session_flow_pending:
+            self._lanzar_sesion()
+            return
+        if self._fv_flow_pending:
+            self._lanzar_estudio_fv()
+
+    # -- the guided sessions of the one-muscle practical ------------------------
+
+    def _rellenar_sesiones(self) -> None:
+        """Offer the guided sessions, in the one-muscle practical only.
+
+        Rebuilt with the practical: changing practical is changing sequence,
+        and a session chosen for another one must not ride along. Always back
+        to «Free recording», as ecgteach does when its tab opens — a session
+        left over from the last test is the state its bench tripped on.
+        """
+        combo = self._combo_sesion
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(tr("Free recording"), None)
+        for clave, construir in GUIDED_SESSIONS.items():
+            script = construir()
+            combo.addItem(tr(script.title), clave)
+            if script.summary:
+                combo.setItemData(combo.count() - 1,
+                                  tr(script.summary).format(**dict(script.fmt)),
+                                  Qt.ItemDataRole.ToolTipRole)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        combo.setVisible(self._mode == MODE_SINGLE and bool(GUIDED_SESSIONS))
+
+    def _sesion_elegida(self) -> SessionScript | None:
+        """The script of the guided session chosen, or ``None`` for a free one."""
+        clave = self._combo_sesion.currentData()
+        if self._mode != MODE_SINGLE or clave not in GUIDED_SESSIONS:
+            return None
+        return GUIDED_SESSIONS[clave]()
+
+    @Slot(bool)
+    def _on_tono_cambiado(self, activo: bool) -> None:
+        """Remember the box, and sound the tone on the way on.
+
+        Ticking a box that promises a sound should make the sound: otherwise
+        the only way to learn whether this machine can be heard — the right
+        output, the volume up, not muted in the mixer — is to start a session
+        and hope (ecgteach, same box).
+        """
+        self._settings.setValue(SESSION_TONE_KEY, bool(activo))
+        if activo:
+            cue.beep()
+
+    @Slot(str, float)
+    def _on_tono(self, kind: str, seconds: float) -> None:
+        """A tone that did not sound leaves a line in the event log.
+
+        The executable has no console: without this, a silent phase change
+        left no trace of why (ecgteach, annex of 6 Oct 2026).
+        """
+        texto = {
+            "failed": tr("The phase tone could not sound (no audio device?)."),
+            "dropped": tr("A phase tone was dropped: the previous one was "
+                          "still sounding."),
+            "stuck": tr("The audio device is not answering; the next tone "
+                        "sounds on its own."),
+        }.get(kind)
+        if texto:
+            self._log(texto)
+
+    def _lanzar_sesion(self) -> None:
+        """The recording phase has begun: the guided session takes over."""
+        self._session_flow_pending = False
+        script = self._session_script
+        if script is None or not (self._worker and self._worker.isRunning()):
+            return
+        runner = SessionRunner(script, self)
+        runner.marker.connect(self._escenario.write_phase_marker)
+        runner.phase_started.connect(self._sesion_fase)
+        runner.tick.connect(self._sesion_tick)
+        runner.finished.connect(self._sesion_fin)
+        self._session_runner = runner
+        self._session_motivo = ""
+        # One box per measured effort, filled as each is done: the count of
+        # what has been done, which the seconds left do not say.
+        self._sesion_hechas = 0
+        self._sesion_en_esfuerzo = False
+        self._mvc_overlay.set_steps(
+            [_CHANNEL_COLORS[0]] * sum(1 for f in script.phases
+                                       if f.kind == EFFORT and f.opens))
+        self._sesion_reposo = []
+        self._sesion_reposo_mv = None
+        self._sesion_esfuerzo_env = []
+        self._senal_revisada = False
+        self._aviso_senal = None
+        cue.set_tone_report(self._tono_informado.emit)
+        self._btn_cancelar_guia.setVisible(True)
+        self._log(tr("Guided session started: {title}. Esc stops it.").format(
+            title=tr(script.title)))
+        runner.start()
+
+    @Slot(object, int)
+    def _sesion_fase(self, fase: SessionPhase, _index: int) -> None:
+        """A phase begins: announce it, and tell the simulated subject."""
+        if self._sesion_en_esfuerzo:
+            self._mvc_overlay.mark_step(self._sesion_hechas)
+            self._sesion_hechas += 1
+        self._sesion_en_esfuerzo = fase.kind == EFFORT and bool(fase.opens)
+        self._revisar_reposo()
+        # «I can't go on»: the button, and the space bar, while it may be pressed.
+        self._btn_no_puedo.setVisible(fase.early_stop)
+        if fase.kind == EFFORT and fase.level:
+            self._escenario.ask_subject({0: float(fase.level)}, repeat_s=fase.repeat_s)
+            self._sesion_pico = 0.0
+        else:
+            # Rest is an instruction too: «do nothing», not the board's cycle.
+            self._escenario.ask_subject({})
+        self._escenario.info(tr(fase.title).format(**dict(fase.fmt)))
+        if fase.cue:
+            self._escenario.tone()
+
+    def _revisar_reposo(self) -> None:
+        """The rest the session measured is over: was it a rest?
+
+        Above guided.REST_WARN_MV the electrodes' contact is poor (the bench's
+        biceps rested at 0.028 mV). Said on the panel's line and in the event
+        log; nothing stops — the spectrum is still worth reading.
+        """
+        muestras, self._sesion_reposo = getattr(self, "_sesion_reposo", []), []
+        if not muestras:
+            return
+        nivel = float(np.median(muestras))
+        self._sesion_reposo_mv = nivel
+        if nivel > REST_WARN_MV:
+            aviso = tr("High rest ({mv:.3f} mV): check the electrodes' contact.").format(
+                mv=nivel)
+            self._escenario.info(aviso)
+            self._log("⚠ " + aviso)
+
+    def _revisar_senal(self, transcurrido: float) -> None:
+        """Does the held load rise above the rest the session measured?
+
+        The envelope from the effort's second 2 to 5 (picking the weight up
+        is before) against that rest; below guided.LOAD_MIN_RATIO the signal
+        is too weak to read fatigue in: a poor contact, or a weight too light.
+        Said once, on the panel for the rest of the effort and in the log.
+        """
+        if self._senal_revisada or transcurrido < LOAD_RATIO_FROM_S:
+            return
+        if transcurrido < LOAD_RATIO_AT_S:
+            self._sesion_esfuerzo_env.append(self._env_inst[0])
+            return
+        self._senal_revisada = True
+        aviso = weak_signal_warning(
+            effort_ratio(self._sesion_esfuerzo_env, self._sesion_reposo_mv))
+        if aviso:
+            self._aviso_senal = aviso
+            self._log("⚠ " + aviso)
+
+    def _no_puedo_mas(self) -> None:
+        """The student cannot go on: the held effort ends now."""
+        if self._session_runner is not None and self._session_runner.end_early():
+            self._log(tr("Effort ended early: the student could not go on."))
+
+    @Slot(object, float, float)
+    def _sesion_tick(self, fase: SessionPhase, restante: float, hecho: float) -> None:
+        """Every tick: the panel over the plots and the phones, in step."""
+        campos = dict(fase.fmt)
+        titulo = tr(fase.title).format(**campos)
+        texto = tr(fase.text).format(**campos) if fase.text else ""
+        cuenta = max(1, math.ceil(restante))
+        if self._mvc_ref[0]:
+            carga = self._carga_inst[0] / 100.0
+        else:
+            # No calibration: the effort against the peak of this same
+            # contraction, which is what falls as a held maximum tires.
+            self._sesion_pico = max(self._sesion_pico, self._env_inst[0])
+            carga = self._env_inst[0] / self._sesion_pico if self._sesion_pico > 0 else 0.0
+        if fase.check_rest:
+            self._sesion_reposo.append(self._env_inst[0])
+        if fase.kind == READY:
+            self._mvc_overlay.show_ready(titulo, cuenta, texto, waiting=hecho)
+            self._aula.calib(True, "ready", titulo, texto, count=cuenta)
+        elif fase.kind == EFFORT and not fase.bar:
+            # A fixed load: nothing on a bar to follow, only the time.
+            self._revisar_senal(fase.seconds - restante)
+            if self._aviso_senal:
+                texto = f"{texto}\n⚠ {self._aviso_senal}" if texto else f"⚠ {self._aviso_senal}"
+            self._mvc_overlay.show_phase(f"{titulo} · {cuenta} s", texto, running=hecho)
+            self._aula.calib(True, "contract", titulo, texto, secs=restante,
+                              progress=hecho)
+        elif fase.kind == EFFORT and fase.target_pct is not None:
+            lo, hi = fase.target_pct
+            if fase.ramp_s > 0:
+                # The band rises from zero over its ramp: a target to follow
+                # up slowly, not a mark to jump to (sessions.GRAD_RAMP_S).
+                subida = min(1.0, max(0.0, (fase.seconds - restante) / fase.ramp_s))
+                lo, hi = lo * subida, hi * subida
+            self._mvc_overlay.show_phase(
+                f"{titulo} · {cuenta} s", texto, running=hecho,
+                loads=[(carga, _CHANNEL_COLORS[0])],
+                zone=(lo / 100.0, hi / 100.0))
+            self._aula.calib(True, "contract", titulo, texto, secs=restante,
+                              progress=hecho, effort=min(1.0, carga))
+        elif fase.kind == EFFORT:
+            self._mvc_overlay.show_contract(titulo, cuenta, hecho, carga,
+                                            subtitle=texto)
+            self._aula.calib(True, "contract", titulo, texto, secs=restante,
+                              progress=hecho, effort=min(1.0, carga))
+        else:
+            self._mvc_overlay.show_relax(texto)
+            self._aula.calib(True, "rest", titulo, texto)
+        self._reposition_mvc_overlay()
+
+    @Slot(bool)
+    def _sesion_fin(self, completa: bool) -> None:
+        """The session is over: completed, stopped with Esc, or with the recording."""
+        runner, self._session_runner = self._session_runner, None
+        if runner is not None:
+            runner.deleteLater()
+        cue.set_tone_report(None)
+        self._btn_cancelar_guia.setVisible(False)
+        self._btn_no_puedo.setVisible(False)
+        self._escenario.release_subject()
+        titulo = tr(self._session_script.title) if self._session_script else ""
+        if completa:
+            self._escenario.tone(final=True)
+            if self._sesion_en_esfuerzo:
+                self._mvc_overlay.mark_step(self._sesion_hechas)
+            hecho = tr("{title}: done").format(title=titulo)
+            detalle = tr("The recording stops on its own. In Analysis the "
+                         "phases are marked in the file.")
+            self._mvc_overlay.show_done(hecho, detalle)
+            self._reposition_mvc_overlay()
+            self._aula.calib(True, "done", hecho, detalle)
+            self._log(tr("Guided session finished: {title}.").format(title=titulo))
+            QTimer.singleShot(5000, self._sesion_cerrar_panel)
+            self._parar_al_terminar_sesion()
+            return
+        if not self._conservar_panel:
+            self._mvc_overlay.set_steps([])
+            self._mvc_overlay.hide_overlay()
+            self._aula.calib(False)
+        self._escenario.info("")
+        if self._session_motivo == "esc":
+            self._log(tr("Guided session stopped; the recording goes on."))
+        else:
+            self._log(tr("Guided session stopped with the recording."))
+
+    def _sesion_cerrar_panel(self) -> None:
+        """The finished session's panel goes once it has been seen."""
+        if self._session_runner is None and not self._mvc_active and not self._fv_active:
+            self._mvc_overlay.set_steps([])
+            self._mvc_overlay.hide_overlay()
+
+    def _etiqueta_tramo(self, tramo: MeasuredSpan) -> str:
+        """The label of a stretch a session marked, for the review."""
+        pct = tramo.number("pct")
+        if pct:
+            return f"{pct:g} %"
+        numero = tramo.number("k") or tramo.number("n")
+        return f"{numero:g}" if numero else ""
+
+    # -- the task, guided: the free manoeuvres and the one that joins them --
+
+    def _guia_maniobras(self, grupo: int) -> None:
+        self._escenario.tone()
+        """Ask for one muscle's share of the free manoeuvres.
+
+        The application names the **muscle**, never the manoeuvre: the guide
+        does that, per pair, which is where a name can be checked against a
+        gesture (:func:`emgteach.coactivation.propose_labels` says the same
+        thing about the windows it labels).
+        """
+        if grupo == 0:
+            self._guia_mapa("maniobras")
+            self._man_hechas = [0, 0]
+        self._man_grupo = grupo
+        self._man_quieto_n = 0
+        # Nothing counted yet, and **a second of rest before anything is
+        # asked of this muscle**. The rest was put here because the count
+        # was an `OnsetDetector` measuring its threshold from the first
+        # second it saw, and a phase that opened with a contraction set a
+        # threshold nothing afterwards crossed — the first muscle counted
+        # none of its six that way. The count is a share of the muscle's
+        # own maximum now and needs no baseline, but the quiet second
+        # stays: the guide asks for a couple of seconds between manoeuvres
+        # and the analysis reads the rest between them.
+        self._rearmar_conteo_guiado()
+        self._escenario.ask_subject({})
+        QTimer.singleShot(
+            int(1000 * (self._profile.onset_baseline_s + 0.5)),
+            lambda g=grupo: self._maniobras_en_marcha(g))
+        self._btn_paso_hecho.setVisible(True)
+        self._btn_cancelar_guia.setVisible(True)
+        self._reposition_mvc_overlay()
+        self._pinta_maniobras()
+
+    def _maniobras_en_marcha(self, grupo: int) -> None:
+        """The resting second is over: ask for the contractions.
+
+        Only the simulated board acts on this — its subject repeats a
+        twelve-second cycle of its own, so while the screen asked for six
+        contractions of one muscle a rehearsal showed one of each every
+        twelve seconds. Repeated and not held, because these are six
+        separate contractions, which is what the boxes count.
+        """
+        if self._guia_fase != "maniobras" or self._man_grupo != grupo:
+            return
+        self._escenario.ask_subject({grupo: 0.5}, repeat_s=MANIOBRA_CADA_S)
+
+    def _pinta_maniobras(self) -> None:
+        etiquetas = self._active_labels()
+        c = min(self._man_grupo, len(etiquetas) - 1)
+        titulo = tr("{n} contractions of {label}").format(
+            n=MANIOBRAS_POR_MUSCULO, label=etiquetas[c])
+        self._mvc_overlay.show_phase(
+            titulo,
+            tr("At your own pace; it moves on at {n}, or with «{button}».")
+            .format(n=MANIOBRAS_POR_MUSCULO, button=tr("Done — next")))
+        self._reposition_mvc_overlay()
+        self._escenario.info(titulo)
+        self._aula.calib(True, "task", titulo, "")
+
+    def _rearmar_conteo_guiado(self) -> None:
+        """Start a muscle's turn with nothing counted and nothing in hand."""
+        self._man_alto_n = [0] * MAX_CHANNELS
+        self._man_bajo_n = [0] * MAX_CHANNELS
+        self._man_quieto_n = 0
+        self._man_sin_novedad_n = 0
+
+    def _guia_detecta(self, env: list) -> None:
+        """Count the free manoeuvres, and only count them.
+
+        One box per **excursion held above the floor**: the muscle over
+        ``MANIOBRA_MINIMO_PCT`` of its own maximum for ``MANIOBRA_MINIMA_S``,
+        counted the instant it has been there long enough — so the box
+        fills while the contraction is being made and not after it — and
+        not again until the envelope has come back down: under seven tenths
+        of the floor, or under the floor for ``MANIOBRA_SALIDA_S``, which is
+        what ends it for somebody whose rest sits above 7 %. Only the muscle
+        whose turn it is is looked at, so what the other one reads through
+        crosstalk counts nothing here.
+
+        **Nothing in this method ends the phase**: that is
+        :meth:`_guia_reposo`. An extra one past the last box is dropped
+        rather than complained about; if boxes are left empty and the
+        signal says otherwise, the count that counts is the one the
+        analysis makes afterwards.
+        """
+        if self._guia_fase != "maniobras":
+            return
+        c = self._man_grupo
+        if c >= len(env) or not len(env[c]):
+            return
+        ref = self._mvc_ref[c]
+        if not ref:
+            return            # sin referencia no hay porcentaje de nada
+        pct = np.asarray(env[c], dtype=float) / float(ref) * 100.0
+        minimo = max(1, round(MANIOBRA_MINIMA_S * FS))
+        salida = max(1, round(MANIOBRA_SALIDA_S * FS))
+        marcadas = 0
+        self._man_sin_novedad_n += pct.size
+        for v in pct:
+            if v >= MANIOBRA_MINIMO_PCT:
+                self._man_bajo_n[c] = 0
+                self._man_alto_n[c] += 1
+                if self._man_alto_n[c] == minimo:     # una vez por excursión
+                    self._man_sin_novedad_n = 0
+                    if self._man_hechas[c] < MANIOBRAS_POR_MUSCULO:
+                        self._mvc_overlay.mark_step(
+                            c * MANIOBRAS_POR_MUSCULO + self._man_hechas[c])
+                        self._man_hechas[c] += 1
+                        marcadas += 1
+            else:
+                self._man_bajo_n[c] += 1
+                if (v < MANIOBRA_MINIMO_PCT * 0.7
+                        or self._man_bajo_n[c] >= salida):
+                    self._man_alto_n[c] = 0          # se acabó el esfuerzo
+        if marcadas:
+            self._mvc_overlay.update()
+        self._guia_reposo(c, pct)
+
+    def _guia_reposo(self, c: int, pct) -> None:
+        """Move on once the group is complete and the muscle is back at rest.
+
+        **The phase ends when the contractions it asked for are done, or
+        when the student says so; what it may never do is fail to end.**
+        For a day the button was the only way out, which broke the flow of
+        a session whose other two studies run straight through — and the
+        requirement that put it there was written more strongly than what
+        it was protecting, which was only that nobody be stranded by a
+        missed onset.
+
+        Advancing on the last contraction would cut its own tail off, so
+        the rule is **the map full — or nothing new counted for
+        ``MANIOBRA_SIN_NOVEDAD_S`` — and then a second under
+        ``MANIOBRA_REPOSO_PCT`` of the maximum**. The two halves do
+        different jobs: the full map is the phase ending because it has
+        what it asked for, and the timeout is what makes «this phase can
+        never fail to end» true rather than merely possible, for the day a
+        contraction is never counted. The rest second is also the quiet the
+        guide asks for between manoeuvres, and it costs a lone false
+        positive its effect. One that gets through costs no data — the
+        recording is continuous and the count that counts is the
+        analysis's — it only moves a phase annotation.
+        """
+        if self._man_sin_novedad_n >= MANIOBRA_SIN_NOVEDAD_S * FS:
+            # El límite, y **sin pedir reposo**: un límite atado al reposo no
+            # es un límite. Si el reposo no llega —que es exactamente el
+            # fallo que todo esto arregla—, los dos caminos se quedarían
+            # colgados del mismo clavo. Nada se corta por medio: doce
+            # segundos sin contar nada quiere decir que no ha habido ningún
+            # esfuerzo sostenido, porque uno de 0,3 s ya se habría contado.
+            self._man_quieto_n = 0
+            self._paso_siguiente()
+            return
+        if self._man_hechas[c] < MANIOBRAS_POR_MUSCULO:
+            self._man_quieto_n = 0
+            return
+        if not pct.size:
+            return
+        if float(np.max(pct)) >= MANIOBRA_REPOSO_PCT:
+            self._man_quieto_n = 0
+            return
+        self._man_quieto_n += int(pct.size)
+        if self._man_quieto_n >= MANIOBRA_REPOSO_S * FS:
+            self._man_quieto_n = 0
+            self._paso_siguiente()
+
+    @Slot()
+    def _paso_siguiente(self) -> None:
+        """On to the next part: the six are counted, or the student says so.
+
+        The one phase the application must not **time**: the manoeuvres are
+        free — a wrist pushing against something brings the antagonist in
+        to stabilise it, and the reciprocal pattern is what the practical
+        is for — so nothing here counts seconds, and the six are whatever
+        the muscle does at its own pace. Ending itself once it has what it
+        asked for is a different thing, and :meth:`_guia_reposo` does it.
+        This is the way out that has to exist either way.
+        """
+        if self._session_runner is not None:
+            self._no_puedo_mas()
+            return
+        if self._guia_fase != "maniobras":
+            return
+        if self._man_grupo + 1 < min(2, self._n_channels):
+            self._guia_maniobras(self._man_grupo + 1)
+            return
+        self._guia_coactivacion()
+
+    def _guia_coactivacion(self) -> None:
+        """The manoeuvre that works both muscles at once, and is timed.
+
+        The map waits for the hold: the countdown before it fills nothing,
+        and a box under a countdown is a promise that countdown does not
+        keep.
+        """
+        self._guia_fase = "coact"
+        self._mvc_overlay.set_steps([])
+        self._btn_paso_hecho.setVisible(False)
+        self._coact_rep = 0
+        self._coact_fase = "ready"
+        self._escenario.tone()
+        self._coact_elapsed = 0.0
+        self._coact_timer.start()
+        self._coact_tick()
+
+    @Slot()
+    def _coact_tick(self) -> None:
+        self._coact_elapsed += MVC_TICK_MS / 1000.0
+        recolocar = True
+        titulo = tr("Both muscles at once")
+        pista = (pair_coactivation_cue(self._par) if self._mode == MODE_PAIR
+                 else tr("Work both muscles at once and hold"))
+        if self._coact_fase == "ready":
+            cuenta = max(1, int(np.ceil(MVC_READY_S - self._coact_elapsed)))
+            self._mvc_overlay.show_ready(
+                titulo, cuenta, pista,
+                waiting=min(1.0, self._coact_elapsed / MVC_READY_S))
+            self._aula.calib(True, "ready", titulo, pista, count=cuenta)
+            if self._coact_elapsed >= MVC_READY_S:
+                if self._coact_rep == 0:
+                    self._guia_mapa("coact")   # the hold is what fills it
+                self._coact_fase = "hold"
+                self._escenario.tone()
+                self._coact_elapsed = 0.0
+                # Both at once: this is the manoeuvre the co-activation
+                # index is computed from, and the one the old instruction
+                # — one muscle, the other forced to rest — could not ask
+                # for. Without it a rehearsal recorded no grip at all.
+                self._escenario.ask_subject({0: 0.4, 1: 0.4})
+        elif self._coact_fase == "hold":
+            frac = min(1.0, self._coact_elapsed / COACT_HOLD_S)
+            # With the load bars inside it, because it is floating over
+            # them: the guide tells the student to hold this one «guiándose
+            # por la barra de carga hacia el 50–60 %», and a panel that
+            # hides the thing the instruction points at is worse than no
+            # panel. Same numbers, same colours, where the eyes already are.
+            self._mvc_overlay.show_phase(
+                titulo, pista, running=frac,
+                loads=[(self._carga_inst[c] / 100.0, _CHANNEL_COLORS[c])
+                       for c in range(min(2, self._n_channels))],
+                zone=COACT_ZONA)
+            self._aula.calib(True, "contract", titulo, pista, progress=frac)
+            if self._coact_elapsed >= COACT_HOLD_S:
+                self._escenario.ask_subject({})
+                self._mvc_overlay.mark_step(self._coact_rep)
+                self._coact_rep += 1
+                self._coact_elapsed = 0.0
+                if self._coact_rep >= COACT_REPS:
+                    self._guia_fin()
+                    return
+                self._coact_fase = "rest"
+                self._escenario.tone()
+        elif self._coact_fase == "rest":
+            self._mvc_overlay.show_relax(tr("Next one in a moment"))
+            if self._coact_elapsed >= COACT_REST_S:
+                self._coact_fase = "ready"
+                self._escenario.tone()
+                self._coact_elapsed = 0.0
+        if recolocar:
+            # Each step of this phase is a different height, and the box is
+            # anchored by its bottom edge while the task runs.
+            self._reposition_mvc_overlay()
+
+    def _guia_fin(self) -> None:
+        """The session has asked for everything it asks for."""
+        self._escenario.tone(final=True)
+        self._coact_timer.stop()
+        self._escenario.release_subject()
+        self._coact_fase = ""
+        self._guia_fase = ""
+        self._btn_paso_hecho.setVisible(False)
+        self._btn_cancelar_guia.setVisible(False)
+        self._mvc_overlay.show_done(
+            tr("Task recorded"),
+            tr("The recording has stopped."))
+        self._log(tr("The guided task is finished."))
+        QTimer.singleShot(5000, self._mvc_overlay.hide_overlay)
+        QTimer.singleShot(5000, lambda: self._aula.calib(False))
+        self._parar_al_terminar_sesion()
+
+    def _guia_cancelar(self) -> None:
+        """Out of the guided task, leaving the recording running."""
+        self._coact_timer.stop()
+        if self._guia_fase in ("maniobras", "coact"):
+            self._escenario.release_subject()
+        self._coact_fase = ""
+        self._guia_fase = ""
+        self._btn_paso_hecho.setVisible(False)
+        self._btn_cancelar_guia.setVisible(False)
+        if not self._conservar_panel:
+            self._mvc_overlay.set_steps([])
+            self._mvc_overlay.hide_overlay()
+            self._aula.calib(False)
+
+    def _write_mvc_ref_marker(self, c: int) -> None:
+        """Carry this channel's MVC reference into the EDF as an annotation.
+
+        Without it the reference lives only in memory and dies with the
+        session, so the offline analysis — which starts from the file — has no
+        way of knowing what each muscle's maximum was, and can only fall back
+        to millivolts. Same device as the guided force-velocity wizard uses for
+        its loads.
+        """
+        ref = self._mvc_ref[c]
+        if ref and self._worker and self._worker.isRunning():
+            self._worker.add_marker(mvc_ref_marker(c, float(ref)))
+
+    def _mvc_crosstalk(self) -> list[tuple[str, str, float]]:
+        """How much each channel read while a *different* muscle was calibrated.
+
+        One entry per ordered pair, ``(muscle calibrated, other channel,
+        % of that other channel's own reference)``, measured exactly the way
+        the reference itself was: each repetition's peak, best of the
+        repetitions. Measured two different ways, the number would move by
+        itself.
+
+        The figure answers the question the two live bars cannot: whether the
+        second channel is following its own muscle or the first one's. It is
+        never zero — a maximal effort recruits the antagonist to hold the joint
+        — so it is reported as a measurement and only warned about above
+        ``mvc_crosstalk_pct``.
+        """
+        window = max(1, round(self._profile.mvc_peak_window_s * FS))
+        labels = self._active_labels()
+
+        def name(i: int) -> str:
+            return labels[i] if i < len(labels) else str(i + 1)
+
+        out: list[tuple[str, str, float]] = []
+        for c in range(self._n_channels):
+            for k, reps in sorted(self._mvc_cross[c].items()):
+                ref_k = self._mvc_ref[k]
+                if not ref_k or k >= self._n_channels:
+                    continue
+                nivel = mvc_from_reps(
+                    reps, self._profile.mvc_percentile, window_samples=window,
+                )
+                if nivel > 0:
+                    out.append((name(c), name(k), 100.0 * nivel / ref_k))
+        return out
+
+    def _mvc_finish_all(self) -> None:
+        self._mvc_timer.stop()
+        self._mvc_active = False
+        self._mvc_phase = "done"
+        self._escenario.release_subject()
+        self._btn_cancelar_guia.setVisible(False)
+        ok = [c for c in range(self._n_channels) if self._mvc_ref[c]]
+        self._prep_aviso = ""
+        self._btn_calibrar.setEnabled(True)
+        self._update_fv_button()          # re-enabled once the MVC wizard ends
+        if self._worker and self._worker.isRunning():
+            self._btn_grabar.setEnabled(True)
+        self._set_thresholds_enabled(bool(ok))
+        if ok:
+            self._escalar_a_la_calibracion(ok)
+            summary = " · ".join(
+                f"{self._active_labels()[c]}: {self._mvc_ref[c]:.2f} mV" for c in ok
+            )
+            self._escenario.info(
+                tr("MVC ready — {summary}. You can start recording.").format(
+                    summary=summary
+                )
+            )
+            self._log(tr("MVC calibrated: {summary}").format(summary=summary))
+
+            cruce = self._mvc_crosstalk()
+            for activo, otro, pct in cruce:
+                self._log(tr(
+                    "Channel separation — while «{muscle}» was at maximum, "
+                    "«{other}» reached {pct:.0f} % of its own reference."
+                ).format(muscle=activo, other=otro, pct=pct))
+            juntos = [
+                tr("{other} at {pct:.0f} % during {muscle}").format(
+                    other=otro, muscle=activo, pct=pct)
+                for activo, otro, pct in cruce
+                if pct >= self._profile.mvc_crosstalk_pct
+            ]
+
+            weak = [name for name in self._mvc_no_maximas if name]
+            if weak:
+                # The one result nobody must scroll past. A reference that is
+                # not a maximum makes every later percentage wrong by the same
+                # factor, and the event log moves on within seconds — so it
+                # ends on the panel the operator is already looking at.
+                warning = tr(
+                    "{muscles}: this is not a maximum. Calibrate again with a "
+                    "brief, intense maximal contraction, not a sustained push "
+                    "against something fixed."
+                ).format(muscles=" · ".join(weak))
+                self._prep_aviso = warning
+                self._mvc_overlay.show_done(tr("Calibration too weak"), warning)
+                self._aula.calib(
+                    True, "done", tr("Calibration too weak"), warning
+                )
+            elif juntos:
+                # Both references are maximal, so the calibration is not the
+                # problem — the montage is. Two channels this alike measure one
+                # muscle twice, and every later comparison between them, the
+                # co-activation index included, is built on that.
+                warning = tr(
+                    "{pairs}. Move the electrode pairs further apart, over the "
+                    "belly of each muscle, and support the limb so that neither "
+                    "muscle has to hold it up."
+                ).format(pairs=" · ".join(juntos))
+                self._prep_aviso = warning
+                self._mvc_overlay.show_done(tr("Channels not separated"), warning)
+                self._aula.calib(
+                    True, "done", tr("Channels not separated"), warning
+                )
+            else:
+                self._mvc_overlay.show_done(
+                    tr("MVC ready"),
+                    tr("{summary}\nYou can start recording.").format(
+                        summary=summary),
+                )
+                self._aula.calib(True, "done", tr("MVC ready"), summary)
+        else:
+            self._escenario.info(tr("Calibration failed (no signal)."))
+            self._mvc_overlay.show_done(
+                tr("Calibration failed"), tr("No signal — check the electrodes.")
+            )
+            self._aula.calib(
+                True, "done", tr("Calibration failed"),
+                tr("No signal — check the electrodes."),
+            )
+        if self._mvc_flow_auto and self._worker and self._worker.isRunning():
+            # The session continues into its second phase, and it does so
+            # here rather than on a timer two seconds from now. A deferred
+            # hand-over is one more thing that can fail to happen — and it
+            # did, leaving a file with its calibration marked and no
+            # recording phase at all — and it bought nothing: the verdict is
+            # carried into the countdown, which is on screen far longer than
+            # the two seconds it used to get on its own.
+            self._mvc_flow_auto = False
+            self._mvc_enter_prep()
+            return
+
+        QTimer.singleShot(5000, self._mvc_overlay.hide_overlay)
+        QTimer.singleShot(5000, lambda: self._aula.calib(False))
+
+    def _mvc_cancel(self) -> None:
+        """Abort the wizard (e.g. on stop/disconnect)."""
+        self._guia_cancelar()
+        self._escenario.release_subject()
+        self._mvc_timer.stop()
+        self._prep_timer.stop()
+        self._mvc_active = False
+        self._mvc_flow_auto = False
+        self._mvc_flow_pending = False
+        self._mvc_phase = ""
+        if not self._conservar_panel:
+            self._mvc_overlay.hide_overlay()
+            self._aula.calib(False)
+        self._btn_cancelar_guia.setVisible(False)
+        self._update_fv_button()
+
+    @Slot()
+    def _cancelar_guiado(self) -> None:
+        """Out of whichever guided procedure is running, now.
+
+        The button beside the record button and Esc both land here. The
+        recording itself goes on: what the operator wanted to stop was the
+        guide, and stopping the file with it would throw away the take.
+        A calibration cut short leaves no reference — the closed repetitions
+        stay in the file, and the analysis reads them back as it does for a
+        recording stopped mid-calibration.
+        """
+        # Esc means «stop guiding me»: a kinematics session whose
+        # calibration is cancelled does not go on to cue the loads either,
+        # and a guided session whose calibration is cancelled does not start.
+        self._fv_flow_pending = False
+        self._session_flow_pending = False
+        if self._session_runner is not None:
+            self._session_motivo = "esc"
+            self._session_runner.cancel()
+            self._btn_cancelar_guia.setVisible(False)
+            return
+        if self._guia_fase in ("maniobras", "coact"):
+            self._guia_cancelar()
+            self._log(tr("Guided task cancelled; the recording goes on."))
+            return
+        if self._mvc_active:
+            self._mvc_cancel()
+            self._prep_aviso = ""
+            if self._worker and self._worker.isRunning():
+                self._btn_calibrar.setEnabled(True)
+                self._btn_grabar.setEnabled(True)
+            self._set_thresholds_enabled(any(bool(r) for r in self._mvc_ref[:self._n_channels]))
+            self._log(tr("Calibration cancelled; the recording goes on."))
+        elif self._fv_active:
+            self._fv_cancel()
+            if self._worker and self._worker.isRunning():
+                self._btn_calibrar.setEnabled(True)
+                self._btn_grabar.setEnabled(True)
+            self._update_fv_button()
+            self._log(tr("Force-velocity acquisition cancelled; the recording goes on."))
+        self._btn_cancelar_guia.setVisible(False)
+
+    # -- Guided force-velocity acquisition wizard ----------------------------
+
+    @Slot()
+    def _on_fv_params(self) -> bool:
+        """Ask for the force-velocity plan and keep it for the recording.
+
+        The loads in order, the lifts per load, the seconds of preparation
+        and of lift. Nothing starts here: the record button runs the
+        session — the calibration of the maximum first, then the cues for
+        every load — and reads the plan from the settings when it gets
+        there. Returns whether a plan is now saved.
+        """
+        if self._mvc_active or self._fv_active:
+            return self._plan_fv_guardado() is not None
+        from emgteach.gui.widgets.force_velocity_plan_dialog import (
+            ForceVelocityPlanDialog,
+        )
+
+        placement = self._combo_acc_place.currentData()
+        dlg = ForceVelocityPlanDialog(
+            self, placement=placement,
+            loads=cast(str, self._settings.value("adquisicion/fv_loads", "", type=str)),
+            reps=cast(int, self._settings.value("adquisicion/fv_reps", 0, type=int)),
+            prep_s=cast(float, self._settings.value("adquisicion/fv_prep_s", 0.0, type=float)),
+            lift_s=cast(float, self._settings.value("adquisicion/fv_window_s", 0.0,
+                                                    type=float)),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return self._plan_fv_guardado() is not None
+        loads = dlg.loads()
+        if len(loads) < 2:
+            return self._plan_fv_guardado() is not None
+        self._settings.setValue(
+            "adquisicion/fv_loads", ", ".join(f"{v:g}" for v in loads)
+        )
+        self._settings.setValue("adquisicion/fv_reps", int(dlg.reps()))
+        self._settings.setValue("adquisicion/fv_prep_s", float(dlg.prep_seconds()))
+        self._settings.setValue("adquisicion/fv_window_s", float(dlg.window_seconds()))
+        self._refresh_fv_config_label()
+        self._actualizar_paso_guiado()
+        return True
+
+    def _actualizar_paso_guiado(self) -> None:
+        """Float the next step of the kinematics sequence over its control.
+
+        The box used to carry the sequence in writing — three numbered rows,
+        the third of them a sentence about a button somewhere else. A line of
+        small print is read by whoever was already looking at it; the
+        floating panel dims the rest of the window and rings the control it
+        names, which is how the analysis tab says the same kind of thing and
+        is what «so it can be seen better» asks for.
+
+        Only on a *change* of step, and never while recording: the panel is
+        for setting up, and a dimmed window over a subject holding a weight
+        would be the worst possible moment for it.
+        """
+        if self._mode != MODE_KINEMATICS or self.is_recording():
+            self._paso_mostrado = ""
+            return
+        if not self._conexion.is_connected():
+            # Before the device is connected there is nothing to sequence:
+            # the parameters can be set at any time and the tour has just
+            # offered itself. Nagging here would be the third panel in a row.
+            return
+        if self._plan_fv_guardado() is None:
+            paso, boton = "params", self._btn_fv_guided
+            texto = tr(
+                "Next: «{button}». The loads in order and the lifts per load. "
+                "Nothing starts there; it is kept for the recording."
+            ).format(button=tr("F-V parameters…"))
+        else:
+            paso, boton = "record", self._btn_grabar
+            texto = tr(
+                "Next: «{button}». It asks for the file name, calibrates the "
+                "maximum, and then cues each load in turn. Esc stops the "
+                "guidance at any point."
+            ).format(button=tr("Start recording"))
+        if paso != self._paso_mostrado:
+            self._paso_mostrado = paso
+            self.coach_step.emit(tr("Next step"), texto, boton)
+
+    def _plan_fv_guardado(self) -> tuple[list[float], int, float, float] | None:
+        """The saved force-velocity plan — loads, lifts per load, seconds of
+        preparation, seconds of lift — or ``None`` until one is set."""
+        from emgteach.gui.widgets.force_velocity_plan_dialog import parse_loads
+
+        loads = parse_loads(cast(str, self._settings.value("adquisicion/fv_loads", "", type=str)))
+        if len(loads) < 2:
+            return None
+        return (
+            loads,
+            max(1, int(cast(int, self._settings.value(
+                "adquisicion/fv_reps", FV_REPS_DEF, type=int)))),
+            float(cast(float, self._settings.value(
+                "adquisicion/fv_prep_s", FV_PREP_DEF_S, type=float))),
+            float(cast(float, self._settings.value(
+                "adquisicion/fv_window_s", FV_LIFT_DEF_S, type=float))),
+        )
+
+    def _lanzar_estudio_fv(self) -> None:
+        """The second phase of a kinematics session: the loads, cued one by
+        one, right after the recording phase has begun. No isometric maximum
+        of its own — the session's calibration was that."""
+        self._fv_flow_pending = False
+        if not (self._worker and self._worker.isRunning()):
+            return
+        plan = self._plan_fv_guardado()
+        if plan is None:
+            self._log(tr(
+                "No force-velocity plan: set the loads in «F-V parameters…» first."))
+            return
+        loads, reps, prep_s, window_s = plan
+        self._fv_start(loads, reps, prep_s, window_s, con_maximo=False)
+
+    @Slot()
+    def _on_fv_rehearse(self) -> None:
+        """Rehearse the guided procedure — no device, no subject, no recording."""
+        from emgteach.gui.widgets.fv_rehearsal_dialog import (
+            ForceVelocityRehearsalDialog,
+        )
+
+        dlg = ForceVelocityRehearsalDialog.run(self)
+        if dlg is not None:
+            # Modeless and kept alive: the point is to leave it open beside the
+            # real controls while following it.
+            self._fv_rehearsal = dlg
+
+    def _fv_start(
+        self,
+        loads: list[float],
+        reps: int,
+        prep_s: float,
+        window_s: float,
+        *,
+        con_maximo: bool = True,
+    ) -> None:
+        """Start the guided F-V state machine for a validated load plan.
+
+        ``con_maximo`` opens with an isometric maximum without load, as the
+        stand-alone wizard always did; the kinematics session passes
+        ``False``, because the calibration it has just run *was* the
+        maximum and a second one only costs the subject another effort.
+        """
+        if len(loads) < 2 or self._mvc_active or self._fv_active:
+            return
+        self._fv_loads = list(loads)
+        self._fv_reps = max(1, int(reps))
+        self._fv_prep_s = float(prep_s)
+        self._fv_window_s = float(window_s)
+        self._fv_active = True
+        self._btn_cancelar_guia.setVisible(True)
+        self._fv_idx = 0
+        self._fv_rep = 0
+        self._fv_mvc_buf = []
+        self._fv_mvc_peak = 0.0
+        self._fv_mvc_cur = 0.0
+        self._mvc_overlay.set_steps([])
+        self._btn_calibrar.setEnabled(False)
+        self._btn_grabar.setEnabled(False)
+        self._update_fv_button()          # disabled while the wizard runs
+        self._reposition_mvc_overlay()
+        self._fv_phase = "mvc_ready" if con_maximo else "intro"
+        self._escenario.tone()
+        self._fv_elapsed = 0.0
+        if not con_maximo:
+            self._log(tr(
+                "Force-velocity study: {n} loads, {r} lifts each, lightest first."
+            ).format(n=len(self._fv_loads), r=self._fv_reps))
+        self._fv_timer.start()
+
+    def _fv_mapa(self) -> None:
+        """The two rows this study is read from: this load, and all of it.
+
+        The pair practical had a map of its phase and this one had none,
+        so the same application looked finished in one practical and bare
+        in the other. Above, the lifts of **the load in hand**; below,
+        **the whole experiment**, grouped by load with a gap between
+        groups and the group being lifted outlined.
+
+        One colour for every box — the channel's, the one its trace and
+        its load bar already have. In the pair the row's colour says which
+        muscle leads, because there are two; here there is one muscle and
+        a colour per load would be a second scale competing with the only
+        one that means something. The gaps already say where a load ends.
+
+        (The kilos are not the ``loads`` this panel draws as bars: those
+        are what the muscle is pulling as a share of its own maximum, a
+        different thing that happens to have the same name.)
+
+        A map is built **when the phase that fills it starts**, not
+        before: the announcement of the study, and the maximum that may
+        open it, fill nothing, and a row of boxes under them is a promise
+        those boxes do not keep. Same rule the warm-up follows in the pair
+        practical.
+        """
+        colour = _CHANNEL_COLORS[0]
+        todas: list = []
+        for i in range(len(self._fv_loads)):
+            if i:
+                todas.append(None)        # the gap that separates two loads
+            todas.extend([colour] * self._fv_reps)
+        self._fv_fila_de = self._fv_idx
+        self._mvc_overlay.set_steps([[colour] * self._fv_reps, todas])
+        # The row of the load in hand goes over its own group, not in the
+        # middle of the row of every load.
+        self._mvc_overlay.align_rows(0, 1)
+        self._fv_grupo()
+
+    def _fv_grupo(self) -> None:
+        """Outline the load being lifted, in the row that maps them all."""
+        primera = self._fv_idx * self._fv_reps
+        self._mvc_overlay.mark_group(1, primera, primera + self._fv_reps - 1)
+
+    def _fv_current_load(self) -> float:
+        if 0 <= self._fv_idx < len(self._fv_loads):
+            return self._fv_loads[self._fv_idx]
+        return 0.0
+
+    def _fv_progress(self) -> str:
+        return tr(" (load {i}/{n}, rep {r}/{rn})").format(
+            i=self._fv_idx + 1, n=len(self._fv_loads),
+            r=self._fv_rep + 1, rn=self._fv_reps,
+        )
+
+    def _fv_info(self, text: str) -> None:
+        self._lbl_load_info.setText(text)
+
+    def _fv_mvc_feed(self, env: list) -> None:
+        """Accumulate the muscle's envelope during the MVC-maximum window."""
+        if env and env[0].size:
+            self._fv_mvc_buf.extend(env[0].tolist())
+            self._fv_mvc_cur = float(np.mean(env[0]))
+            self._fv_mvc_peak = max(self._fv_mvc_peak, float(np.max(env[0])))
+
+    @Slot()
+    def _fv_tick(self) -> None:
+        self._fv_elapsed += MVC_TICK_MS / 1000.0
+        kg = self._fv_current_load()
+        prep_s = self._fv_prep_s
+        mvc_hold_s = FV_MVC_HOLD_S       # sustained maximum
+        lift_s = self._fv_window_s       # quick loaded lift
+
+        if self._fv_phase == "intro":
+            # The announcement between the two phases of a kinematics
+            # session: the maximum is behind, the loads are next.
+            self._mvc_overlay.show_done(
+                tr("Now the force-velocity study"),
+                tr("{n} loads, {r} lifts each, lightest first. "
+                   "Set up the first load.").format(
+                    n=len(self._fv_loads), r=self._fv_reps),
+            )
+            self._fv_info(tr("Now the force-velocity study"))
+            if self._fv_elapsed >= FV_INTRO_S:
+                self._fv_mapa()
+                self._fv_phase = "ready"
+                self._escenario.tone()
+                self._fv_elapsed = 0.0
+        elif self._fv_phase == "mvc_ready":
+            count = max(1, int(np.ceil(MVC_READY_S - self._fv_elapsed)))
+            self._mvc_overlay.show_ready(
+                tr("Get ready — maximum contraction (no load)"),
+                count,
+                tr("Contract at maximum when the count reaches 0"),
+            )
+            self._fv_info(
+                tr("Get ready — maximum (no load): {n}").format(n=count)
+            )
+            if self._fv_elapsed >= MVC_READY_S:
+                self._fv_phase = "mvc_contract"
+                self._escenario.tone()
+                self._fv_elapsed = 0.0
+                self._fv_mvc_buf = []
+                self._fv_mvc_peak = 0.0
+                self._fv_mvc_cur = 0.0
+        elif self._fv_phase == "mvc_contract":
+            secs_left = max(0.0, mvc_hold_s - self._fv_elapsed)
+            progress = min(1.0, self._fv_elapsed / mvc_hold_s)
+            effort = (
+                self._fv_mvc_cur / self._fv_mvc_peak
+                if self._fv_mvc_peak > 0 else 0.0
+            )
+            self._mvc_overlay.show_contract(
+                tr("Contract at maximum! (no load)"),
+                secs_left, progress, effort,
+            )
+            self._fv_info(tr("Contract at maximum! ({s:.0f} s)").format(
+                s=secs_left))
+            if self._fv_elapsed >= mvc_hold_s:
+                self._fv_compute_mvc()
+                self._fv_phase = "mvc_rest"
+                self._escenario.tone()
+                self._fv_elapsed = 0.0
+        elif self._fv_phase == "mvc_rest":
+            self._mvc_overlay.show_relax(
+                tr("Relax — now the loads, lightest first")
+            )
+            self._fv_info(tr("Relax — the loads come next…"))
+            if self._fv_elapsed >= FV_MVC_TO_LOADS_REST_S:
+                self._fv_mapa()
+                self._fv_phase = "ready"
+                self._escenario.tone()
+                self._fv_elapsed = 0.0
+        elif self._fv_phase == "ready":
+            self._fv_fila_de_esta_carga()
+            count = max(1, int(np.ceil(prep_s - self._fv_elapsed)))
+            self._mvc_overlay.show_ready(
+                tr("Prepare {kg:g} kg{prog}").format(kg=kg, prog=self._fv_progress()),
+                count,
+                tr("Lift {kg:g} kg when the count reaches 0").format(kg=kg),
+            )
+            self._fv_info(tr("Prepare {kg:g} kg{prog}: {n}").format(
+                kg=kg, prog=self._fv_progress(), n=count))
+            if self._fv_elapsed >= prep_s:
+                self._fv_begin_contract(kg)
+        elif self._fv_phase == "contract":
+            # The same two bars as every other effort the application asks
+            # for: the window being recorded, in blue, and what the muscle
+            # is pulling, in green, as a share of the maximum this session
+            # measured. For a while this cue was a bare «Lift!», on the
+            # grounds that bars would distract from a quick concentric
+            # action; watched on screen it is the other way round — they
+            # say what is being recorded and how much is left of it, and
+            # every other effort in the application says it like this.
+            self._mvc_overlay.show_contract(
+                tr("Lift {kg:g} kg!").format(kg=kg),
+                max(0.0, lift_s - self._fv_elapsed),
+                min(1.0, self._fv_elapsed / lift_s),
+                self._carga_inst[0] / 100.0,
+                subtitle=self._fv_progress().strip(),
+            )
+            self._fv_info(tr("Lift {kg:g} kg — then relax").format(kg=kg))
+            if self._fv_elapsed >= lift_s:
+                self._fv_finish_contract()
+        elif self._fv_phase == "rest":
+            more_reps = self._fv_rep < self._fv_reps
+            if more_reps:
+                sub = tr("Relax — another rep of {kg:g} kg").format(kg=kg)
+            else:
+                nxt = (
+                    self._fv_loads[self._fv_idx]
+                    if self._fv_idx < len(self._fv_loads) else kg
+                )
+                sub = tr("Relax — change to {kg:g} kg").format(kg=nxt)
+            self._mvc_overlay.show_relax(sub)
+            self._fv_info(tr("Relax…"))
+            if self._fv_elapsed >= MVC_REST_S:
+                self._fv_phase = "ready"
+                self._escenario.tone()
+                self._fv_elapsed = 0.0
+
+    def _fv_compute_mvc(self) -> None:
+        """Set the MVC reference from the guided maximum contraction."""
+        if not self._fv_mvc_buf:
+            return
+        window = max(1, round(self._profile.mvc_peak_window_s * FS))
+        ref = mvc_from_reps(
+            [np.asarray(self._fv_mvc_buf, dtype=float)],
+            self._profile.mvc_percentile, window_samples=window,
+        )
+        if ref > 0:
+            self._mvc_ref[0] = ref
+            self._online[0].reset()
+            self._load_bars[0].set_value(0.0, active=True)
+            self._set_thresholds_enabled(True)
+            self._escalar_a_la_calibracion([0])
+            self._log(tr("F-V: MVC reference {ref:.2f} mV.").format(ref=ref))
+
+    def _fv_begin_contract(self, kg: float) -> None:
+        """Enter a contraction window and mark it in the EDF with its load."""
+        self._fv_phase = "contract"
+        self._escenario.tone()
+        self._fv_elapsed = 0.0
+        from emgteach.force_velocity import fv_load_marker
+
+        if self._worker and self._worker.isRunning():
+            self._worker.add_marker(fv_load_marker(kg))
+        # Only the simulated board acts on this. Without it a rehearsal of
+        # this study records a muscle that never lifts anything — and now
+        # that the cue shows the effort, a flat bar on every lift.
+        self._escenario.ask_subject({0: FV_NIVEL_SIMULADO})
+        self._log(tr("Force-velocity: contraction with {kg:g} kg.").format(kg=kg))
+
+    def _fv_finish_contract(self) -> None:
+        """Advance to the next rep, next load, or finish."""
+        self._escenario.ask_subject({})          # the lift is over: rest
+        self._mvc_overlay.mark_step(self._fv_rep, row=0)
+        self._mvc_overlay.mark_step(
+            self._fv_idx * self._fv_reps + self._fv_rep, row=1)
+        self._fv_rep += 1
+        if self._fv_rep < self._fv_reps:
+            self._fv_phase = "rest"           # rest, then another rep, same load
+            self._escenario.tone()
+            self._fv_elapsed = 0.0
+            return
+        self._fv_rep = 0
+        self._fv_idx += 1
+        if self._fv_idx < len(self._fv_loads):
+            # The top row is **not** started over here. The box just filled
+            # is the one that completes the group — the one that says this
+            # load is done — and starting the row over in the same instant
+            # meant it was the only box of the study nobody ever saw full.
+            # It stays up through the rest and becomes the next load's when
+            # that load's countdown begins.
+            self._fv_phase = "rest"           # rest, then the next load
+            self._escenario.tone()
+            self._fv_elapsed = 0.0
+        else:
+            self._fv_finish_all()
+
+    def _fv_fila_de_esta_carga(self) -> None:
+        """Hand the top row to the load whose countdown is starting.
+
+        Called from the countdown and not from the lift that finished the
+        previous load: that lift's box is what says the load is done, and
+        it is left on screen for the whole rest before the row means
+        something else. Once per load — the countdown ticks ten times a
+        second and this has to happen on the first of them.
+        """
+        if self._fv_fila_de == self._fv_idx:
+            return
+        self._fv_fila_de = self._fv_idx
+        self._mvc_overlay.clear_steps(0)
+        self._fv_grupo()
+        self._mvc_overlay.update()
+
+    def _fv_finish_all(self) -> None:
+        self._fv_timer.stop()
+        self._escenario.release_subject()
+        self._fv_active = False
+        self._fv_phase = "done"
+        self._escenario.tone(final=True)
+        self._btn_cancelar_guia.setVisible(False)
+        if self._worker and self._worker.isRunning():
+            self._btn_grabar.setEnabled(True)
+            self._btn_calibrar.setEnabled(True)
+        self._update_fv_button()          # re-enabled once the wizard ends
+        n = len(self._fv_loads)
+        self._fv_info(
+            tr(
+                "Force-velocity: {n} loads recorded. The recording has stopped; "
+                "open the Force-velocity study in the Analysis tab."
+            ).format(n=n)
+        )
+        self._mvc_overlay.show_done(
+            tr("Loads recorded"),
+            tr(
+                "{n} loads marked.\nThe recording has stopped: open the "
+                "Force-velocity study."
+            ).format(n=n),
+        )
+        self._log(
+            tr("Force-velocity acquisition finished: {n} loads.").format(n=n)
+        )
+        # The map stays under this panel, full: the last lift of the last
+        # load has a box too, and the end of the study is worth seeing
+        # whole. It goes when the panel goes.
+        QTimer.singleShot(5000, self._fv_cerrar_mapa)
+        self._parar_al_terminar_sesion()
+
+    def _parar_al_terminar_sesion(self) -> None:
+        """The guided session has asked for everything: so does the recording.
+
+        Decision of 11 Oct 2026, as ecgteach and eegteach do: at the end of
+        the pair practical's task and of the kinematics practical's last load
+        the recording stops by itself, and the event log says why. The panel
+        that says the task is recorded stays its five seconds: the cancels
+        the stop runs, now and when the thread ends, leave it alone
+        (_conservar_panel). Since 24 Oct 2026 the one-muscle practical's
+        guided sessions end here too; a free recording has no guided end and
+        is never stopped here, and «Cancel guide» (Esc) does not come here
+        either.
+        """
+        if not self.is_recording():
+            return
+        self._log(tr("Recording stopped automatically: guided session finished."))
+        # Until the panel's own five seconds are up: the thread's «finished»
+        # comes after this returns and runs the cancels again.
+        self._conservar_panel = True
+        QTimer.singleShot(5000, self._soltar_panel)
+        self._btn_grabar.setChecked(False)
+        self._detener_grabacion()
+
+    def _soltar_panel(self) -> None:
+        """The five seconds are up: the phones' guide panel goes too, as the
+        cancels would have sent it at the stop."""
+        if not self._conservar_panel:
+            return
+        self._conservar_panel = False
+        if not self.is_recording():
+            self._aula.calib(False)
+
+    def _fv_cerrar_mapa(self) -> None:
+        """Drop the map and hide the panel, once the finished study is seen."""
+        self._mvc_overlay.set_steps([])
+        self._mvc_overlay.hide_overlay()
+
+    def _fv_cancel(self) -> None:
+        """Abort the guided F-V wizard (e.g. on stop/disconnect)."""
+        self._fv_timer.stop()
+        self._escenario.release_subject()
+        self._fv_active = False
+        self._fv_phase = ""
+        self._btn_cancelar_guia.setVisible(False)
+        if self._conservar_panel:
+            return
+        self._mvc_overlay.set_steps([])
+        if not self._mvc_active:
+            self._mvc_overlay.hide_overlay()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition_mvc_overlay()
+
+    def _reposition_mvc_overlay(self) -> None:
+        """Centre the floating guide at the top of the plot area.
+
+        **Never above it**, which is where the load bars are. The bars are
+        what the student is told to work from — the grip is held «guiándose
+        por la barra de carga hacia el 50–60 %» and every % MVC on screen
+        is read off them — so a box that covers them covers the
+        measurement. The raw trace is the one thing on this screen that can
+        be covered for a few seconds without anybody losing their place.
+
+        It was the other way round for a day, on the grounds that figure 5
+        of the article captures the bars **and** the plots and the traces
+        were the more useful of the two. Tried with the board: the boxes of
+        the task sat on the bars and hid them.
+        """
+        ov = self._mvc_overlay
+        x = max(0, (self.width() - ov.width()) // 2)
+        y = 72
+        if hasattr(self, "_trazado"):
+            y = max(72, self._trazado.geometry().top() + 8)
+        ov.move(x, y)
+
+    @Slot(int)
+    def _seguir_el_dispositivo(self, index: int) -> None:
+        """The device type changed: the raw plot takes its full scale
+        (LivePlots.follow_device), redrawn at once unless a recording runs."""
+        self._trazado.follow_device(index, recording=self.is_recording())
+
+    def _escalar_a_la_calibracion(self, channels: list[int]) -> None:
+        """Fit the live plots to this subject once the MVC is known: the
+        envelope from the references, the raw plot from the peaks
+        (LivePlots.autoscale)."""
+        self._trazado.autoscale(
+            [r for c in channels if (r := self._mvc_ref[c])],
+            [self._mvc_raw_peak[c] for c in channels if self._mvc_raw_peak[c] > 0],
+        )
+
+    @Slot()
+    def _update_load_readout(self) -> None:
+        if all(r is None for r in self._mvc_ref[: self._n_channels]):
+            return
+        colours = {"normal": "#1a7a1a", "warning": "#E67E22", "danger": "#cc0000"}
+        for c in range(self._n_channels):
+            if not self._mvc_ref[c]:
+                continue
+            ol = self._online[c]
+            self._load_readouts[c].setText(
+                f"P10 {ol.static:.0f} · P50 {ol.median:.0f} · P90 {ol.peak:.0f} %"
+            )
+            self._load_readouts[c].setStyleSheet(
+                f"font-size: 9px; color: {colours[ol.status]};"
+            )
+
+    def _reset_load_monitor(self) -> None:
+        self._mvc_cancel()
+        self._fv_cancel()
+        self._mvc_ref = [None] * MAX_CHANNELS
+        self._mvc_capture = [[] for _ in range(MAX_CHANNELS)]
+        self._mvc_cross = [{} for _ in range(MAX_CHANNELS)]
+        self._mvc_no_maximas = []
+        for c in range(MAX_CHANNELS):
+            self._online[c].reset()
+            self._load_bars[c].reset()
+            self._load_readouts[c].setText("")
+        self._lbl_load_info.setText("")
+        self._set_thresholds_enabled(False)
+
+    def _stop_load_monitor(self) -> None:
+        self._load_timer.stop()
+        self._mvc_cancel()
+        self._fv_cancel()
+        # And the guided session, whichever way the recording ended: by
+        # «Stop», or by the board going away under it.
+        if self._session_runner is not None:
+            self._session_motivo = "stop"
+            self._session_runner.cancel()
+        self._btn_calibrar.setEnabled(False)
+        self._update_fv_button()
+        self._set_thresholds_enabled(False)
+        for bar in self._load_bars:
+            bar.set_value(0.0, active=False)
+
+    # ------------------------------------------------------------------
+    # Markers
+    # ------------------------------------------------------------------
+
+
+
+    @Slot(str)
+    def _on_marca_manual(self, etiqueta: str) -> None:
+        """A mark by hand: the worker writes it like any other, at its time."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.add_marker(etiqueta)
+
+    @Slot(float, str)
+    def _on_marker_added(self, tiempo: float, etiqueta: str) -> None:
+        # The marker is reflected in the "Event log" (log).
+        self._log(tr("Marker added: t={t:.1f} s — {label}").format(t=tiempo, label=etiqueta))
+        # Record the event to draw it live over the plots.
+        self._trazado.add_marker(tiempo, etiqueta)
+        self._aula.marker(tiempo, etiqueta)
+        # Add it to the editable marker list (data carries the exact key).
+        item = QListWidgetItem(f"t={tiempo:.1f} s — {etiqueta}")
+        item.setData(Qt.ItemDataRole.UserRole, (float(tiempo), etiqueta))
+        self._list_markers.addItem(item)
+        # Two lines, so the oldest goes as the newest arrives. A list that
+        # grows all recording long is a table nobody reads while recording,
+        # and it was pushing the plots down the window to say it.
+        while self._list_markers.count() > 2:
+            self._list_markers.takeItem(0)
+
+
+
+    def _on_error(self, msg: str, worker: AcquisitionWorker | None = None) -> None:
+        """An error from *worker*; ``None`` means the current one."""
+        self._err(msg)
+        if worker is None or worker is self._worker:
+            self._restaurar_controles()
+
+    @Slot(str)
+    def _on_escritura_fallida(self, mensaje: str) -> None:
+        """The file could not be created or written: said in a box at once.
+
+        Not modal: the recording is already stopping, and the window has to
+        come back ready to record somewhere else. The log has it too.
+        """
+        caja = QMessageBox(
+            QMessageBox.Icon.Warning, tr("The recording cannot be saved"), mensaje,
+            QMessageBox.StandardButton.Ok, self,
+        )
+        caja.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        caja.setWindowModality(Qt.WindowModality.NonModal)
+        self._aviso_guardado = caja
+        caja.show()
+
+    def _on_finished(self, edf_path: str, worker: AcquisitionWorker | None = None) -> None:
+        """*worker* has ended. Its file, if it left one worth opening, goes to
+        the analysis whichever worker it was; the controls and the review of
+        the session are only for the worker that is current."""
+        current = worker is None or worker is self._worker
+        if current:
+            self._restaurar_controles()
+        motivo = None
+        if edf_path:
+            self._log(tr("Recording finished. File: {path}").format(path=edf_path))
+            self.recording_saved.emit(edf_path)
+            if current:
+                self._ruta_registro = edf_path
+                motivo = self._trazado.show_recording(
+                    edf_path, self._etiqueta_tramo,
+                    self._contracciones_del_registro(edf_path))
+            else:
+                motivo = tr("another recording had already started")
+        else:
+            motivo = (getattr(worker, "motivo_sin_archivo", "")
+                      or tr("the recording left no file"))
+        # Never in silence: on the bench of 6 November a recording sometimes
+        # ended with no review and nothing in the log to say why.
+        if motivo:
+            self._log(tr("No review of {file}: {reason}.").format(
+                file=Path(edf_path).name if edf_path else tr("this recording"),
+                reason=motivo))
+        if current:
+            self._guardar_eventos()
+
+    @Slot(str, object)
+    def show_measured(self, edf_path: str, result: dict) -> None:
+        """An analysis of *edf_path* has finished: if that recording is on
+        review, draw inside its bars the stretches its numbers were read on
+        (guided.measured_in_file). In the one-muscle practical only, for now
+        (Ángel, 7 November 2026)."""
+        if self._mode != MODE_SINGLE or not self._trazado.reviewing(edf_path):
+            return
+        try:
+            tramos = measured_in_file(result)
+        except Exception:                  # the review goes on without them
+            tramos = []
+        self._trazado.show_measured(tramos)
+
+    def _contracciones_del_registro(self, edf_path: str) -> list[tuple[float, float]]:
+        """The rows the fragment editor will propose for this recording, for
+        the review's bar (fragments.recording_proposal), at this practical's
+        sensitivity and rule. None if they cannot be worked out: the review
+        is still shown, without the bar."""
+        try:
+            return [(f.start_s, f.end_s) for f in recording_proposal(
+                edf_path, k=mode_detection_k(self._mode),
+                rest_fraction=mode_rest_fraction(self._mode))]
+        except Exception:
+            return []
+
+    def _restaurar_controles(self) -> None:
+        self._conexion.mark_if_no_answer()
+        self._marcador.set_recording(False)
+        self._btn_grabar.setChecked(False)
+        self._btn_grabar.setText(tr("Start recording"))
+        self._conexion.recording_finished()
+        self._lbl_estado.setText(self._estado_en_reposo())
+        self._set_auto_controls_enabled(True)
+        self._stop_load_monitor()
+        self._session_flow_pending = False
+        self._combo_sesion.setEnabled(True)
+        self._quality_monitor = None
+        self._lbl_calidad.setVisible(False)
+        self._lbl_calidad.setText("")
+
+    # ------------------------------------------------------------------
+    # Vertical scale (▲▼ per plot)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Time scale (sliding window)
+    # ------------------------------------------------------------------
+
+    # Every one of these ends in a forced repaint, and that is the whole
+    # point of the line. Without it the window only changed on the *next*
+    # frame that carried new samples — so while recording it worked with a
+    # thirty-millisecond delay nobody could notice, and standing idle it did
+    # nothing at all: the caption said "5 s visible" and the plot went on
+    # showing thirty: the click changed nothing on screen.
+    #
+    # The vertical ▲▼ buttons beside each plot had always forced it. Two
+    # controls in the same corner, one working and one not.
+
+    # ------------------------------------------------------------------
+    # The port held by an attempt that did not answer
+    # ------------------------------------------------------------------
+
+    def _esperar_al_puerto(self) -> bool:
+        """Hold a new recording until the previous attempt lets go of the port.
+
+        After the 20-second warning the attempt that did not answer can
+        still be inside Windows' opening of the Bluetooth port — on the
+        bench, for 52 s — and a new connection then finds the port taken.
+        So the new one waits, and says so, with the window answering; it
+        starts by itself when the old thread ends. The wait used to be a
+        ``wait()`` on the thread, which froze the window for as long.
+        """
+        viejo = self._worker
+        if viejo is None or not viejo.isRunning() or not viejo.is_opening():
+            return False
+        viejo.stop_forced()
+        self._btn_grabar.setChecked(False)
+        self._btn_grabar.setEnabled(False)
+        self._lbl_estado.setText(
+            tr("Status: waiting for Windows to release the port…"))
+        if not self._esperando_puerto:
+            self._esperando_puerto = True
+            self._log(tr(
+                "The previous connection attempt is still holding the port; "
+                "the recording starts as soon as Windows releases it."))
+            viejo.finished.connect(self._puerto_liberado)
+        return True
+
+    @Slot()
+    def _puerto_liberado(self) -> None:
+        """The attempt that held the port has ended: start the one asked for."""
+        if not self._esperando_puerto:
+            return
+        self._esperando_puerto = False
+        conectado = self._conexion.is_connected()
+        self._btn_grabar.setEnabled(conectado)
+        self._lbl_estado.setText(self._estado_en_reposo())
+        if conectado and not self.is_recording():
+            self._btn_grabar.setChecked(True)
+            self._toggle_grabacion()
+
+    @Slot()
+    def _reintentar_tras_aviso(self) -> None:
+        """«Retry» on the box that said the board did not answer: start the
+        recording again, as the button would.
+
+        The attempt that did not answer is usually still running, inside
+        the port's opening: that is not a recording in the way, it is the
+        port the retry has to wait for (_esperar_al_puerto).
+        """
+        if not self._btn_grabar.isEnabled():
+            return
+        abriendo = self._worker is not None and self._worker.is_opening()
+        if abriendo or not self.is_recording():
+            self._btn_grabar.setChecked(True)
+            self._toggle_grabacion()
+
+    # ------------------------------------------------------------------
+    # New-session reset (clear the live view for a new student)
+    # ------------------------------------------------------------------
+
+    def is_recording(self) -> bool:
+        """True while a recording worker is running."""
+        return bool(self._worker and self._worker.isRunning())
+
+    def reset(self) -> None:
+        """Clear the live acquisition view to its just-opened state.
+
+        Wipes the plot buffers, event markers, local log and the muscle-load
+        calibration, and restores the scales/time window. Keeps the device
+        connection and the saved configuration (MAC, folder, labels). The EDF
+        files already written to disk are NOT touched. No effect while
+        recording (the caller guards with :meth:`is_recording`).
+        """
+        if self.is_recording():
+            return
+        self._trazado.leave_review()
+        # A new student: the previous recording's name must not follow them
+        # into their screenshots.
+        self._ruta_registro = ""
+        self._trazado.clear()
+        self._list_markers.clear()
+        self._reset_load_monitor()
+        self._trazado.reset_all_scales()
+        self._local_log.clear()
+        self._trazado.redraw()
+
+    # ------------------------------------------------------------------
+    # Cleanup on window close
+    # ------------------------------------------------------------------
+
+    def apply_mode(self, mode: str, advanced: bool) -> None:
+        """Set the tab up for one practical, optionally with the fine controls.
+
+        Whole containers are hidden, never the individual widgets: most of
+        these controls sit beside plain QLabels that are not kept as
+        attributes, so hiding the widget alone would leave its caption behind.
+
+        The mode *drives* the channel count and the accelerometer rather than
+        merely hiding their selectors. Hiding them alone was a bug: a
+        two-muscle set-up chosen in one mode survived into another that had no
+        way to show or change it, so the labels and load bars claimed two
+        muscles while the rest of the tab behaved as if there were one.
+        """
+        # Kept, not merely acted on: the session flow asks which practical is
+        # running on every press of the record button, long after this call.
+        # It was read and never stored, so _flow_needs_calibration raised
+        # AttributeError inside a Qt slot — which prints to stderr and is
+        # invisible in the running app — and aborted the rest of
+        # _iniciar_grabacion in silence. Four recordings came back with
+        # no calibration because of this one missing assignment.
+        self._mode = normalise_mode(mode)
+        self._apply_mode_channels(mode)
+
+        # The device row, in every practical; the choice of device only in
+        # the single-muscle one (ConnectionBox.set_practical).
+        self._conexion.set_practical(single_muscle=self._mode == MODE_SINGLE)
+
+        # Channel names the practical imposes: the row goes, and the names
+        # come from _active_labels(). The boxes are left exactly as the
+        # operator had them, so their own names survive a visit to a practical
+        # that does not use them.
+        self._box_labels.setVisible(not mode_fixed_labels(mode))
+        # The hint in the first box names what the practical records: one
+        # muscle, or the agonist of a pair.
+        self._edit_labels[0].setPlaceholderText(
+            tr("Muscle — e.g. biceps") if mode_channels(mode) == 1
+            else pair_hint(self._par, 0))
+        self._lbl_labels.setText(
+            tr("Muscle:") if mode_channels(mode) == 1 else tr("Labels:"))
+        # Which pair is a question only the pair practical asks.
+        for w in (self._lbl_par, self._combo_par):
+            w.setVisible(self._mode == MODE_PAIR)
+
+        # Belongs to the kinematics practical, not to the fine controls.
+        uses_acc = mode_uses_acc(mode)
+        self._box_acc.setVisible(uses_acc)
+        self._box_fv_guided.setVisible(uses_acc)
+        # In the kinematics practical the calibration is the session's first
+        # phase, run by the record button: a button for it beside the
+        # sequence was the step nobody knew whether or when to take.
+        self._btn_calibrar.setVisible(mode != MODE_KINEMATICS)
+        # The guided sessions are the one-muscle practical's.
+        self._rellenar_sesiones()
+        # A different practical is a different sequence: whatever step was
+        # offered belongs to the one being left.
+        self._paso_mostrado = ""
+        # Which analogue input the sensor is wired to is a convention the
+        # block states — muscle on A1, accelerometer on A2 — not a selector:
+        # the selector stays built (the recording code reads the combo) but
+        # is never shown, and the practical sets it.
+        self._box_acc_wiring.setVisible(False)
+        if uses_acc:
+            fijo = self._combo_acc_channel.findData(_ACC_INPUT)
+            if fijo >= 0:
+                self._combo_acc_channel.setCurrentIndex(fijo)
+
+        # The channel count is now decided by the mode, so its selector never
+        # appears — it would be a control that cannot disagree with the mode.
+        self._box_nchan.setVisible(False)
+
+        # Following the class on their own phones is what the practical is
+        # for, not a fine adjustment, so it is offered at every level.
+        self._box_aula.setVisible(True)
+
+        # Offered at every level, and not as a fine adjustment: hiding it in
+        # the practicals would leave a recording with no onsets in it at all.
+        # Marks are not a refinement — the analysis finds each effort by them.
+        self._box_autoonset.setVisible(True)
+        # Fine controls: the warning/danger thresholds, the onset sensitivity
+        # k, and the four ways of moving the view by hand (Reset scales and
+        # the ▲▼ sidebar). None of them is a decision a student should be
+        # making in the middle of a physiology exercise; the advanced
+        # practical, where the reader is past that point, shows them all.
+        # The legend and the lane labels are painted while the tab is built,
+        # before any mode has been applied, so they carried the names of the
+        # default practical: with the channel count already at two nothing
+        # changed and the first lane stayed «Muscle» beside an «ECR».
+        self._trazado.update_legend()
+
+        self._box_thr.setVisible(advanced)
+        # k stays on screen in every practical, with its one-line meaning
+        # beside it: the box's help explains it, and a control that is
+        # explained and hidden is a puzzle. Its default is right for all
+        # three practicals; the label says so.
+        self._box_k.setVisible(True)
+        self._trazado.set_scale_controls_visible(advanced)
+
+    def _apply_mode_channels(self, mode: str) -> None:
+        """Make the recording match the mode: channel count and accelerometer.
+
+        Driven through the existing widgets so their slots run and the plots,
+        legend, load bars and broadcast configuration all follow.
+        """
+        # Every practical does this, including the kinematics one. The
+        # channel selector is hidden in every mode on purpose, so "whatever
+        # the user set stays set" would mean a channel count that nothing on
+        # screen could show or change. That is the state this
+        # module exists to make unreachable.
+        #
+        # Imposing is not locking: this *sets* the widgets when the practical
+        # is chosen and leaves them editable, and the accelerometer's own
+        # checkbox stays on screen. Choosing the kinematics practical arrives
+        # with the accelerometer on, which is what makes it kinematics, and
+        # unticking it afterwards is still the operator's to do.
+        wanted = mode_channels(mode)
+        if self._combo_n_channels.currentIndex() != wanted - 1:
+            self._combo_n_channels.setCurrentIndex(wanted - 1)
+
+        uses_acc = mode_uses_acc(mode)
+        if self._chk_acc.isChecked() != uses_acc:
+            self._chk_acc.setChecked(uses_acc)
+
+    def cleanup(self) -> None:
+        """
+        Called by MainWindow.closeEvent before destroying the window.
+        Stops timers, stops the worker (forced if necessary) and waits for it
+        to finish to ensure the EDF is closed correctly.
+        """
+        self._conexion.stop()
+        self._trazado.stop_live()
+        self._load_timer.stop()
+        self._broadcast.stop()
+        # A recording asked for with «Retry» while the port was still held
+        # starts by itself when the holding thread ends (_puerto_liberado).
+        # Not from here: should Windows let the port go during the wait
+        # below, that start would come after the window has closed, with a
+        # «Save as» dialog nobody asked for and a recording on a tab that is
+        # gone. Seen with a MainWindow under app.exec(), 22 October 2026.
+        self._esperando_puerto = False
+        self._session_flow_pending = False
+        if self._session_runner is not None:
+            self._session_motivo = "stop"
+            self._session_runner.cancel()
+        if self._worker and self._worker.isRunning():
+            self._worker.stop_forced()
+            self._worker.wait(5000)

@@ -1,0 +1,162 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the article and the package."
+title: "emgteach: an open-source teaching platform for surface electromyography"
+abstract: >-
+  emgteach is a Python package that provides a unified PySide6 desktop
+  application for real-time acquisition, offline analysis and MVC
+  normalisation of surface EMG signals. Two interchangeable hardware
+  backends are supported: BITalino over Bluetooth and Arduino RedBoard
+  Plus + MyoWare 2.0 over USB serial. Output files follow the EDF+
+  standard with reliable buffered writing. Version 0.2.0 added two-channel
+  acquisition (e.g. agonist/antagonist), automatic contraction-onset
+  annotation and one-click PDF session reports; version 0.3.0 added a stacked
+  two-channel live view and a bilingual (English/Spanish) interface; version
+  1.0.0 reimplements the BITalino backend over pyserial (Bluetooth virtual COM
+  port, no PyBluez or external dependencies) with MAC-to-COM resolution and
+  autodetection, and adds a recipe for a standalone Windows executable.
+  Version 1.1.0 adds
+  assisted fragment selection with an editable fragment editor, region-of-interest
+  analysis, CSV export, a live signal-quality check and an ECG signal profile.
+  Version 2.0.0 adds a kinematic dimension via the BITalino accelerometer: a
+  movement-versus-EMG analysis panel, a guided force-velocity acquisition wizard
+  (an MVC maximum followed by cued quick lifts, each auto-marked with its load)
+  and a force-velocity study that turns one recording into the load-velocity,
+  Hill force-velocity, power and recruitment curves. Version 3.0.0 configures
+  the application by choosing the practical rather than by setting controls one
+  at a time: three practicals (one muscle, agonist/antagonist and muscle
+  kinematics) fix the channel count, the accelerometer and what each tab
+  offers. The session becomes a single file with its phases marked inside it,
+  so the maximum voluntary contraction every percentage is measured against
+  travels with the signal; it adds a guided tour, contextual help on every
+  box, one analysis row per contraction with its electromechanical delay, an
+  agonist/antagonist co-activation index (Falconer-Winter) computed per marked
+  phase in %MVC, and a derived "tuned" recording that carries the decisions
+  taken on screen. Version 3.1.0 turns the fragment editor into a three-step
+  procedure that counts the marked contractions against the protocol and lets
+  each one be kept, dropped, split or dragged, sets the detection sensitivity
+  per practical and records it in the report, keeps a single running instance
+  with a start-up splash, and shows the electrode placement and the
+  calibration in the guided tour. Version 3.1.1 reads the co-activation of a
+  named window on the uncut recording, with each muscle's resting level taken
+  from the whole recording phase. Version 3.1.2 asks the calibration for a
+  brief, explosive maximal jerk of each muscle's own movement instead of a
+  sustained push against something fixed. Version 3.2.0 takes the MVC
+  reference as the highest point of the envelope across the calibration
+  repetitions kept, sets the co-activation floor at 4.5 % of it and computes
+  each fatigue segment's MDF over the analysis band; a recording reanalysed
+  with 3.2.0 gives % MVC figures different from those of 3.1.2. Version 3.3.0
+  reads the task maximum on the whole recording phase, whatever fragments are
+  chosen, and draws each spectrum of panel 3 scaled to unit area. Version 3.4.0
+  numbers the analysis panels 1 to 12 from one table, makes every title say
+  how to read its panel, and draws the two muscles' raw traces on one panel
+  with an axis each; nothing computed changes. Version 3.5.0 adds a
+  simulated BITalino that speaks the board's protocol, so a practical can be
+  prepared and taught without hardware, a connection diagnostic for the
+  station, an event log beside every recording and a recovery for a recording
+  whose process died; and it repairs the session report, whose table of
+  contractions lost four columns off the page, and the CSV export. In version
+  3.6.0 the simulated board obeys the calibration, so a session rehearsed
+  without hardware reads in % MVC as a real one does; nothing computed
+  changes. Version 3.7.0, the one the article describes, guides the whole
+  session into the task, with a map of each phase, a grip made squeezing a
+  ball, fragment rows from where each contraction leaves rest to where it
+  returns, one row per marked lift in the kinematics practical, and a
+  connection that says when the board does not answer. Patch 3.7.1 keeps a
+  recording going when a BITalino frame arrives corrupted, resynchronising
+  on the next frames that validate, marks in the file the frames the link
+  lost, and makes saving the tuned recording say why it cannot; nothing
+  computed changes. Patch 3.7.2 moves the classroom broadcast to ports 8080
+  and 8443 and lets a laboratory change them in a text file next to the
+  application; nothing computed changes. Version 3.8.0 brings over what the
+  bench of the sister applications found in shared code: a phone that joins
+  the broadcast late gets the report, the event log survives a crash, the
+  default file name carries the seconds, and a file that disappears in
+  mid-recording stops it at once; nothing computed changes. Version 3.9.0
+  brings back marking by hand while recording: a label and a button, or the
+  M key, put a mark in the file at the moment it is pressed, and the
+  analysis draws those marks apart; nothing computed changes. Patch 3.9.1
+  keeps the live view following the signal after a wheel zoom, starts no
+  recording when the window is closed while «Retry» waits for the port, and
+  writes «% CVM» in Spanish; nothing computed changes. Version 3.10.0
+  guides three sessions of the one-muscle practical — graded contractions,
+  fatigue with a fixed load and quick repeated contractions — timed, marked
+  in the file and analysed by their own spans, with an optional tone at every
+  phase change of every guided flow; nothing computed changes for a free
+  recording. Patch 3.10.1 has each step of the gradation reached slowly,
+  reads the fatigue's 10 % fall on the MDF's line, ends the train where its
+  last contraction does and counts a contraction with two humps as one, does
+  the fatigue with a fixed load on the forearm, and in the one-muscle
+  practical ends a fragment where the muscle is back at rest. Version
+  3.11.0 draws in the review of each recording a bar for each contraction the
+  fragment editor will propose and, in the one-muscle practical, the stretch
+  each number was measured on; a fragment there follows its contraction's
+  fall to rest, a gradation is proposed one row per step, and a weak
+  contraction among strong ones is measured; a recording never ends without
+  its review in silence; and the classroom link carries the address the
+  phones can reach.
+type: software
+version: 3.11.0
+date-released: "2026-11-10"
+authors:
+  - family-names: "Agis-Torres"
+    given-names: "Ángel"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    email: "aagisto@ucm.es"
+    orcid: "https://orcid.org/0000-0002-3548-7264"
+  - family-names: "Fernandes"
+    given-names: "Vítor Samuel"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    email: "vleite@ucm.es"
+    orcid: "https://orcid.org/0000-0001-6060-9035"
+  - family-names: "Navarro-Dorado"
+    given-names: "Jorge"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    email: "jorgend@ucm.es"
+    orcid: "https://orcid.org/0000-0002-4643-3528"
+  - family-names: "Muñoz-Picos"
+    given-names: "Mercedes"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    orcid: "https://orcid.org/0000-0002-1679-9588"
+  - family-names: "Climent"
+    given-names: "Belén"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    email: "bcliment@ucm.es"
+    orcid: "https://orcid.org/0000-0003-0852-9227"
+  - family-names: "Hernández"
+    given-names: "Medardo"
+    affiliation: "Physiology Department, Complutense University of Madrid"
+    email: "medardo@ucm.es"
+    orcid: "https://orcid.org/0000-0001-7165-2135"
+license: GPL-3.0-or-later
+doi: 10.5281/zenodo.21002297
+repository-code: "https://github.com/aagisto-maker/emgteach"
+url: "https://github.com/aagisto-maker/emgteach"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21002297
+    description: "Concept DOI for emgteach (always resolves to the latest version)"
+  - type: doi
+    value: 10.5281/zenodo.24117162
+    description: "Version-specific DOI for emgteach v3.11.0"
+  # (History: v3.10.1 = 10.5281/zenodo.23729099; v3.10.0 = 10.5281/zenodo.23675472; v3.9.1 = 10.5281/zenodo.23587320; v3.9.0 = 10.5281/zenodo.23399825; v3.8.0 = 10.5281/zenodo.23361729; v3.7.2 = 10.5281/zenodo.23103390; v3.7.1 = 10.5281/zenodo.22999304; v3.7.0 = 10.5281/zenodo.22976106 (the version the article describes); v3.6.0 = 10.5281/zenodo.22842108; v3.5.0 = 10.5281/zenodo.22832544; v3.4.0 = 10.5281/zenodo.22756263; v3.3.0 = 10.5281/zenodo.22750425; v3.2.0 = 10.5281/zenodo.22744748; v3.1.2 = 10.5281/zenodo.22736393; v3.1.1 = 10.5281/zenodo.22734612; v3.1.0 = 10.5281/zenodo.22733151; v3.0.0 = 10.5281/zenodo.22365602; v2.0.0 = 10.5281/zenodo.21440569; v1.4.1 = 10.5281/zenodo.21362249; v1.4.0 = 10.5281/zenodo.21361921; v1.3.0 = 10.5281/zenodo.21292858; v1.2.1 = 10.5281/zenodo.21289905; v1.2.0 = 10.5281/zenodo.21281048; v1.1.2 = 10.5281/zenodo.21203730; v1.1.1 = 10.5281/zenodo.21197452; v1.1.0 = 10.5281/zenodo.21197169; v1.0.0 = 10.5281/zenodo.21002298; v0.3.0 = 10.5281/zenodo.20723266; v0.1.0 = 10.5281/zenodo.20110846.)
+keywords:
+  - electromyography
+  - EMG
+  - EDF
+  - EDF+
+  - biopotential
+  - Arduino
+  - BITalino
+  - MyoWare
+  - physiology
+  - teaching
+  - open-source-hardware
+references:
+  - type: article
+    title: "Silent corruption of EDF recordings during real-time biopotential streaming: a buffered-write solution"
+    authors:
+      - family-names: "Agis-Torres"
+        given-names: "Ángel"
+    year: 2026
+    notes: "Manuscript under review (JORS); the DOI resolves to the reproducibility package."
+    doi: 10.5281/zenodo.21163099

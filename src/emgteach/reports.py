@@ -1,0 +1,1339 @@
+"""PDF session reports for EMG recordings.
+
+Builds a one-click, self-contained PDF from the offline-analysis result
+dictionary produced by :class:`emgteach.workers.AnalysisWorker`:
+
+- a header (title, generation date, optional student name/code, source
+  file),
+- the main signal plot (filtered EMG + envelope) with the event
+  annotations marked,
+- a metrics table (RMS, MNF, MDF, fatigue evidence, IEMG, duration),
+- the processing configuration that was used (filters, sampling rate,
+  channel),
+- a reproducible footer (package version, git commit, generation
+  timestamp).
+
+The layout uses ``reportlab``; the signal figure is rendered with
+matplotlib's Agg backend into an in-memory PNG. The module is therefore
+Qt-free and unit-testable without a display.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from xml.sax.saxutils import escape
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+from emgteach.charts import (
+    COLOUR_1,
+    COLOUR_2,
+    draw_coactivation_chart,
+    draw_contraction_chart,
+    draw_load_chart,
+    draw_steps_chart,
+    draw_train_chart,
+)
+from emgteach.contractions import load_of_each
+from emgteach.fatigue import FATIGUE, INCONCLUSIVE, NO_FATIGUE
+from emgteach.figures import (
+    draw_amplitude_frequency_panel,
+    draw_emd_note,
+    draw_psd_panel,
+    draw_raw_panel,
+    draw_rms_panel,
+)
+from emgteach.guided import (
+    REST_WARN_MV,
+    fatigue_unmeasured,
+    gradation_reference_text,
+    is_monotonic,
+    mdf_trend_applies,
+    weak_signal_warning,
+)
+from emgteach.i18n import tr
+from emgteach.modes import protocol_label
+from emgteach.mvc import (
+    AUTO_COLOR,
+    NO_LOAD_MSG,
+    mark_excess_over_100,
+    overlay_curves,
+)
+from emgteach.panels import BY_PID as PANEL_BY_PID
+from emgteach.panels import panel_title
+from emgteach.phases import NO_CALIBRATION, reference_source_text
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+__all__ = [
+    "build_mvc_report",
+    "build_session_report",
+    "git_commit_hash",
+]
+
+_HEADER_BG = colors.HexColor("#1a2a3a")
+_ROW_ALT = colors.HexColor("#eef3f8")
+
+# Distinct colour per Jonsson load level (matches the MVC tab); out-of-range
+# values get a red ring.
+_LEVEL_COLORS = {"static": "#2E86C1", "median": "#E67E22", "peak": "#8E44AD"}
+_OUT_COLOR = "#cc0000"
+
+
+def git_commit_hash(short: bool = True) -> str | None:
+    """Return the current git commit hash, or ``None`` if unavailable.
+
+    Runs ``git rev-parse`` in the package directory, so it resolves the
+    hash when running from a source checkout and quietly returns ``None``
+    when the package was installed without the repository (e.g. a wheel).
+    """
+    cmd = ["git", "rev-parse"]
+    if short:
+        cmd.append("--short")
+    cmd.append("HEAD")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:  # pragma: no cover — git missing / sandboxed
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _app_version() -> str:
+    try:
+        import emgteach
+
+        return getattr(emgteach, "__version__", "?")
+    except Exception:  # pragma: no cover — defensive
+        return "?"
+
+
+def _fatigue_text(result: Mapping[str, Any], suffix: str = "") -> str:
+    """The verdict in words; ``suffix`` ``"_2"`` reads the second muscle's."""
+    slope = float(result.get("mdf_slope" + suffix, 0.0))
+    r2 = float(result.get("fat_r_squared" + suffix, 0.0))
+    decline = float(result.get("fat_pct_decline" + suffix, 0.0))
+    verdict = result.get("fat_verdict" + suffix, INCONCLUSIVE)
+    carga = result.get("load") if not suffix else None
+    if carga is not None and carga.mdf_trend is not None:
+        # The held load is judged by the significance of the MDF's fall and
+        # its size, not by R² (guided.load_verdict).
+        tend = carga.mdf_trend
+        p = "< 0.001" if tend.p < 0.001 else f"= {tend.p:.3f}"
+        if verdict == FATIGUE:
+            return tr("Yes — MDF falls {pct:.0f} % in {s:.0f} s (p {p}, R²={r2:.2f})").format(
+                pct=-(tend.change_pct or 0.0), s=carga.seconds, p=p, r2=tend.r2)
+        if verdict == NO_FATIGUE:
+            return tr("No — MDF changes {pct:+.0f} % (p {p}): less than a 10 % fall").format(
+                pct=tend.change_pct or 0.0, p=p)
+        return tr("Not conclusive — the MDF's fall is not significant (p {p}). "
+                  "Fatigue needs a load held long enough for the trend to show.").format(p=p)
+    if verdict == FATIGUE:
+        return tr(
+            "Yes — MDF falls {slope:+.2f} Hz/s "
+            "({decline:.1f}% decline, R²={r2:.2f})"
+        ).format(slope=slope, decline=decline, r2=r2)
+    if verdict == NO_FATIGUE:
+        return tr(
+            "No — MDF stable or rising ({slope:+.2f} Hz/s, R²={r2:.2f})"
+        ).format(slope=slope, r2=r2)
+    # The report is what the student hands in, so this cannot read as "no".
+    return tr(
+        "Not conclusive — the trend does not fit ({slope:+.2f} Hz/s, R²={r2:.2f}). "
+        "Fatigue needs a contraction held long enough for the trend to show."
+    ).format(slope=slope, r2=r2)
+
+
+def _render_signal_figure(result: Mapping[str, Any]) -> BytesIO:
+    """Render the filtered EMG + envelope with markers into a PNG buffer."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(7.2, 4.2), dpi=150)
+    FigureCanvasAgg(fig)
+    ax1, ax2 = fig.subplots(2, 1, sharex=True)
+
+    times = result["times"]
+    markers = list(result.get("markers", []))
+
+    ax1.plot(times, result["emg_filtered"], color=COLOUR_1, linewidth=0.6)
+    ax1.set_ylabel(tr("Filtered (mV)"))
+    ax1.set_title(
+        tr("EMG signal — channel «{name}»").format(name=result.get("channel_name", ""))
+    )
+
+    ax2.plot(times, result["emg_envelope"], color="#D6620C", linewidth=0.9)
+    ax2.set_ylabel(tr("Envelope (mV)"))
+    ax2.set_xlabel(tr("Time (s)"))
+
+    for ax in (ax1, ax2):
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(float(times[0]), float(times[-1]))
+        for t_mark, _lbl in markers:
+            ax.axvline(t_mark, color="#E67E22", linestyle="--", linewidth=1.0, alpha=0.8)
+
+    ymax = ax1.get_ylim()[1]
+    for t_mark, lbl in markers:
+        ax1.text(
+            t_mark, ymax, str(lbl)[:14], fontsize=6, rotation=90,
+            va="top", ha="right", color="#E67E22",
+        )
+
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    return buf
+
+
+def _draw_report_markers(ax: Any, markers: list, x0: float, x1: float) -> None:
+    for t_mark, _lbl in markers:
+        if x0 <= float(t_mark) <= x1:
+            ax.axvline(float(t_mark), color="#E67E22", ls="--", lw=1.0, alpha=0.8)
+
+
+def _draw_analysis_panel(
+    fig: Any, ax: Any, idx: int, result: Mapping[str, Any],
+    x_range: tuple[float, float] | None = None,
+) -> None:
+    """Draw one analysis panel (0-7) onto ``ax``, mirroring the on-screen
+    panels of the Analysis tab so the report shows the same graphs.
+
+    ``x_range`` restricts the time axis of the time-domain panels (0-3, 5, 6)
+    to ``(start, end)`` seconds; ``None`` uses the whole recording. The PSD (4)
+    and RMS-vs-MDF (7) panels are not time-domain and ignore it.
+    """
+    r = result
+    times = r["times"]
+    x0, x1 = float(times[0]), float(times[-1])
+    if x_range is not None:
+        x0, x1 = float(x_range[0]), float(x_range[1])
+    markers = list(r.get("markers", []))
+    grid = dict(ls="--", color="#DDDDDD", alpha=0.8)
+
+    if idx == 0:
+        # Both muscles, each against its own axis, when there are two: the
+        # same drawing as the screen's (emgteach.figures.draw_raw_panel).
+        draw_raw_panel(ax, r, lw=0.8, fontsize=8)
+        ax.set_xlim(x0, x1)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 1:
+        ax.plot(times, r["emg_filtered"], color="#1f77b4", lw=1.0,
+                label=tr("Filtered (20-450 Hz)"))
+        # The red of the rectified trace in panel 5, not the second
+        # muscle's: in the pair, that red means the other muscle.
+        ax.plot(times, r["emg_rectified"], color="#E74C3C", lw=1.0, alpha=0.9,
+                label=tr("Rectified"))
+        ax.set_ylabel(tr("Amplitude (mV)"), fontsize=8)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(loc="upper right", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 2:
+        ax.plot(times, r["emg_rectified"], color="#E74C3C", lw=1.0, alpha=0.6,
+                label=tr("Rectified"))
+        ax.plot(times, r["emg_envelope"], color="#9467bd", lw=1.8,
+                label=tr("LP envelope"))
+        ax.plot(times, r["rms_sliding"], color="#2ca02c", lw=1.3, ls="--",
+                label=tr("RMS envelope"))
+        ax.set_ylabel(tr("Amplitude (mV)"), fontsize=8)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(loc="upper right", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 3:
+        ax.plot(times, r["emg_envelope_normalised"], color="#9467bd", lw=1.6,
+                label=tr("Normalised envelope (max=1)"))
+        ax.axhline(1.0, color="#E74C3C", ls=":", lw=1.3, alpha=0.8)
+        ax.set_ylabel(tr("Amplitude (0-1)"), fontsize=8)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(0, 1.15)
+        ax.legend(loc="upper right", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 4:
+        draw_psd_panel(ax, r, lw=1.6, fontsize=8)
+    elif idx == 5:
+        # With two muscles, one axis each: the screen's drawing
+        # (emgteach.figures.draw_rms_panel).
+        draw_rms_panel(ax, r, lw=1.3, ms=3, fontsize=8)
+        ax.set_xlim(x0, x1)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 6:
+        dos = r.get("mdf_seg_2") is not None
+        n1 = r.get("channel_name") or tr("Muscle {n}").format(n=1)
+        ax.scatter(r["t_seg"], r["mdf_seg"], s=18, alpha=0.7,
+                   color=COLOUR_1 if dos else "#666666",
+                   label=(tr("{muscle}: MDF per window").format(muscle=n1)
+                          if dos else tr("MDF per window")))
+        if len(r["t_seg"]) >= 2:
+            ax.plot(r["t_seg"], r["fat_fitted"],
+                    color=COLOUR_1 if dos else "#E74C3C", lw=2.2,
+                    label=(tr("{muscle}: trend").format(muscle=n1)
+                           if dos else tr("Trend (degree 2)")))
+        if dos:
+            n2 = r.get("channel_name_2") or tr("Muscle {n}").format(n=2)
+            ax.scatter(r["t_seg_2"], r["mdf_seg_2"], s=18, alpha=0.7,
+                       color=COLOUR_2,
+                       label=tr("{muscle}: MDF per window").format(muscle=n2))
+            if len(r["t_seg_2"]) >= 2:
+                ax.plot(r["t_seg_2"], r["fat_fitted_2"], color=COLOUR_2, lw=2.2,
+                        label=tr("{muscle}: trend").format(muscle=n2))
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_ylabel("MDF (Hz)", fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 7:
+        # The path through time, as on screen
+        # (emgteach.figures.draw_amplitude_frequency_panel).
+        draw_amplitude_frequency_panel(ax, r, lw=1.4, ms=4, fontsize=8)
+    elif idx == 8:
+        # Each muscle against its own maximum — see the same panel in the
+        # analysis tab for why two muscles must never share a millivolt axis.
+        # Same rule as the screen, decided in one place: this is the figure
+        # the student hands in, so it must not be able to disagree with the
+        # panel it was read from.
+        curve1, curve2 = overlay_curves(r)
+        ax.plot(times, curve1.data, color=COLOUR_1, lw=1.6,
+                label=str(r.get("channel_name") or tr("Muscle {n}").format(n=1)))
+        if curve2 is not None:
+            ax.plot(times, curve2.data, color=COLOUR_2, lw=1.6,
+                    label=str(r.get("channel_name_2")
+                              or tr("Muscle {n}").format(n=2)))
+        ax.set_ylabel(curve1.ylabel, fontsize=8)
+        mark_excess_over_100(ax, curve1.ylabel)
+        if curve1.warning:
+            ax.text(0.5, 1.005, curve1.warning, transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=6.5,
+                    color="#B0243A")
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(loc="upper right", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 9:
+        emg_lbl = r.get("channel_name") or "EMG"
+        ax.plot(times, r["emg_envelope"], color=COLOUR_1, lw=1.5,
+                label=tr("EMG — {ch} (electrical)").format(ch=emg_lbl))
+        mmg = r.get("acc_mmg_envelope")
+        if mmg is not None:
+            ax2 = ax.twinx()
+            ax2.plot(times, mmg, color="#2ca02c", lw=1.4,
+                     label=tr("MMG envelope (mechanical)"))
+            ax2.set_ylabel(tr("MMG (g)"), fontsize=8, color="#2ca02c")
+            ax2.tick_params(axis="y", labelsize=7, colors="#2ca02c")
+            ax2.set_xlim(x0, x1)
+        ax.set_ylabel(tr("EMG (mV)"), fontsize=8, color=COLOUR_1)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(loc="upper left", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+    elif idx == 10:
+        freqs = r.get("acc_tremor_freqs")
+        psd = r.get("acc_tremor_psd")
+        if freqs is not None and psd is not None:
+            ax.plot(freqs, psd, color="#8c564b", lw=1.5)
+            peak = float(r.get("acc_tremor_peak_hz", 0.0))
+            if peak > 0:
+                ax.axvline(peak, color="#E74C3C", ls="--", lw=1.6,
+                           label=tr("Peak: {hz:.1f} Hz").format(hz=peak))
+                ax.legend(fontsize=7)
+            ax.set_xlim(0, 25)
+        ax.set_xlabel(tr("Frequency (Hz)"), fontsize=8)
+        ax.set_ylabel("PSD (g²/Hz)", fontsize=8)
+    elif idx == 11:
+        emg_lbl = r.get("channel_name") or "EMG"
+        ax.plot(times, r["emg_envelope"], color=COLOUR_1, lw=1.5,
+                label=tr("EMG — {ch} (electrical)").format(ch=emg_lbl))
+        move = r.get("acc_movement_envelope")
+        if move is not None:
+            ax2 = ax.twinx()
+            ax2.plot(times, move, color="#D35400", lw=1.4,
+                     label=tr("Movement (limb kinematics)"))
+            ax2.set_ylabel(tr("Movement (a.u.)"), fontsize=8, color="#D35400")
+            ax2.tick_params(axis="y", labelsize=7, colors="#D35400")
+            ax2.set_xlim(x0, x1)
+            draw_emd_note(ax, r)
+        ax.set_ylabel(tr("EMG (mV)"), fontsize=8, color=COLOUR_1)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.set_xlim(x0, x1)
+        ax.legend(loc="upper left", fontsize=7)
+        _draw_report_markers(ax, markers, x0, x1)
+
+    # Every title from the panel table, as on screen; panel 9's from
+    # overlay_curves(), which also picks its unit and its reading.
+    if idx == 8:
+        ax.set_title(curve1.title, fontsize=9, pad=16 if curve1.warning else 6)
+    elif idx in PANEL_BY_PID:
+        ax.set_title(panel_title(idx, r), fontsize=9)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, **grid)
+
+
+def _render_one_panel_figure(
+    result: Mapping[str, Any], idx: int,
+    x_range: tuple[float, float] | None = None,
+) -> BytesIO:
+    """Render a single analysis panel into a PNG buffer."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(7.2, 2.9), dpi=150)
+    FigureCanvasAgg(fig)
+    ax = fig.subplots(1, 1)
+    _draw_analysis_panel(fig, ax, idx, result, x_range)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    return buf
+
+
+#: The width a table has to fit in: A4 minus the two 2 cm margins.
+TABLE_WIDTH_CM = 17.0
+
+
+def _cell_styles(size: float) -> tuple[ParagraphStyle, ParagraphStyle]:
+    """The header's and the body's paragraph styles, at *size* points."""
+    head = ParagraphStyle("th", fontName="Helvetica-Bold", fontSize=size,
+                          leading=size + 2, textColor=colors.white)
+    body = ParagraphStyle("td", fontName="Helvetica", fontSize=size,
+                          leading=size + 2)
+    return head, body
+
+
+def _styled_table(
+    data: list[list[str]], widths: list[float] | None = None,
+    size: float = 9, spans: list[int] | tuple[int, ...] = (),
+) -> Table:
+    """A table whose columns fit the page and whose cells wrap.
+
+    *widths* are in centimetres, one per column, adding up to
+    :data:`TABLE_WIDTH_CM` at most; without them the first column takes
+    five centimetres and the rest share what is left. Every cell is a
+    paragraph, so a long value — the list of analysed fragments, a fatigue
+    verdict that says why it is not conclusive — breaks into lines instead
+    of running off the page, and a header of three words wraps rather than
+    invading the next column. *spans* are the rows whose value spans every
+    column but the first.
+
+    (Every table used to get two columns of 7 and 8 cm; reportlab repeats
+    the last width for the columns that have none, so the seven-column
+    table of contractions was 55 cm wide and lost its last four columns
+    off the page.)
+    """
+    n_cols = max(len(row) for row in data) if data else 1
+    if widths is None:
+        first = 5.0 if n_cols > 1 else TABLE_WIDTH_CM
+        rest = (TABLE_WIDTH_CM - first) / max(1, n_cols - 1)
+        widths = [first] + [rest] * (n_cols - 1)
+    if len(widths) != n_cols:
+        raise ValueError(f"{n_cols} columns, {len(widths)} widths")
+    if sum(widths) > TABLE_WIDTH_CM + 1e-6:
+        raise ValueError(
+            f"the columns add up to {sum(widths):.1f} cm, over {TABLE_WIDTH_CM:.0f}")
+    head, body = _cell_styles(size)
+    cells = [
+        [Paragraph(escape(str(c)), head if i == 0 else body) for c in row]
+        for i, row in enumerate(data)
+    ]
+    # The header row repeats when a table breaks across pages: a header left
+    # alone at the foot of one page, its rows on the next, reads as two tables.
+    table = Table(cells, hAlign="LEFT", colWidths=[w * cm for w in widths], repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), _HEADER_BG),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _ROW_ALT]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    style += [("SPAN", (1, r), (-1, r)) for r in spans]
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _render_chart(draw, *args, **kwargs) -> BytesIO:
+    """One of the two summary charts of :mod:`emgteach.charts`, as a PNG."""
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(6.4, 2.4), dpi=150, constrained_layout=True)
+    draw(fig, *args, **kwargs)
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    return buf
+
+
+def _seccion_contracciones(story: list, result: Mapping[str, Any], h2, normal) -> None:
+    """One row per contraction, as on screen — the chart first, the table under it.
+
+    This is the table a laboratory report is built from; without it the
+    student copies numbers off a screenshot. Same rows, same columns, same
+    rounding as the tab, so the two cannot be compared and found different.
+    The chart above it is the one the tab shows in front of the table.
+    """
+    filas = result.get("contractions") or []
+    if not filas:
+        return
+    dos = bool(result.get("channel_name_2"))
+    con_emd = any(f.emd_ms is not None for f in filas)
+    story.append(Paragraph(tr("Contractions"), h2))
+    # The series and the relation first; then, with two muscles, the
+    # categories and the dominance side by side; and, when the guided
+    # force-velocity wizard left its load markers, the three panels by load.
+    # The tab shows the same views one at a time.
+    n1 = str(result.get("channel_name") or tr("Muscle {n}").format(n=1))
+    n2 = str(result.get("channel_name_2") or "") if dos else ""
+    razon = float((result.get("detection") or {}).get("both_ratio", 0.5))
+    cargas = load_of_each(filas, result.get("fv_loads") or [])
+    vistas: list = ["both"]
+    if dos:
+        vistas.append(("category", "dominance"))
+    if any(c is not None for c in cargas):
+        vistas.append("load")
+    for vista in vistas:
+        try:
+            story.append(Image(
+                _render_chart(draw_contraction_chart, filas, name_1=n1, name_2=n2,
+                              both_ratio=razon, view=vista, loads=cargas),
+                width=16 * cm, height=6 * cm,
+            ))
+            story.append(Spacer(1, 0.15 * cm))
+        except Exception:  # pragma: no cover — a chart must never sink the report
+            pass
+    cab = ["#", tr("Start (s)"), tr("Duration (s)")]
+    if dos:
+        cab.append(tr("Muscle"))
+    cab += [tr("RMS (mV)"), tr("Peak (% MVC)"), tr("MDF (Hz)")]
+    if con_emd:
+        cab.append(tr("EMD (ms)"))
+    rows = [cab]
+    for f in filas:
+        fila = [str(f.n), f"{f.start_s:.1f}", f"{f.duration_s:.2f}"]
+        if dos:
+            fila.append(str(f.muscle))
+        fila += [
+            f"{f.rms_mv:.3f}",
+            "" if f.peak_pct is None else f"{f.peak_pct:.0f}",
+            "" if f.mdf_hz is None else f"{f.mdf_hz:.0f}",
+        ]
+        if con_emd:
+            fila.append("" if f.emd_ms is None else f"{f.emd_ms:.0f}")
+        rows.append(fila)
+    anchos = ([0.9, 2.0, 2.3] + ([2.8] if dos else []) + [2.2, 2.5, 2.1]
+              + ([2.2] if con_emd else []))
+    story.append(_styled_table(rows, anchos))
+    emd = result.get("emd_ms_mean")
+    if emd is not None:
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph(
+            tr("Electromechanical delay: {ms:.0f} ms (mean of {n})").format(
+                ms=float(emd), n=sum(1 for f in filas if f.emd_ms is not None)),
+            normal,
+        ))
+    story.append(Spacer(1, 0.4 * cm))
+
+
+def _seccion_gradacion(story: list, result: Mapping[str, Any], h2, normal) -> None:
+    """The gradation, when the recording is one: the bars and their numbers.
+
+    The level held is the mean of the envelope over each step after its
+    first second (emgteach.guided); the tab shows the same bars and the same
+    two columns beside the contraction table.
+    """
+    pasos = result.get("grad_steps") or []
+    if not pasos:
+        return
+    story.append(Paragraph(tr("Guided session: graded contractions"), h2))
+    try:
+        story.append(Image(_render_chart(draw_steps_chart, pasos,
+                                         reference=gradation_reference_text(result)),
+                           width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.15 * cm))
+    except Exception:  # pragma: no cover — a chart must never sink the report
+        pass
+    rows = [[tr("Step"), tr("Asked (% MVC)"), tr("Held (% MVC)"), tr("Held (mV)"),
+             tr("RMS (mV)"), tr("MDF (Hz)")]]
+    for paso in pasos:
+        rows.append([
+            str(paso.k), f"{paso.target_pct:.0f}",
+            "" if paso.held_pct is None else f"{paso.held_pct:.0f}",
+            f"{paso.held_mv:.3f}", f"{paso.rms_mv:.3f}",
+            "" if paso.mdf_hz is None else f"{paso.mdf_hz:.0f}",
+        ])
+    story.append(_styled_table(rows, [1.6, 3.0, 3.0, 2.8, 2.8, 2.6]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(
+        (tr("Each step held more than the one before.") if is_monotonic(pasos)
+         else tr("Not every step held more than the one before.")) + " "
+        + ((gradation_reference_text(result) or "") + " ")
+        + tr(
+            "Held: the mean of the envelope over the plateau of each step's "
+            "contraction, after its first second (the reach) and before its "
+            "letting go. Each step is the contraction begun after its cue and "
+            "followed past its end: the subject begins and lets go late."), normal))
+    story.append(Spacer(1, 0.4 * cm))
+
+
+def _seccion_fatiga_guiada(story: list, result: Mapping[str, Any], h2, normal) -> None:
+    """The fixed load held, when the recording is one.
+
+    The MDF and MNF against time with the RMS in grey, and a table with the
+    straight line through each measure: where it began and ended, its slope,
+    R² and p, and when the MDF had fallen 10 %. A rest that was too high
+    before the effort is said, since it makes the electrodes suspect.
+    """
+    carga = result.get("load")
+    nota = result.get("load_note")
+    if carga is None and not nota:
+        return
+    story.append(Paragraph(tr("Guided session: fatigue with a fixed load"), h2))
+    if carga is None:
+        story.append(Paragraph(nota, normal))
+        story.append(Spacer(1, 0.4 * cm))
+        return
+    trozo = result.get("load_piece")
+    try:
+        story.append(Image(_render_chart(draw_load_chart, carga, piece=trozo),
+                           width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.15 * cm))
+    except Exception:  # pragma: no cover — a chart must never sink the report
+        pass
+
+    def fila(nombre, tend, fmt, unidad):
+        if tend is None:
+            return [nombre, "", "", "", "", "", ""]
+        return [nombre, format(tend.start, fmt), format(tend.end, fmt),
+                format(tend.change_pct or 0.0, "+.0f") + " %",
+                format(tend.slope * 60.0, "+.2f" if unidad == "mV" else "+.1f"),
+                f"{tend.r2:.2f}", "< 0.001" if tend.p < 0.001 else f"{tend.p:.3f}"]
+
+    rows = [[tr("Measure"), tr("Start"), tr("End"), tr("Change"), tr("Slope per minute"),
+             tr("R²"), tr("p")],
+            fila(tr("MDF (Hz)"), carga.mdf_trend, ".0f", "Hz"),
+            fila(tr("MNF (Hz)"), carga.mnf_trend, ".0f", "Hz"),
+            fila(tr("RMS (mV)"), carga.rms_trend, ".3f", "mV")]
+    story.append(_styled_table(rows, [2.6, 2.0, 2.0, 2.0, 3.0, 1.6, 1.8]))
+    story.append(Spacer(1, 0.15 * cm))
+    t10 = (tr("MDF −10 % at {t:.0f} s").format(t=carga.t_mdf_10)  # noqa: RUF001
+           if carga.t_mdf_10 is not None else tr("MDF never fell 10 %"))
+    story.append(Paragraph(tr(
+        "Held {s:.0f} s, from 2 s after the activity began to when it fell. MDF and MNF "
+        "of each 1 s window every 0.5 s; the line is fitted to all of them, and the "
+        "chart draws their means over 5 s. Start and end are the line's.").format(
+            s=carga.seconds) + " " + t10 + "."
+        + ("" if trozo is None else " " + tr(
+            "Fragments were chosen: the load is read on the longest piece of it they "
+            "keep, {a:.1f}–{b:.1f} s of the recording.").format(a=trozo[0], b=trozo[1])),  # noqa: RUF001
+        normal))
+    story.append(Paragraph(tr(
+        "Fatigue moves the spectrum down: the conduction velocity of the fibres falls "
+        "and the units fire more in step, so MDF and MNF fall. The amplitude may hold "
+        "or even rise, as more motor units are recruited to keep the same load. It "
+        "counts as fatigue when the MDF's slope is significant (p < 0.01) and its "
+        "line falls at least 10 %."), normal))
+    reposo = result.get("rest_mv")
+    if reposo is not None and reposo > REST_WARN_MV:
+        story.append(Paragraph(tr(
+            "High rest ({mv:.3f} mV): check the electrodes' contact.").format(mv=reposo),
+            normal))
+    debil = weak_signal_warning(result.get("load_ratio"))
+    if debil:
+        story.append(Paragraph(debil, normal))
+    story.append(Spacer(1, 0.4 * cm))
+
+
+def _seccion_rapidas(story: list, result: Mapping[str, Any], h2, normal) -> None:
+    """The quick contractions: the trace with its peaks and floor, and what
+    of the floor is the measure's and what is the subject's."""
+    tren = result.get("train")
+    nota = result.get("train_note")
+    if tren is None and not nota:
+        return
+    story.append(Paragraph(tr("Guided session: quick repeated contractions"), h2))
+    if tren is None:
+        story.append(Paragraph(nota, normal))
+        story.append(Spacer(1, 0.4 * cm))
+        return
+    try:
+        story.append(Image(_render_chart(draw_train_chart, tren), width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.15 * cm))
+    except Exception:  # pragma: no cover — a chart must never sink the report
+        pass
+
+    def num(x, fmt):
+        return "" if x is None else format(x, fmt)
+
+    rows = [[tr("Measure"), tr("Value")],
+            [tr("Contractions"), str(tren.n)],
+            [tr("Rate (per second)"), num(tren.rate_hz, ".1f")],
+            [tr("Peaks, last third against the first"), num(tren.peak_change_pct, "+.0f") + " %"],
+            [tr("Floor, first third (% of the peak)"), num(tren.floor_start_pct, ".0f")],
+            [tr("Floor, last third (% of the peak)"), num(tren.floor_end_pct, ".0f")],
+            [tr("Floor the measure alone leaves at this rate (% of the peak)"),
+             num(tren.processing_floor_pct, ".0f")],
+            [tr("Rest before the train (mV)"), num(tren.rest_mv, ".3f")]]
+    story.append(_styled_table(rows, [11.0, 4.0]))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(tr(
+        "Measured on a 50 ms moving RMS, not on the envelope: at four or five "
+        "contractions a second the envelope's 5 Hz filter alone keeps the floor "
+        "at a fifth to a third of the peak. «The measure alone» is the floor the "
+        "same measure leaves with a perfect relaxation at the rate achieved; "
+        "what is above it is the subject's, mostly a relaxation not completed. "
+        "This is not the treppe, a mechanical phenomenon of electrical "
+        "stimulation; and the peaks are EMG, not force."), normal))
+    story.append(Spacer(1, 0.4 * cm))
+
+
+def _seccion_calibracion(story: list, result: Mapping[str, Any], h2, normal) -> None:
+    """The reference, and everything the application knows about it.
+
+    One row per muscle: the value, where it came from and how many
+    repetitions counted; what the task reached against it, measured the way
+    the reference is, as the envelope's peak, on the whole recording phase;
+    and, when that crosses the
+    limit, the sentence that says the maximum was not one. Then the
+    repetitions themselves, with what the other muscle did during each — the
+    cross-talk that used to be shown for four seconds in the calibration
+    panel and then vanished.
+    """
+    refs = [
+        (result.get("channel_name"), result.get("mvc_ref"),
+         result.get("mvc_ref_source", NO_CALIBRATION),
+         len(result.get("cal_reps", {}).get(0, ()) or ())),
+        (result.get("channel_name_2"), result.get("mvc_ref_2"),
+         result.get("mvc_ref_source_2", NO_CALIBRATION),
+         len(result.get("cal_reps", {}).get(1, ()) or ())),
+    ]
+    refs = [r for r in refs if r[0] and r[1]]
+    if not refs:
+        return
+    story.append(Paragraph(tr("Calibration (maximal voluntary contraction)"), h2))
+    picos = result.get("task_peak_pct", {}) or {}
+    rows = [[tr("Muscle"), tr("Reference"), tr("Source"), tr("Task maximum")]]
+    for name, ref, fuente, n_reps in refs:
+        assert ref is not None              # refs keeps only those with one
+        pico = picos.get(name)
+        rows.append([
+            str(name), f"{float(ref):.3f} mV",
+            reference_source_text(str(fuente), int(n_reps)),
+            "" if pico is None else tr("{pct:.0f} % MVC (envelope peak)").format(
+                pct=pico),
+        ])
+    story.append(_styled_table(rows, [3.0, 3.0, 6.0, 5.0]))
+    if result.get("mvc_implausible"):
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph(tr(
+            "The task exceeds the reference by a wide margin: the calibration "
+            "did not capture a maximum, so every percentage in this report is "
+            "too high in the same proportion. Calibrate again with a brief, "
+            "intense maximal contraction, not a sustained push against something "
+            "fixed."
+        ), normal))
+
+    reps = result.get("cal_rep_values") or {}
+    nombres = result.get("cal_channel_names") or {}
+    if reps:
+        story.append(Spacer(1, 0.2 * cm))
+        story.append(Paragraph(tr("Calibration repetitions"), normal))
+        filas = [[tr("Muscle"), tr("Repetition"), tr("Value"),
+                  tr("Other muscle during it")]]
+        keep = result.get("cal_keep") or {}
+        for idx, valores in sorted(reps.items()):
+            nombre = str(nombres.get(idx, tr("Channel {n}").format(n=int(idx) + 1)))
+            kept = keep.get(idx)
+            for v in valores:
+                descartada = kept is not None and v.rep not in kept
+                etiqueta = f"{v.rep}" + (f" ({tr('discarded')})" if descartada else "")
+                cross = "" if v.crosstalk_pct is None else f"{v.crosstalk_pct:.0f} %"
+                filas.append([nombre, etiqueta, f"{v.value_mv:.3f} mV", cross])
+        story.append(_styled_table(filas, [3.5, 3.5, 4.0, 6.0]))
+    story.append(Spacer(1, 0.4 * cm))
+
+
+def build_session_report(
+    pdf_path: str | Path,
+    result: Mapping[str, Any],
+    meta: Mapping[str, Any] | None = None,
+    panels: list[int] | None = None,
+    time_range: tuple[float, float] | None = None,
+) -> str:
+    """Write a one-page PDF report of an analysed EMG session.
+
+    Parameters
+    ----------
+    pdf_path : str or pathlib.Path
+        Output path for the PDF (parent directory must exist).
+    result : mapping
+        The analysis-result dictionary from
+        :class:`emgteach.workers.AnalysisWorker` (arrays, metrics,
+        ``markers`` and ``config``).
+    meta : mapping, optional
+        Extra fields: ``student_code`` (str), ``protocol`` (str),
+        ``device`` (str, the header's equipment), ``derived`` (str, the
+        header's note of a file derived from another), ``generated_at``
+        (datetime), ``version`` (str) and ``commit`` (str). Missing fields
+        are filled in automatically (version from the package, commit from
+        git, timestamp from now).
+    panels : list of int, optional
+        Indices (0-7) of the analysis panels to include as graphs, in the
+        order given. When ``None`` (default), the legacy single combined
+        signal figure (filtered EMG + envelope) is used instead.
+    time_range : tuple of float, optional
+        ``(start, end)`` seconds to show on the time-domain panels; ``None``
+        (default) plots the whole recording.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    meta = dict(meta or {})
+    pdf_path = str(pdf_path)
+
+    generated_at: datetime = meta.get("generated_at") or datetime.now()
+    version: str = meta.get("version") or _app_version()
+    commit = meta.get("commit", git_commit_hash())
+    student_code = str(meta.get("student_code", "")).strip()
+    protocol = str(meta.get("protocol", "")).strip()
+    device = str(meta.get("device", "")).strip()
+    derived = str(meta.get("derived", "")).strip()
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ReportTitle", parent=styles["Title"], fontSize=16, spaceAfter=6
+    )
+    normal = styles["Normal"]
+    h2 = styles["Heading2"]
+
+    story: list[Any] = []
+    story.append(Paragraph(tr("EMG recording and analysis report"), title_style))
+
+    # The code alone. The report is what gets handed in and marked, and a
+    # name on it is a name in every copy of it.
+    header_lines = [tr("Generated on: {dt:%Y-%m-%d %H:%M}").format(dt=generated_at)]
+    if student_code:
+        header_lines.append(
+            tr("Test identifier: {code}").format(code=student_code))
+    edf_name = Path(str(result.get("edf_path", ""))).name
+    if edf_name:
+        header_lines.append(tr("File: {name}").format(name=edf_name))
+    if protocol:
+        header_lines.append(
+            tr("Protocol: {p}").format(p=protocol_label(protocol) or protocol)
+        )
+    if derived:
+        # «DERIVED from …»: a tuned copy says so in its header, and so
+        # must the report made from it.
+        header_lines.append(tr("Provenance: {note}").format(note=derived))
+    for line in header_lines:
+        story.append(Paragraph(line, normal))
+    story.append(Spacer(1, 0.4 * cm))
+
+    # Graphs: either the chosen analysis panels, or (default) the legacy
+    # combined signal figure.
+    if panels is None:
+        story.append(
+            Image(_render_signal_figure(result), width=16 * cm, height=9.33 * cm)
+        )
+        story.append(Spacer(1, 0.4 * cm))
+    elif panels:
+        story.append(Paragraph(tr("Graphs"), h2))
+        for idx in panels:
+            if idx not in PANEL_BY_PID:
+                continue
+            story.append(
+                Image(_render_one_panel_figure(result, idx, time_range),
+                      width=16 * cm, height=6.44 * cm)
+            )
+            story.append(Spacer(1, 0.3 * cm))
+
+    # Metrics: one column per muscle when there are two, so the second
+    # muscle's numbers — which the worker computes — reach the paper.
+    story.append(Paragraph(tr("Metrics"), h2))
+    n1 = str(result.get("channel_name") or tr("Muscle {n}").format(n=1))
+    n2 = str(result.get("channel_name_2") or "")
+    dos = bool(n2) and result.get("mnf_2") is not None
+    metrics = [[tr("Metric"), n1, n2] if dos else [tr("Metric"), tr("Value")]]
+    generales = [
+        [tr("Duration"), f"{float(result.get('duration', 0.0)):.1f} s"],
+    ]
+    # State the analysed window/fragments explicitly when not the whole file.
+    full_dur = float(result.get("full_duration_s", 0.0))
+    segments = result.get("roi_segments")
+    roi_a = result.get("roi_start_s")
+    roi_b = result.get("roi_end_s")
+    if segments and len(segments) > 1:
+        kept = sum(float(b) - float(a) for a, b in segments)
+        frag_txt = "; ".join(f"{float(a):.2f}-{float(b):.2f}" for a, b in segments)
+        generales.append(
+            [
+                tr("Analysed fragments"),
+                tr("{n} fragments ({d:.2f} s of {full:.1f} s): {list} s").format(
+                    n=len(segments), d=kept, full=full_dur, list=frag_txt
+                ),
+            ]
+        )
+    elif roi_a is not None and roi_b is not None and (
+        float(roi_a) > 0.0 or float(roi_b) < full_dur - 1e-6
+    ):
+        generales.append(
+            [
+                tr("Analysed window"),
+                tr("{a:.2f}-{b:.2f} s of {d:.1f} s").format(
+                    a=float(roi_a), b=float(roi_b), d=full_dur
+                ),
+            ]
+        )
+    spans: list[int] = []
+    for fila in generales:
+        if dos:
+            spans.append(len(metrics))       # one value across both columns
+            fila = [*fila, ""]
+        metrics.append(fila)
+
+    def _por_musculo(label: str, key: str, fmt: str) -> list[str]:
+        celdas = [label, fmt.format(float(result.get(key, 0.0) or 0.0))]
+        if dos:
+            celdas.append(fmt.format(float(result.get(key + "_2", 0.0) or 0.0)))
+        return celdas
+
+    metrics += [
+        _por_musculo(tr("Global RMS"), "rms_global", "{:.4f} mV"),
+        _por_musculo(tr("Mean frequency (MNF)"), "mnf", "{:.1f} Hz"),
+        _por_musculo(tr("Median frequency (MDF)"), "mdf", "{:.1f} Hz"),
+        _por_musculo("iEMG", "iemg", "{:.3f} mV·s"),
+    ]
+    if mdf_trend_applies(result.get("guided_session")):
+        # A fixed load the chosen fragments do not keep is not measured, and
+        # the row says so rather than give the general fit's verdict.
+        motivo = fatigue_unmeasured(result)
+        metrics.append([tr("Fatigue evidence"), motivo or _fatigue_text(result)]
+                       + ([_fatigue_text(result, "_2")] if dos else []))
+    story.append(_styled_table(metrics, [5.0, 6.0, 6.0] if dos else [5.0, 12.0],
+                               spans=spans))
+    story.append(Spacer(1, 0.4 * cm))
+
+    # The calibration, when the recording carries one. Everything the
+    # application learned about the reference used to stay in the log, or in
+    # a panel that closed itself: which repetitions counted, what the task
+    # reached against the maximum, whether the maximum was one at all, and
+    # what the other muscle did during each effort. The report is what the
+    # student hands in, so this is where it has to be.
+    _seccion_calibracion(story, result, h2, normal)
+    _seccion_gradacion(story, result, h2, normal)
+    _seccion_fatiga_guiada(story, result, h2, normal)
+    _seccion_rapidas(story, result, h2, normal)
+    _seccion_contracciones(story, result, h2, normal)
+
+    # Co-activation, when the recording can support it: two muscles, and an
+    # MVC reference for each. The two mean activations go beside every index,
+    # never the index alone — see emgteach.coactivation.
+    coact = result.get("coactivation")
+    if coact:
+        story.append(Spacer(1, 0.4 * cm))
+        story.append(Paragraph(tr("Co-activation (Falconer-Winter)"), h2))
+        if not result.get("coactivation_from_markers", True):
+            story.append(Paragraph(
+                f"<font color='#B0243A'>"
+                f"{tr('Whole recording — accept the fragments for one value per window')}"
+                f"</font>", normal
+            ))
+        cab = tr("Mean activation (% MVC)")
+        n1 = str(result.get("channel_name") or tr("Muscle {n}").format(n=1))
+        n2 = str(result.get("channel_name_2") or tr("Muscle {n}").format(n=2))
+        if result.get("coactivation_from_markers", True):
+            try:
+                story.append(Image(
+                    _render_chart(draw_coactivation_chart, coact, name_1=n1, name_2=n2),
+                    width=16 * cm, height=6 * cm,
+                ))
+                story.append(Spacer(1, 0.15 * cm))
+            except Exception:  # pragma: no cover — a chart must never sink the report
+                pass
+        rows = [[tr("Window"), f"{n1} — {cab}", f"{n2} — {cab}",
+                 tr("Co-activation index")]]
+        for res in coact:
+            rows.append([
+                # With its seconds: the last window is closed at the
+                # end of the effort rather than at the end of the
+                # recording, and the report is what gets handed in.
+                f"{res.label}  ({res.window_s[0]:.1f}–"  # noqa: RUF001
+                f"{res.window_s[1]:.1f} s)".strip(),
+                f"{res.mean_1:.0f}",
+                f"{res.mean_2:.0f}",
+                res.reason or f"{res.index:.0f} %",
+            ])
+        story.append(_styled_table(rows, [5.0, 3.5, 3.5, 5.0], size=8))
+        story.append(Spacer(1, 0.4 * cm))
+    elif result.get("coactivation_reason"):
+        story.append(Spacer(1, 0.4 * cm))
+        story.append(Paragraph(tr("Co-activation (Falconer-Winter)"), h2))
+        story.append(Paragraph(str(result["coactivation_reason"]), normal))
+        story.append(Spacer(1, 0.4 * cm))
+
+    # Configuration used.
+    story.append(Paragraph(tr("Configuration used"), h2))
+    cfg = result.get("config", {})
+    config_rows = [
+        [tr("Parameter"), tr("Value")],
+        [tr("Sampling rate"), f"{float(result.get('fs', 0.0)):.0f} Hz"],
+        [tr("Channel"), ", ".join(
+            str(n) for n in (result.get("channel_name"),
+                             result.get("channel_name_2")) if n)],
+    ]
+    if cfg:
+        config_rows += [
+            [tr("Band-pass"), f"{cfg.get('f_low')}-{cfg.get('f_high')} Hz"],
+            [tr("Notch (mains)"), f"{cfg.get('f_notch')} Hz"],
+            [tr("Envelope (low-pass)"), f"{cfg.get('f_env')} Hz"],
+            [tr("RMS window"), f"{cfg.get('rms_window_ms')} ms"],
+        ]
+    k = (result.get("detection") or {}).get("k")
+    if k is not None:
+        # What the contractions were found with: the rows, and the
+        # co-activation windows read off them, move with it.
+        config_rows.append([tr("Detection sensitivity (k)"), f"{float(k):.1f}"])
+    config_rows.append(
+        [tr("Device"), device or tr("not stored in the EDF")]
+    )
+    story.append(_styled_table(config_rows, [5.0, 12.0]))
+
+    def _footer(canvas: Any, doc: Any) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        parts = [f"emgteach v{version}"]
+        if commit:
+            parts.append(f"commit {commit}")
+        parts.append(tr("generated {dt:%Y-%m-%d %H:%M}").format(dt=generated_at))
+        canvas.drawString(2 * cm, 1 * cm, "  ·  ".join(parts))
+        canvas.drawRightString(
+            A4[0] - 2 * cm, 1 * cm, tr("page {n}").format(n=doc.page)
+        )
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        leftMargin=2 * cm,
+        rightMargin=2 * cm,
+        topMargin=1.6 * cm,
+        bottomMargin=1.6 * cm,
+        title=tr("EMG report"),
+    )
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return pdf_path
+
+
+def _render_mvc_figure(
+    result: Mapping[str, Any], x_range: tuple[float, float] | None = None,
+) -> BytesIO:
+    """Render the MVC panels (filtered+rectified / envelope / normalised) and
+    the muscle-load APDF into a PNG buffer. ``x_range`` restricts the time axis
+    of the three time-series panels; the APDF (a distribution) ignores it."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    # 14 by 21 cm, the size the report prints it at: drawn larger and shrunk
+    # into the page, its 6 pt legends came out at under 5 pt.
+    fig = Figure(figsize=(5.51, 8.27), dpi=150, constrained_layout=True)
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(4, 1)
+
+    ref = result.get("mvc_amplitude_ref")
+    norm = result.get("emg_norm")
+    n = int(result.get("n_plot", len(result["emg_envelope"])))
+    t = result["t_plot"]
+    dim = result.get("dimension", "")
+
+    ax = axes[0]
+    # The MVC tab's colours for the same panel; its red is not the second
+    # muscle's.
+    ax.plot(t, result["emg_filtered"][:n], color=COLOUR_1, lw=0.6,
+            label=tr("Filtered EMG (20-450 Hz)"))
+    ax.plot(t, result["emg_rectified"][:n], color="tomato", lw=0.6, alpha=0.8,
+            label=tr("Rectified EMG"))
+    ax.set_title(tr("1. Filtered and rectified EMG signal"), fontsize=9)
+    ax.set_ylabel(tr("Amplitude ({units})").format(units=dim), fontsize=8)
+    ax.legend(loc="upper right", fontsize=7)
+    ax.grid(True, color="#DDDDDD", alpha=0.5)
+    ax.tick_params(labelsize=7)
+
+    ax = axes[1]
+    ax.plot(t, result["emg_envelope"][:n], color="purple", lw=1.5,
+            label=tr("LP envelope (zero-phase)"))
+    if ref:
+        ax.axhline(float(ref), color="red", ls="--", lw=1.2)
+    ax.set_title(
+        tr("2. Envelope and MVC reference amplitude") if ref
+        else tr("2. Envelope (no calibration in this recording)"),
+        fontsize=9,
+    )
+    ax.set_ylabel(tr("Amplitude ({units})").format(units=dim), fontsize=8)
+    ax.legend(loc="upper right", fontsize=7)
+    ax.grid(True, color="#DDDDDD", alpha=0.5)
+    ax.tick_params(labelsize=7)
+
+    ax = axes[2]
+    # The report is what the student hands in. A panel that quietly vanished
+    # would leave them holding a document that does not say what is missing.
+    if norm is None:
+        ax.text(0.5, 0.5, tr(NO_LOAD_MSG), ha="center", va="center",
+                fontsize=8, color="#666666", wrap=True, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(tr("3. Signal as % MVC — not available"), fontsize=9)
+    else:
+        ax.fill_between(t, norm[:n], alpha=0.25, color="darkorange")
+        ax.plot(t, norm[:n], color="darkorange", lw=1.5)
+        ax.axhline(100.0, color="red", ls=":", lw=1.0)
+        ax.set_title(
+            tr("3. EMG signal normalised to MVC (% MVC)"), fontsize=9)
+        ax.set_ylabel(tr("% MVC"), fontsize=8)
+        ax.set_xlabel(tr("Time (s)"), fontsize=8)
+        ax.grid(True, color="#DDDDDD", alpha=0.5)
+        ax.tick_params(labelsize=7)
+
+    if x_range is not None:
+        for tax in (axes[0], axes[1], axes[2]):
+            tax.set_xlim(*x_range)
+
+    ax = axes[3]
+    apdf = result.get("apdf")
+    if apdf is None:
+        ax.text(0.5, 0.5, tr(NO_LOAD_MSG), ha="center", va="center",
+                fontsize=8, color="#666666", wrap=True, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_title(
+            tr("Muscle-load distribution (APDF, Jonsson)"), fontsize=9)
+        buf = BytesIO()
+        fig.savefig(buf, format="png")
+        buf.seek(0)
+        return buf
+
+    ax.plot(apdf.load, apdf.cumulative, color="#0047AB", lw=1.5)
+    for lvl, prob, name in (
+        (apdf.static, 10, tr("Static")),
+        (apdf.median, 50, tr("Median")),
+        (apdf.peak, 90, tr("Peak")),
+    ):
+        base = _LEVEL_COLORS[lvl.name]
+        ax.axhline(prob, color="#cccccc", ls=":", lw=0.6)
+        ax.plot([lvl.value], [prob], "o", ms=7, zorder=5,
+                markerfacecolor=base, markeredgecolor=base, markeredgewidth=0.6,
+                label=f"{name}: {lvl.value:.0f} % (≤{lvl.limit:.0f} %)")
+        if lvl.exceeds:
+            ax.plot([lvl.value], [prob], "o", ms=16, zorder=6,
+                    markerfacecolor="none", markeredgecolor=_OUT_COLOR,
+                    markeredgewidth=2.0)
+    ax.set_title(tr("Muscle-load distribution (APDF, Jonsson)"), fontsize=9)
+    ax.set_xlabel(tr("Load (% MVC)"), fontsize=8)
+    ax.set_ylabel(tr("Cumulative % of time"), fontsize=8)
+    ax.set_ylim(0, 100)
+    # Legend key for the out-of-range marker (the red ring drawn above).
+    ax.plot([], [], "o", linestyle="none", markersize=9,
+            markerfacecolor="none", markeredgecolor=_OUT_COLOR,
+            markeredgewidth=1.8, label=tr("Out of normal range"))
+    ax.legend(loc="lower right", fontsize=7)
+    ax.grid(True, color="#DDDDDD", alpha=0.5)
+    ax.tick_params(labelsize=7)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    return buf
+
+
+def build_mvc_report(
+    pdf_path: str | Path,
+    result: Mapping[str, Any],
+    meta: Mapping[str, Any] | None = None,
+    time_range: tuple[float, float] | None = None,
+) -> str:
+    """Write a one-page PDF report of an MVC normalisation + muscle-load run.
+
+    Mirrors :func:`build_session_report` (header, figure, metrics table,
+    reproducible footer) but for the MVC-tab result: the three normalisation
+    panels, the Jonsson muscle-load APDF, and a metrics table with the
+    static / median / peak load levels against their recommended limits.
+    ``meta`` takes the same fields as :func:`build_session_report` plus
+    ``channel`` (the label of the channel normalised) and ``fragments``
+    (the analysed stretches, ``(start, end)`` seconds).
+
+    Returns the path written.
+    """
+    meta = dict(meta or {})
+    pdf_path = str(pdf_path)
+
+    generated_at: datetime = meta.get("generated_at") or datetime.now()
+    version: str = meta.get("version") or _app_version()
+    commit = meta.get("commit", git_commit_hash())
+    student_code = str(meta.get("student_code", "")).strip()
+    protocol = str(meta.get("protocol", "")).strip()
+    device = str(meta.get("device", "")).strip()
+    derived = str(meta.get("derived", "")).strip()
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ReportTitle", parent=styles["Title"], fontSize=16, spaceAfter=6
+    )
+    normal = styles["Normal"]
+    h2 = styles["Heading2"]
+
+    story: list[Any] = []
+    story.append(Paragraph(tr("MVC normalisation and muscle-load report"), title_style))
+
+    header_lines = [tr("Generated on: {dt:%Y-%m-%d %H:%M}").format(dt=generated_at)]
+    if student_code:
+        header_lines.append(
+            tr("Test identifier: {code}").format(code=student_code))
+    edf_name = Path(str(result.get("edf_path", ""))).name
+    if edf_name:
+        header_lines.append(tr("File: {name}").format(name=edf_name))
+    if protocol:
+        header_lines.append(
+            tr("Protocol: {p}").format(p=protocol_label(protocol) or protocol)
+        )
+    if derived:
+        # «DERIVED from …»: a tuned copy says so in its header, and so
+        # must the report made from it.
+        header_lines.append(tr("Provenance: {note}").format(note=derived))
+    for line in header_lines:
+        story.append(Paragraph(line, normal))
+    story.append(Spacer(1, 0.4 * cm))
+
+    story.append(Image(_render_mvc_figure(result, time_range), width=14 * cm, height=21 * cm))
+
+    dim = result.get("dimension", "")
+    duration = float(result["tiempo"][-1]) if len(result.get("tiempo", [])) else 0.0
+    apdf = result.get("apdf")
+    ref = result.get("mvc_amplitude_ref")
+
+    def _level_cell(lvl: Any) -> str:
+        status = tr("exceeds limit") if lvl.exceeds else tr("within limit")
+        return f"{lvl.value:.0f} {tr('% MVC')}  (≤ {lvl.limit:.0f} %) — {status}"
+
+    story.append(PageBreak())
+    story.append(Paragraph(tr("Metrics"), h2))
+    metrics = [
+        [tr("Metric"), tr("Value")],
+        [tr("MVC reference:"), f"{ref:.4f} {dim}" if ref else tr("none")],
+        [
+            tr("Reference from:"),
+            reference_source_text(
+                str(result.get("mvc_ref_source", NO_CALIBRATION)),
+                int(result.get("cal_reps_n", 0)),
+            ),
+        ],
+        [tr("Mean activation:"),
+         "—" if result.get("mean_norm") is None
+         else f"{float(result['mean_norm']):.1f} {tr('% MVC')}"],
+        [tr("Duration"), f"{duration:.1f} s"],
+        [tr("Channel"), str(meta.get("channel") or result.get("channel_name") or "")],
+    ]
+    # Which stretches the numbers come from, and which the graphs show:
+    # neither used to be anywhere on the paper.
+    fragments = [(float(a), float(b)) for a, b in (meta.get("fragments") or [])]
+    if fragments:
+        kept = sum(b - a for a, b in fragments)
+        metrics.append([
+            tr("Analysed fragments"),
+            tr("{n} fragments ({d:.2f} s of {full:.1f} s): {list} s").format(
+                n=len(fragments), d=kept, full=duration,
+                list="; ".join(f"{a:.2f}-{b:.2f}" for a, b in fragments)),
+        ])
+    if time_range is not None:
+        metrics.append([tr("Graphs show"),
+                        f"{float(time_range[0]):.1f}-{float(time_range[1]):.1f} s"])
+    # Without a reference the three load levels do not exist, so the report
+    # says so instead of printing verdicts against limits computed from
+    # nothing.
+    if apdf is not None:
+        metrics += [
+            [f"{tr('Static')} (P10)", _level_cell(apdf.static)],
+            [f"{tr('Median')} (P50)", _level_cell(apdf.median)],
+            [f"{tr('Peak')} (P90)", _level_cell(apdf.peak)],
+        ]
+    story.append(_styled_table(metrics, [5.0, 12.0]))
+    if apdf is None:
+        story.append(Spacer(1, 0.3 * cm))
+        story.append(Paragraph(
+            f"<font color='{AUTO_COLOR}'>{tr(NO_LOAD_MSG)}</font>", normal
+        ))
+
+    # What the numbers were computed with — the filters, the device — as in
+    # the session report: a paper that cannot say which settings it
+    # describes cannot be reproduced.
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph(tr("Configuration used"), h2))
+    config_rows = [
+        [tr("Parameter"), tr("Value")],
+        [tr("Sampling rate"), f"{float(result.get('fs', 0.0)):.0f} Hz"],
+    ]
+    if result.get("f_low") is not None:
+        config_rows += [
+            [tr("Band-pass"), f"{result.get('f_low')}-{result.get('f_high')} Hz"],
+            [tr("Notch (mains)"), f"{result.get('f_notch')} Hz"],
+            [tr("Envelope (low-pass)"), f"{result.get('f_env')} Hz"],
+        ]
+    config_rows.append([tr("Device"), device or tr("not stored in the EDF")])
+    story.append(_styled_table(config_rows, [5.0, 12.0]))
+
+    def _footer(canvas: Any, doc: Any) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        parts = [f"emgteach v{version}"]
+        if commit:
+            parts.append(f"commit {commit}")
+        parts.append(tr("generated {dt:%Y-%m-%d %H:%M}").format(dt=generated_at))
+        canvas.drawString(2 * cm, 1 * cm, "  ·  ".join(parts))
+        canvas.drawRightString(
+            A4[0] - 2 * cm, 1 * cm, tr("page {n}").format(n=doc.page)
+        )
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        leftMargin=2 * cm,
+        rightMargin=2 * cm,
+        topMargin=1.6 * cm,
+        bottomMargin=1.6 * cm,
+        title=tr("MVC report"),
+    )
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return pdf_path

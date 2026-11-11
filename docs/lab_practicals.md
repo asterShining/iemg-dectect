@@ -1,0 +1,777 @@
+# Surface-EMG lab practicals with emgteach
+
+> **Course:** Physiology (teaching laboratory).
+> **Software:** emgteach (branch `feat/ui-levels`, September 2026).
+> **Hardware:** BITalino with surface electrodes; the single-muscle practical
+> also runs on an Arduino with a MyoWare 2.0 sensor.
+>
+> This guide has **three practicals**, one for each practical the application
+> offers in its selector. Each holds several **exercises**, each with what is
+> done, what the application computes on its own, what to write down and what
+> to reason about. Instructors pick the exercises that fit the time; each stands
+> on its own.
+
+---
+
+## How this is organised, and why
+
+The application is configured **by choosing the practical**, not by setting
+controls. The drop-down in the top-right corner has three options, and from that
+choice follow the channel count, the accelerometer, what the recording asks for
+and which panels the analysis offers. The coloured band beside it names the
+level.
+
+| Practical in this guide | Selector option | Level | Channels | What is learnt |
+|---|---|---|---|---|
+| 1 | **Single-muscle contraction** | basic (green) | 1 | from the signal to the number: amplitude, spectrum, fatigue, load |
+| 2 | **Agonist / antagonist contraction** | intermediate (amber) | 2 | comparing two muscles in % MVC; co-activation |
+| 3 | **Muscle kinematics** | advanced (purple) | 1 + accelerometer | force-velocity, electromechanical delay, tremor |
+
+The window's three tabs are always the same: **Acquisition** (record), **Analysis**
+(read a recording) and **MVC normalisation** (express the task as a share of the
+maximum and measure the load). What changes with the practical is what each tab
+shows.
+
+---
+
+## General objectives
+
+By the end, students should be able to:
+
+1. Place the electrodes and obtain a clean surface-EMG signal, and tell a good
+   signal from a spoiled one on the screen.
+2. Explain the processing chain (filtering, rectification, envelope) and which
+   question each measure answers: RMS and iEMG (how much the muscle activates),
+   MNF and MDF (at which frequencies), % MVC (how much, relative to its own
+   maximum).
+3. Calibrate a **maximum voluntary contraction** that really is maximal, and
+   recognise in the analysis when it was not.
+4. Read the **contraction table** and the **summary cards** against the reference
+   ranges, and say what is usual and what is a question.
+5. Detect **fatigue** from the spectral shift, and tell «not detected» from «not
+   conclusive».
+6. Compare an **agonist and its antagonist** in % MVC and measure their
+   **co-activation**.
+7. Assess the **muscle load** of a task with Jonsson's method.
+8. In the advanced practical, obtain a muscle's **force-velocity relationship**,
+   measure its **electromechanical delay** and see **physiological tremor**.
+
+---
+
+## Safety and hygiene
+
+- **Very low-voltage** equipment, battery or USB powered; no electrical risk to
+  the subject.
+- **Disposable** electrodes, one set per person; clean the skin with alcohol and
+  let it dry. Do not reuse electrodes between subjects.
+- Subjects with skin lesions in the area should abstain.
+- Maximal efforts are brief, intense contractions (1.5 s), made by the subject alone
+  and never against another person. Anyone who feels joint pain stops.
+
+---
+
+## Before starting (common to the three practicals)
+
+### 0 · Choose the practical
+
+In the drop-down in the top-right corner, before anything else. The application
+remembers the last choice; check it every session. The quick guide (**«Guide»**
+button) walks through what follows in five steps, and every box of the
+application has a **«?»** in its corner explaining what it does.
+
+### 1 · Place the electrodes
+
+General rule: two active electrodes over the **muscle belly**, aligned with the
+fibres and **2 cm apart centre to centre**; the reference over **bone**, and **only
+one even with two channels**, because both sensors share the board's ground (on the
+forearm, the **olecranon**). Clean, dry skin, no cream. If the signal comes out
+small, move the pair one or two centimetres towards the tendon.
+
+The pair this guide uses in practicals 1 and 2 is the forearm pair: **flexor carpi
+radialis** (FCR, anterior side) and **extensor carpi radialis** (ECR, posterior
+side). Exactly where, with which palpation check and which mistake is easy to
+make, is in [`colocacion_electrodos_antebrazo_es.md`](colocacion_electrodos_antebrazo_es.md)
+(Spanish). Practical 3 uses the biceps brachii, with the accelerometer on the
+wrist.
+
+![Where the muscles are and where the electrodes go](electrodos_antebrazo_en.png)
+
+Channel 1 at 5 cm from the medial epicondyle, channel 2 at 5 cm from the
+lateral epicondyle, one reference on the olecranon.
+
+### 2 · Connect
+
+**Acquisition** tab, **Device configuration** box:
+
+- In the single-muscle practical the device is chosen (BITalino over Bluetooth or
+  Arduino + MyoWare over USB). In the other two the box reads **«Device:
+  BITalino»** with no drop-down, because they need two channels or the
+  accelerometer, which only the BITalino has. In every case the address (MAC or
+  port) can be changed; the BITalino is best identified by its **MAC**, which is
+  the same on every computer.
+- **Output path and file**: the folder the EDF will be saved to.
+- **Labels**: each muscle's name, in the order of the board's channels (**Muscle
+  1 is the one recorded on A1**). In the pair, the boxes start empty with a hint
+  («Agonist, e.g. FCR»). What is typed here is what the lanes, the tables and the
+  report will say.
+- **Test identifier**: a student, a pair, a bench or an attempt; it goes into the
+  EDF header and the report.
+- Press **Connect**. The indicator turns yellow (connected) and green when data
+  arrives.
+- The board is reached when **Start recording** is pressed. If the board does not
+  answer, wait for the warning and press **Retry**; if Windows gives an error
+  opening the port, switch the board off and on and press **Start recording**
+  again.
+
+### 3 · Test the signal before recording
+
+With the connection made, ask for a brief contraction and watch the two plots:
+the raw signal should burst into symmetric spikes and the envelope rise and
+return to baseline. At rest the baseline is almost flat. The event log warns of
+two frequent faults: a **flat channel** (electrode loose or not connected) and
+**saturation** (poor contact, or an electrode over the tendon).
+
+### 4 · How a recording with calibration runs
+
+Measurements in **% MVC** need to know that muscle's maximum in that session. The
+application asks for it with a wizard that writes everything into the same file,
+without stopping the recording:
+
+1. **Warm-up (10 s).** Two or three easy contractions of each muscle. The first
+   maximal contraction of a session is never the most intense one, and this corrects
+   that in part.
+2. **Three brief maximal efforts**, 1.5 s each, with a 3 s countdown and 2 s of
+   rest between them. The screen says «Maximum, brief and intense!».
+3. With two muscles, the same for the second one.
+4. In the pair practical a 5 s **preparation** follows and the **recording** of
+   the task begins. In the other two practicals the calibration is launched with
+   the **«Calibrate MVC»** button while recording, and the recording goes on.
+5. **And in the pair practical the guide goes on into the task**: six
+   contractions led by one muscle, six by the other, and last the manoeuvre
+   that works both at once, held once for about eight seconds. The row of
+   boxes along the
+   bottom of the panel is the map — one per contraction, in the colour that
+   muscle has in the plots, filled as each one is detected. The six are free,
+   at your own pace, and the session **moves on by itself** once it has counted
+   the six and the muscle has been at rest for a second — not on the sixth
+   itself, which would cut its own tail off. **«Done — next» (or the space
+   bar)** moves it on whenever you want. If the detector misses one, that box
+   stays empty and the phase moves on anyway after 12 s with nothing new
+   counted; the button brings that forward. The count that counts is the one
+   the analysis makes afterwards.
+
+The reference is **the highest point the envelope reaches across the three
+repetitions**. Why brief?
+Because a sustained contraction shows a peak at its start and then a
+plateau, and a task's brief efforts reach that peak. Measured on the plateau, the
+reference fell short and the task beat it: 135 % of "maximum" on one
+recording.
+
+> **The manoeuvre of the maximum decides the practical.**
+>
+> - **Flexor (FCR, channel 1): a contraction of wrist flexion at maximal power,
+>   clenching the fist with all your strength.**
+> - **Extensor (ECR, channel 2): a contraction of wrist extension at maximal power,
+>   with the hand open and the fingers stretched out as far as they go.**
+> - **Brief and intense**, within the 1.5 s of the count: not a sustained push
+>   against something fixed. A repetition that comes out weak is no good; the
+>   application lets you discard it afterwards.
+> - **Why this manoeuvre.** A surface electrode on the forearm does not see one
+>   muscle but the compartment beneath it, with the finger flexors or extensors
+>   in it, and the reference is only a yardstick if it recruits the same muscle
+>   mass as the task. The task includes a grip: clenching the fist brings in the
+>   finger flexors, whereas a push of the wrist leaves them out and, because the
+>   forearm has to be braced, switches on the antagonist as well.
+> - **Immediate check:** when the task is over, the analysis summary states the
+>   **task maximum** in % MVC. Above 150 % it is flagged in red, «not a maximum»,
+>   and the calibration has to be repeated. Between 90 and 125 % is what
+>   well-calibrated sessions give.
+
+### 5 · What happens on stopping
+
+On **Stop recording**, the Acquisition tab shows the **whole session** with its
+phases shaded (warm-up, each calibration repetition, preparation, recording), and
+the **Analysis** tab analyses the recording **on its own**, with nothing to
+press. On switching to Analysis a box points at the next step:
+
+1. **«Calibration repetitions…»**: the three repetitions of each muscle with their
+   values. Untick the weak ones and accept; the reference is recomputed. This
+   goes first because **every percentage is measured against that reference**.
+2. **«Select fragments…»**: one row per contraction found, with its start, end,
+   duration and, with two muscles, which one led it. The calibration is left out
+   on its own. The dialogue takes you through **three steps**, and a yellow line
+   over its plot says which one you are on:
+   1. **Sensitivity.** Move it until the count beside it matches what was done:
+      in the pair, 6 flexions, 6 extensions and 1 grip; in kinematics, one per
+      lift. The dashed line is the threshold. Each proposed row holds the
+      whole contraction, from where the envelope leaves rest (the dotted «rest» line)
+      to where it returns to it: there is no need to widen it by hand.
+   2. **Each contraction in turn**, with ▶ or by clicking it on the plot:
+      **Keep it** if it is right, **Drop it** if it should not count (it stays
+      hatched and can be brought back), **Split it** if one stretch holds two
+      peaks (a dash-dotted line shows the cut first), or **drag it** onto the
+      right contraction, where it snaps into place. A **dotted** stretch is
+      activity the threshold left out: a click adds it. In kinematics, a lift
+      the wizard did not ask for stays dotted; added with a click, it comes in
+      with no load. In the pair, one button per muscle confirms who led it.
+   3. **«Use these fragments»**, once everything is reviewed and the count
+      matches. Nothing is applied until then.
+
+   In the pair there is also the **co-activation threshold** (from what share
+   of the stronger muscle the weaker one counts as co-activating), which
+   changes the names and not the rows. The **fine adjustment** (minimum
+   duration, gap joining, split between contractions) stays folded and is
+   rarely needed. The dialogue's «?» repeats these steps.
+
+Then read. The tab has three areas: the **panels** (top; the mouse wheel scrolls
+them; the ▲▼ and ▶◀ buttons on the left change the scales), the **contraction
+chart** and the **summary** (bottom) and, in the pair, the **co-activation
+chart**. The contraction chart shows one view at a time, chosen on its title
+line, and opens on the **relation**, which is the one a conclusion is read
+from. With one muscle it is **amplitude against MDF**, contraction by
+contraction and joined in order: a drift towards more amplitude and less
+frequency is fatigue, towards more of both is more force, and the other two
+quadrants are their opposites. With two muscles it is **one muscle against the
+other**, with the wedge in which the application calls a contraction
+co-activation: a flexion falls on one axis, an extension on the other and a grip
+inside the wedge. With two muscles there are also **«Category»**, each muscle's
+mean per manoeuvre with every contraction as a dot, and **«Who leads»**, one bar
+per contraction to the right when the first muscle led and to the left when the
+second did, with the co-activation band in the middle. **«Series»** follows the
+contractions in order with the fitted trend and the MDF on the right axis, and in
+kinematics **«By load»** groups amplitude, velocity and electromechanical delay by the
+load the wizard marked. **«Table»** is the numbers, which are the ones copied
+into the tables of this guide. The co-activation chart is one line per window:
+the name on the left, the seconds on the right and, between them, the index as
+a purple bar or, when it is not reported, a gold block and a small square in
+the colour of the muscle that worked alone; the legend above says what each
+colour is, and the means in % MVC are in its «Table».
+**«Generate PDF report»** produces the deliverable with the
+figures, the calibration, the charts, the tables and the cards.
+
+### 6 · Following the session on a phone
+
+In a group practical, **one person drives the equipment** and the rest follow the
+signal in their phone's browser. In Acquisition, tick **«Broadcast to phones (in
+the laboratory)»**; an address `http://…:8080/?k=…` and a **QR** button appear.
+Everyone on the same Wi-Fi, and the address typed with `http://`. The phone only
+watches and downloads: the session as CSV while recording and, when the operator
+analyses, the PDF report and the results. Each activation generates a new code;
+links from a previous practical expire.
+
+---
+
+## Practical 1 — Single-muscle contraction (basic level)
+
+**Set-up.** One channel over the FCR (or over the biceps if a large muscle is
+preferred), reference on the olecranon. Selector on **Single-muscle contraction**.
+
+**What the application shows in this practical.** Three panels by default: **1.
+Raw**, **2. Env. norm.** (the envelope scaled to its maximum) and **3. PSD** (the
+spectrum, with the spectrum *before* the filter in grey behind). Below, the
+**contraction table** with one row per effort (start, duration, RMS, peak in %
+MVC, MDF) and the **summary cards** (MNF, MDF, MDF slope, fatigue, task maximum,
+global RMS, iEMG, duration, MVC). **«More panels…»** reveals the rest for anyone
+who wants to look further.
+
+**Fragments.** Check that every contraction has its row; the very brief ones may
+come out dotted or unmarked, and are added by hand (clicking the dotted one or
+with «Add fragment»). The editor does not propose a contraction that stays less
+than 0.5 s above the threshold, and in this practical there is no expected count
+to warn about it.
+
+### Exercise 1a · First recording: from the signal to the number
+
+**Objective.** Obtain a clean recording and recognise the representations of the
+signal.
+
+**Procedure.**
+1. **Start recording**. Sequence: 5 s rest, light contraction 4 s, rest 5 s,
+   intense contraction 4 s, rest 5 s. The application marks each contraction's
+   onset by itself (**Auto-onset**, threshold = rest + k × noise, with k = 3).
+2. **Stop**. Go to **Analysis** and accept the fragments it proposes.
+
+**Data to record.** From the contraction table:
+
+| Contraction | Duration (s) | RMS (mV) | MDF (Hz) |
+|---|---|---|---|
+| light | | | |
+| intense | | | |
+
+**Questions.**
+- Why is the raw signal positive and negative and the envelope positive only?
+  What does rectification do?
+- In panel 3, the grey spectrum is the signal before the filter and the blue one
+  after. What has gone? At which frequency was it? And below 20 Hz?
+- Is the RMS of the intense contraction larger than that of the light one? By how
+  many times? Which two nervous mechanisms explain the growing amplitude?
+- Do the automatic onsets agree with what the envelope shows?
+
+### Exercise 1b · Graded effort: more force, more signal, but not twice as much
+
+**Objective.** Check that amplitude grows with activation monotonically but
+**not linearly**, and see what normalisation is for.
+
+**Procedure.** With the guided session **«Graded contractions»**.
+1. On the line of «Calibrate MVC», choose **«Graded contractions»** in the chooser (it opens
+   on «Free recording») and press **Start recording**. The application asks for
+   the warm-up and the three maximal efforts (section 4), counts 5 s and directs
+   the steps: five 4 s isometric contractions against the table, at **20, 40, 60
+   and 80 % of the bar and at the maximum**, with 6 s of rest between them. Every
+   phase change is announced with a tone («Tone» box); the panel shows the bar
+   with the band of the step asked for, which rises to its level over 1.5 s.
+   **Rise slowly to the mark (1-2 s) and hold it there**: a jump to the level
+   leaves a peak at the start that is not what is asked for.
+2. The recording **stops by itself** at the end. In Analysis, review the
+   calibration repetitions; the five steps are already the five rows of the
+   table, with no fragments to choose.
+
+**Data to record.** From the contraction table and the **«Steps»** view:
+
+| Step asked for | Held (% MVC) | RMS (mV) | MDF (Hz) |
+|---|---|---|---|
+| 20 % | | | |
+| 40 % | | | |
+| 60 % | | | |
+| 80 % | | | |
+| maximum | | | |
+
+«Held» is the mean of the envelope over the plateau of each step's contraction,
+from 1.5 s after its start (the reach) and before its letting go. Each step is the
+contraction begun after its cue and followed up to 1.5 s past its end: one
+begins and lets go some tenths of a second late. The gradation's MVC is the
+highest half-second mean of the calibration, not its peak, as the level held is
+a mean too.
+
+**Questions.**
+- Does the RMS rise at each step? How close to the step asked for did each one
+  stay, and which was hardest to hold? The bar measures **activation**, not force:
+  did 40 % of the bar feel like 40 % of your force? Comment on why sEMG is a good
+  indicator of activation and a poor dynamometer.
+- Does the MDF change from one step to the next? Which motor units are added as
+  the force rises, and how would that affect the spectrum?
+- Compare your RMS at 100 % with a classmate's. Who "makes more force"? Why is
+  that comparison invalid, while the % MVC column is valid?
+- What does the **«Task maximum»** card say? If it is above 100 %, what happened
+  in the calibration?
+
+### Exercise 1c · A fixed load: the signature of fatigue
+
+**Objective.** Detect fatigue from the shift of the spectrum towards lower
+frequencies, and understand what it takes to be able to claim it.
+
+**Background.** Holding a contraction lowers the pH and the conduction velocity
+of the fibres, and the motor units fire more in step; the spectrum compresses
+downwards and **the MDF falls**. What the RMS does depends on the effort: with a
+**submaximal** load it holds or **rises**, because more units are recruited to
+keep the same weight up; in a **maximal** contraction there are no units left
+to add and the RMS **falls**. The specific proof of fatigue is the fall of the
+MDF, not of the amplitude.
+
+**Procedure.** With the guided session **«Fatigue with a fixed load»**, on the
+**forearm flexor**: the electrodes are already there from exercises 1a and 1b.
+**The forearm resting on the table, the hand over its edge**, and a fixed weight
+you cannot hold for more than 60-90 s (3-5 kg, a dumbbell), so that fatigue comes
+within the session.
+1. Choose the session in the chooser on the line of «Calibrate MVC» and press
+   **Start recording**; no calibration is needed. After 5 s of preparation,
+   **5 s of rest** with the forearm resting, the hand relaxed and without the
+   weight (if it comes out high, the application warns that an electrode is
+   loose), a 3 s countdown to **pick up the weight** and hold it **hanging from
+   the hand, gripping no harder than you need**, for **90 s**. There is no bar
+   during the effort: the load is fixed. If «Weak signal» shows after 5 s,
+   the effort barely exceeds the rest: check the electrodes' contact or use a
+   heavier weight, and repeat. **Breathe normally during the effort.**
+2. **If you cannot go on, press the space bar** (or «I can't go on
+   (Space)»): the effort ends there and the session goes on to putting the
+   weight down. The recording **stops by itself**.
+3. In Analysis the analysed span begins 2 s after the activity begins
+   (picking up the weight is not the contraction that tires) and ends where the
+   activity falls. The contractions box opens on the **«MDF over time»** view,
+   and panels **6. RMS/window** and **7. MDF/time** come ticked.
+
+**Variant · The biceps.** The same session, with the electrodes over the
+**biceps brachii**, on the line between the medial acromion and the cubital
+fossa, **at 1/3 of that line from the cubital fossa** (SENIAM), aligned with the
+fibres and about 2 cm apart; the reference over bone (olecranon or wrist). The
+rest with the arm relaxed along the body; the weight held **with the elbow at
+90°**, the arm against the body. The analysis is the same.
+
+**How the application decides.** It computes the MDF and the MNF in 1 s
+windows every 0.5 s and fits a line to each against time. It says **«Fatigue
+detected»** if the MDF's line falls **significantly** (p < 0.01) and by at least
+**10 %**; **«Not detected»** if it is significant but falls less or rises; and
+**«Not conclusive»** if it is not significant or the effort was too short. No
+minimum R² is required: each window's spectrum has a large scatter of its own:
+on the bench the forearm's MDF fell 26 % in 66 s with an R² of 0.39, and the
+biceps' 16-20 % in 90 s with an R² of only 0.3.
+
+**Data to record.** From the summary line of the contractions box and from the
+report's table:
+
+| Quantity | Start | End | Change | Slope per minute | R² | p |
+|---|---|---|---|---|---|---|
+| MDF (Hz) | | | | | | |
+| MNF (Hz) | | | | | | |
+| RMS (mV) | | | | | | |
+
+Time held: ____ s. MDF −10 % at ____ s. Verdict: ______________.
+
+**Questions.**
+- Did the MDF fall? By what percentage, and after how many seconds had it fallen
+  10 %? What explains it in the fibres?
+- What did the RMS do? Why does it hold or rise with a submaximal load, and
+  what would you expect in a maximal contraction?
+- Why does the application look at the significance (p) and not at R²? What
+  does an R² of 0.3 with a p of 10⁻⁸ mean?
+- A classmate pressed the space bar at 20 s and got «not conclusive». Fatigued
+  or not? What is the recording missing?
+
+**Then: quick repeated contractions** (session **«Quick repeated contractions»**),
+with the electrodes on the forearm flexor: 10 s of clenching and releasing
+the fist as fast as possible. In the **«Train»** view: the rate achieved, how much the peaks rise from
+the first to the last third, and the floor between contractions in % of the peak,
+beside the one the measure alone would leave at that rate.
+- Did the peaks rise? Did the floor stay above the measure's own? Which part of
+  that floor is the processing's and which is yours?
+- Is this the *treppe*? Why can it not be said from the EMG that the muscle makes
+  more force?
+
+### Exercise 1d · The load of a task (Jonsson's method)
+
+**Objective.** Express a task in % MVC and describe its load with three levels.
+
+**Background.** The **APDF** sorts every instant of the task from least to most
+effort and reads three points: **P10 (static)**, the load the muscle never lets
+go of; **P50 (median)**, the typical effort; **P90 (peak)**, the moments of
+highest demand. Jonsson recommended not exceeding 2–5 % for the static level,
+10–14 % for the median and 50–70 % for the peak; the application uses the upper
+end of each range (5, 14 and 70 %). The risk usually comes not from the peaks but
+from a high, sustained static level.
+
+**Procedure.**
+1. **Start recording**, **Calibrate MVC**, and do a task for **60 s**: hold a
+   bottle of water with the wrist neutral, or type with the hand raised, or lift
+   and put down a weight every 10 s. Each group a different one.
+2. **Stop**. In **MVC normalisation** the result appears on its own. With **«Select
+   fragments…»** keep only the task (without the calibration), or the peak will
+   be the maximum itself.
+
+**Data to record.** From the data panel:
+
+| Level | Value (% MVC) | Limit | Within? |
+|---|---|---|---|
+| Static (P10) | | 5 % | |
+| Median (P50) | | 14 % | |
+| Peak (P90) | | 70 % | |
+| Mean activation | | 10 % | |
+
+**Questions.**
+- Which level exceeds its limit? Compare with another group's task: which has
+  the higher peak and which the higher static level? Which is worse for the
+  muscle, and why?
+- The live bars warned in amber above 40 % and in red above 70 %. Does that
+  impression match the APDF? Explain why they measure different things.
+- Propose a change to the task that lowers the static level without lowering
+  the peak.
+
+---
+
+## Practical 2 — Agonist / antagonist contraction (intermediate level)
+
+**Set-up.** Two channels: **FCR** on channel 1 (A1) and **ECR** on channel 2 (A2),
+and **a single reference, shared by both, on the olecranon**; the other sensor's
+reference lead is left without an electrode. This is not a preference: it was
+checked on the bench, with both pairs over the same muscle, that removing the
+reference of either sensor changes neither the amplitude nor the noise, and one
+reference fewer is one connection fewer to get wrong. Selector on **Agonist /
+antagonist contraction**. Labels: FCR and ECR.
+
+**What the application shows in this practical.** On **Start recording** the
+wizard calibrates **both muscles** (section 4) and then opens the recording. The
+analysis offers **1. Raw** with both muscles, each against its own axis, **3. PSD** with both curves, **7.
+MDF/time** of both and **9. Env. overlay**, the two envelopes in % MVC on the same
+axis. The contraction table says **which muscle led each one** (FCR, ECR or
+«Co-activation» when the smaller exceeds half of the larger, each measured
+against its own maximum) and the **co-activation table** gives, per window, the
+mean activation of each muscle and the **Falconer-Winter index**.
+
+**Why in % MVC and not in millivolts.** The millivolts of two different muscles do
+not compare: they depend on where the electrodes ended up and how much skin and
+fat lies beneath. On one recording the flexor's reference was a third of the
+extensor's; a flexion at 100 % of the flexor read *fewer millivolts* than
+the extensor at 42 %. Everything that compares two muscles in this practical
+does so as a percentage of each one's maximum.
+
+### Exercise 2a · Flexion, extension and grip
+
+**Objective.** See the reciprocal pattern of an antagonist pair and measure its
+co-activation.
+
+**Why the grip works.** The finger flexors are extrinsic: their bellies are in the
+forearm and their tendons cross the wrist. Closing the fist therefore produces,
+besides the closing of the fingers, a flexor moment on the wrist that would bend
+it; the radial wrist extensors counter it and hold the wrist in slight extension,
+which is the length at which those flexors are strongest. That is why grip force
+falls when the wrist flexes, and why the extensors are continuously active
+throughout a grip, without the silences they show in a reciprocal movement. Here
+they are not antagonists but stabilisers. It is also the mechanism of lateral
+epicondylitis, an injury of repeated gripping and not of extending the wrist.
+
+**Procedure.**
+1. **Start recording**. Calibrate both muscles as in section 4 (a contraction with the
+   fist clenched for the FCR, with the hand open for the ECR).
+2. In the recording, always in this order, with 2 s of stillness between
+   manoeuvres: **six wrist flexions** (1 s each, free, with no resistance),
+   **six extensions**, also free, and finally the **grip**. Free because,
+   if the wrist pushes against something, the antagonist comes in to
+   stabilise it and the reciprocal pattern is blurred.
+3. **The grip in detail**, because it is the manoeuvre that yields a number and
+   the easiest one to get wrong:
+   - Forearm on the table as far as the wrist, elbow at 90°, thumb up, and **the
+     wrist beyond the edge, in the air**. If the wrist rests on the table, the
+     table does the stabilising, the extensor relaxes and the manoeuvre measures
+     nothing.
+   - **Close the hand on a tennis ball**, which is what the screen names; failing one,
+     something that does not deform and gives a repeatable posture, such as a
+     rolled-up blood-pressure cuff or a tightly rolled towel. A hand
+     dynamometer is better still, since it also quantifies the effort. **With
+     the fist closed on nothing it does not work**: with nothing to close the
+     hand on, the extensor barely comes in (4 % of its reference on the bench) and the
+     grip gives no index.
+   - «Close your hand on the ball with an intense contraction and hold it» for **8 s**, firm but submaximal, guided
+     by the load bar towards 50–60 %. **Never say «extend the wrist»**: the
+     extensors have to come in on their own. The application times those eight
+     seconds and shows both load bars inside its own box, which is where to look
+     while holding the contraction.
+   - Repeating it gives more signal and still counts as one window, since
+     consecutive rows with the same name are grouped; the wizard guides one.
+   - It goes last, so its fatigue does not contaminate the flexions or the
+     extensions.
+4. **Stop**. In Analysis, review the repetitions and accept the fragments: the
+   **Muscle** column comes filled in with who led each contraction; correct only
+   if the trace says otherwise. Consecutive rows with the same name form one
+   window of the co-activation table.
+
+**Data to record.**
+
+| Window | FCR (mean % MVC) | ECR (mean % MVC) | Co-activation index |
+|---|---|---|---|
+| Flexions | | | |
+| Extensions | | | |
+| Grip | | | |
+
+From the event log or the PDF, the **channel separation** during calibration:
+ECR during the FCR maximum ____ %; FCR during the ECR maximum ____ %.
+
+**What each manoeuvre teaches.** The three in this exercise, plus the one in 2b,
+form a progression worth reading whole before answering:
+
+| Manoeuvre | What the two muscles do | What the index gives |
+|---|---|---|
+| Flexions | the FCR works; the ECR little or not at all | «not reported» if the ECR stays under the 4.5 % floor; if it passes it, a low index, around 30 % |
+| Extensions | the roles swap | the same: «not reported» or around 30 % |
+| Grip | both work at once | clearly higher than in the reciprocal manoeuvres |
+| Fast alternation (2b) | both work, but by turns | a low number |
+
+**A 30 % in the flexions is not a mistake.** It means the ECR passed the 4.5 %
+floor while the FCR worked, which depends on how much each person stabilises the
+wrist; on the bench the same person gave «not reported» in one session and 30 %
+in another. What does not change is the order: the grip comes out clearly above.
+
+The grip is the only manoeuvre of this montage that always produces a number, and the
+comparison with the fast alternation of exercise 2b closes the argument: in both
+manoeuvres the two muscles work, but only in the grip do they work **at the same
+time**, which is what the index measures. Co-activation is a property of the task,
+not of the muscle.
+
+**Questions.**
+- During the flexions, what does the ECR do? If its row says «not reported», why
+  is that the right answer and not a fault? And if it gives a low number, what
+  does that say about how the wrist was held?
+- During the grip, who works? Explain why the wrist extensors contract intensely when
+  the hand closes although nobody extends anything, and what it has to do with
+  lateral epicondylitis.
+- The channel separation during the maxima: is it below 25 %? Above 50 % the
+  application says «channels not separated». What does that number measure and
+  what can be done with the electrodes?
+- Compare the two muscles' MDFs in panel 3. Are they different? What can an MDF
+  well above the usual range mean?
+
+### Exercise 2b · Voluntary co-activation and fatigue of a pair
+
+**Objective.** See that co-activation depends on the task, not on the muscle.
+
+**Procedure.** Without recalibrating, record again: 10 s of **fast alternating
+flexions and extensions** (like shaking the hand), then a **grip held for 30 s**.
+
+**Data to record.** Co-activation index of the alternation window and of the grip;
+fatigue verdict of each muscle in the grip (panel 7 draws both).
+
+**Questions.**
+- Is there more co-activation in the fast alternation or in the grip? Why does
+  the index compare the *shape* of the two envelopes and not their size?
+- In the held grip, which of the two muscles shows the MDF fall first? Propose an
+  explanation.
+
+---
+
+## Practical 3 — Muscle kinematics (advanced level)
+
+**Set-up.** One channel over the **biceps brachii**, reference on the olecranon,
+and the BITalino **accelerometer** taped to the **back of the wrist** (the moving
+segment). Selector on **Muscle kinematics**. The wiring is a convention the
+accelerometer box states: **muscle on A1, accelerometer on A2**. In that box,
+placement «on the moving segment», and under «Labels» the muscle's name (biceps),
+which goes into the EDF header.
+
+**What the application shows in this practical.** The fine controls appear
+(envelope cut-off, region, refined EDF, force-velocity study). The analysis offers
+the three basic panels plus **10. EMG vs MMG**, **11. Tremor** and **12. Movement
+vs EMG**. The contraction table adds the **electromechanical delay (EMD)** of each
+effort: the time between the onset of the electrical signal and the onset of the
+movement in the accelerometer. The **«Rehearse…»** button runs the whole
+force-velocity procedure with no hardware, on a simulated signal, to learn it
+before strapping anyone to anything.
+
+### Exercise 3a · The force-velocity relationship
+
+**Objective.** Obtain the biceps' force-velocity curve with known loads.
+
+**Background.** The more load, the slower the muscle shortens; against a load
+equal to its maximum it does not move (isometric). Power (force × velocity) is
+greatest at intermediate loads. The accelerometer gives the velocity of the lift
+and the EMG the activation.
+
+**Procedure.**
+1. Prepare four known loads (for instance 0, 1, 2 and 3 kg: a bottle and
+   dumbbells or filled bottles).
+2. The **«Force-velocity study»** box holds the first two steps of the
+   sequence. **«F-V parameters…»** asks for the **plan** (the loads in order,
+   the lifts per load, three by default, and the seconds to prepare and to
+   lift) and keeps it. **The plan is kept on each computer**: beside the
+   button is the last one saved there, which need not be the default, so it
+   is worth a look before starting. **«Rehearse…»**, beside it, runs the whole procedure
+   with no hardware, which is optional and worth one run before anyone holds
+   a weight. Then **«Start recording»** runs the session by itself:
+   it names the file, **calibrates the maximum first** (warm-up and three
+   brief, intense maximal contractions), announces the study and,
+   for each load, cues the repetitions of **one quick lift**, each with its
+   countdown and marked in the file with its load. Under the panel are **two
+   rows of boxes**: above, the lifts of the load in hand; below, the whole
+   experiment, grouped by load with the one being lifted outlined. No separate
+   maximum without load in between: the calibration was the maximum. Just follow the screen; «Cancel
+   guide (Esc)» stops it without stopping the recording.
+3. **Stop**. In Analysis, the contraction table holds one row per lift with
+   its load, and **«Force-velocity study…»** reads those rows and returns four
+   curves: load-velocity, force-velocity (normalised hyperbola), power and
+   recruitment (EMG amplitude against load).
+
+**Data to record.**
+
+| Load (kg) | Peak velocity (rel. u.) | Biceps RMS (% MVC) |
+|---|---|---|
+| 0 | | |
+| 1 | | |
+| 2 | | |
+| 3 | | |
+
+Load of maximum power: ____ kg.
+
+**Questions.**
+- Does velocity fall as load rises? With what shape? Where does maximum power
+  fall?
+- Does the EMG amplitude rise with load although velocity falls? Which mechanism
+  explains it?
+- Why is the isometric maximum calibrated with the elbow locked?
+
+### Exercise 3b · The electromechanical delay
+
+**Objective.** Measure the time between the electrical command and the movement.
+
+**Background.** Between the fibre depolarising and the segment starting to move
+some tens of milliseconds pass: calcium release, cross-bridge formation,
+tensioning of the series elastic elements. In healthy adults the delay lies
+between **30 and 100 ms** in voluntary contractions.
+
+**Procedure.** With the same set-up, **Start recording** and make **eight quick
+elbow flexions** without load, from the arm relaxed and hanging, with 3 s of rest
+between them. **Stop**. In the contraction table, column **EMD (ms)**.
+
+**Data to record.** EMD of the eight flexions; mean and deviation.
+
+**Questions.**
+- Are your values within range? Which physiological steps take up that time?
+- Repeat three flexions **with 2 kg in the hand**. Does the delay change? Why does
+  the segment take longer to start moving when there is a load to overcome?
+
+### Exercise 3c · Physiological tremor
+
+**Objective.** See physiological tremor in the accelerometer and locate its
+frequency.
+
+**Procedure.** **Start recording** and hold the arm **extended forward,
+horizontal, for 30 s**, unsupported; then another 30 s holding 2 kg. **Stop**.
+Panel **11. Tremor**: the accelerometer's spectrum.
+
+**Data to record.** Frequency of the tremor peak without load ____ Hz; with load
+____ Hz.
+
+**Questions.**
+- Does the peak fall between 8 and 12 Hz? Does it change with load?
+- Physiological tremor arises partly from synchronised motor-unit discharge and
+  partly from the mechanics of the segment. Which part would change with load
+  and which would not?
+
+---
+
+## Reference ranges for interpreting
+
+The numbers in the table are **orientative**, not limits: they hold for surface
+EMG in healthy adults, and depend on the muscle, the electrodes and the subject. A
+value outside the range is a question, not an error. These same ranges appear in
+grey under the summary cards and in the «?» of the tables.
+
+| Measure | Orientative range | Where it comes from |
+|---|---|---|
+| Mean frequency (MNF) | 80–170 Hz | most of the surface-EMG power lies between 50 and 150 Hz; MNF is always a little above MDF because of the spectrum's tail |
+| Median frequency (MDF) | 60–150 Hz; in the forearm rather 90–150 | the same band; measured (FCR and ECR) 86–127 Hz with a good montage, 176 Hz with a misplaced electrode |
+| MDF fall with fatigue | clear negative slope; no universal magnitude threshold | the application requires not an amount but a trend that fits (R² ≥ 0.30, ≥ 4 one-second windows) |
+| RMS at rest | ≈ 0.005–0.02 mV | background noise of amplifier and skin (≥ 8 µV peak to peak at best) |
+| RMS in firm effort | 0.1–1 mV; maxima up to ~1.5 mV | surface electrodes over limb muscles |
+| Task effort | 20–80 % MVC | a typical submaximal effort; > 100 % sustained says the calibration was not maximal |
+| Task maximum with a sound calibration | 90–125 % MVC | recorded sessions with a correct calibration; the application warns in red from 150 % |
+| Antagonist co-activation | 5–10 % MVC in light efforts; 25–35 % in maxima | triceps during maximal elbow flexion ≈ 26 %; finger extensor during wrist flexion at 75 % ≈ 15 % |
+| Co-activation index (Falconer-Winter) | reciprocal movement: «not reported», or low (≈ 30 %) if the antagonist passes the floor; firm grip closing the hand on the ball: clearly higher | the index measures shared activity; in a clean flexion the antagonist stays below the 4.5 % floor |
+| Channel separation (cross-talk) | ≤ 20–25 % of its own reference | measured with well-placed electrodes; > 50 %, «channels not separated» |
+| Static load (P10) | ≤ 2–5 % MVC (the application uses 5) | Jonsson 1978, 1982 |
+| Median load (P50) | ≤ 10–14 % MVC (the application uses 14) | Jonsson 1978, 1982 |
+| Peak load (P90) | ≤ 50–70 % MVC (the application uses 70) | Jonsson 1978, 1982 |
+| Electromechanical delay | 30–100 ms; voluntary, 35–80 ms | Cavanagh and Komi 1979: biceps 41 ± 13 ms, triceps 26 ± 11 ms |
+| Physiological tremor | peak at 8–12 Hz | accelerometry of maintained posture in healthy adults |
+| Contraction-onset threshold | rest + 3 standard deviations | Hodges and Bui 1996 |
+
+---
+
+## Appendix — Student report template
+
+For each practical, submit:
+
+1. **Identification**: test identifier, muscle(s), device, practical and
+   exercises done.
+2. The **PDF report** the application generates (it holds the figures, the
+   calibration with its repetitions, the contraction table and the cards). With
+   the broadcast on, it can be downloaded on the phone itself.
+3. The **data tables** of the exercises, copied from the report.
+4. The **reasoned answers** to the questions, citing the numbers.
+5. A brief **conclusion** relating what was observed to the physiology: motor
+   unit, recruitment, conduction velocity, force-velocity relationship,
+   ergonomic risk.
+
+> **Note for instructors.** What decides the quality of a practical is the
+> calibration: a maximum that was not one makes every percentage false, and the
+> application says so in red on the «Task maximum» card. It is worth checking
+> before letting the group go on. The questions that compare across groups work
+> best if each group does a different task in 1d. The ranges in the table above
+> are also in the application, so the student has something to interpret against
+> without opening the guide.
