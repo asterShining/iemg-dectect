@@ -34,7 +34,15 @@ if os.path.isdir(os.path.join(_SRC, "emgteach")):
     _pkg.__path__ = [os.path.join(_SRC, "emgteach")]
     sys.modules.setdefault("emgteach", _pkg)
 from emgteach.apda import compute_apdf  # noqa: E402
-from emgteach.dsp import compute_psd_mnf_mdf, compute_segments  # noqa: E402
+from emgteach.dsp import (  # noqa: E402
+    RealtimeFilterState,
+    RealtimeMetricAccumulator,
+    compute_iemg,
+    compute_psd_mnf_mdf,
+    compute_realtime_window_metrics,
+    compute_segments,
+    read_metrics_csv,
+)
 from emgteach.fatigue import fit_mdf_vs_time  # noqa: E402
 from emgteach.mvc import compute_mvc, normalise_to_mvc  # noqa: E402
 
@@ -129,10 +137,136 @@ def run():
         check(f"APDF {lvl}", "uniform[0,A]", got[lvl], k / 100.0 * amp / mvc * 100.0,
               0.01, "%MVC", rel=True)
 
+    # 4) LHE7904 4000 SPS real-time 1 s metrics (iEMG, MPF, MF) & 60 s stability
+    fs_lhe = 4000.0
+    t_1s = np.arange(int(fs_lhe), dtype=np.float64) / fs_lhe
+    # 4a) User bench signal: 100 Hz, 1.0 mV, 0 offset
+    bench_100 = 1.0 * np.sin(2.0 * np.pi * 100.0 * t_1s)
+    m_100 = compute_realtime_window_metrics(bench_100, fs_lhe, f_low=10.0, f_high=500.0)
+    ref_iemg_1mv = (2.0 / np.pi) * 1000.0
+    check("iEMG (4kHz)", "100 Hz 1 mV bench sine", m_100["iemg_uv_s"], ref_iemg_1mv, 0.005, "uV*s", rel=True)
+    check("MPF (4kHz)", "100 Hz 1 mV bench sine", m_100["mpf_hz"], 100.0, 0.5, "Hz")
+    check("MF (4kHz)", "100 Hz 1 mV bench sine", m_100["mf_hz"], 100.0, 0.5, "Hz")
+
+    # 4b) 200 Hz, 2.0 mV sine
+    sig_200 = 2.0 * np.sin(2.0 * np.pi * 200.0 * t_1s)
+    m_200 = compute_realtime_window_metrics(sig_200, fs_lhe, f_low=10.0, f_high=500.0)
+    check("iEMG (4kHz)", "200 Hz 2 mV sine", m_200["iemg_uv_s"], 2.0 * ref_iemg_1mv, 0.01, "uV*s", rel=True)
+    check("MPF (4kHz)", "200 Hz 2 mV sine", m_200["mpf_hz"], 200.0, 0.5, "Hz")
+    check("MF (4kHz)", "200 Hz 2 mV sine", m_200["mf_hz"], 200.0, 0.5, "Hz")
+
+    # 4c) Dual-tone (100+200 Hz) MPF and Three-tone (100+150+200 Hz) MPF/MF
+    sig_2t = np.sin(2.0 * np.pi * 100.0 * t_1s) + np.sin(2.0 * np.pi * 200.0 * t_1s)
+    m_2t = compute_realtime_window_metrics(sig_2t, fs_lhe, f_low=10.0, f_high=500.0)
+    check("MPF (4kHz)", "dual-tone 100+200 Hz", m_2t["mpf_hz"], 150.0, 1.0, "Hz")
+    sig_3t = (
+        np.sin(2.0 * np.pi * 100.0 * t_1s)
+        + np.sin(2.0 * np.pi * 150.0 * t_1s)
+        + np.sin(2.0 * np.pi * 200.0 * t_1s)
+    )
+    m_3t = compute_realtime_window_metrics(sig_3t, fs_lhe, f_low=10.0, f_high=500.0)
+    check("MPF (4kHz)", "3-tone 100+150+200 Hz", m_3t["mpf_hz"], 150.0, 1.0, "Hz")
+    check("MF (4kHz)", "3-tone 100+150+200 Hz", m_3t["mf_hz"], 150.0, 1.0, "Hz")
+
+    # 4d) Single-50 Hz notch effect on 50 Hz + 100 Hz composite signal (2nd second steady state)
+    t_2s = np.arange(int(2 * fs_lhe), dtype=np.float64) / fs_lhe
+    comp_50_100 = np.sin(2.0 * np.pi * 50.0 * t_2s) + np.sin(2.0 * np.pi * 100.0 * t_2s)
+    filt_lhe = RealtimeFilterState(
+        fs_lhe, f_low=10.0, f_high=500.0, f_notch=50.0, notch_enabled=True, notch_harmonics=False
+    )
+    comp_filtered, _ = filt_lhe.process_block(comp_50_100)
+    m_notch = compute_realtime_window_metrics(
+        comp_filtered[int(fs_lhe) :], fs_lhe, f_low=10.0, f_high=500.0
+    )
+    check("MPF (4kHz)", "50+100 Hz after 50 Hz notch", m_notch["mpf_hz"], 100.0, 1.0, "Hz")
+    check("MF (4kHz)", "50+100 Hz after 50 Hz notch", m_notch["mf_hz"], 100.0, 1.0, "Hz")
+
+    # 4e) 60-second chunked streaming stability (600 x 400 samples at 4000 SPS)
+    filt_60s = RealtimeFilterState(
+        fs_lhe, f_low=10.0, f_high=500.0, f_notch=50.0, notch_enabled=True, notch_harmonics=False
+    )
+    acc_60s = RealtimeMetricAccumulator(fs=fs_lhe, n_channels=1, f_low=10.0, f_high=500.0)
+    t_60s = np.arange(int(60 * fs_lhe), dtype=np.float64) / fs_lhe
+    sig_60s = 1.0 * np.sin(2.0 * np.pi * 100.0 * t_60s)
+    snaps_60s = []
+    for k in range(600):
+        blk = sig_60s[k * 400 : (k + 1) * 400]
+        f_blk, _ = filt_60s.process_block(blk)
+        snaps_60s.extend(acc_60s.push_block([f_blk]))
+    check("60s stream", "window count (600x400)", float(len(snaps_60s)), 60.0, 0.0, "windows")
+    check(
+        "iEMG (60s)",
+        "steady-state window #60",
+        snaps_60s[-1]["iemg_uv_s"][0],
+        compute_iemg(bench_100, fs_lhe),
+        0.02,
+        "uV*s",
+        rel=True,
+    )
+
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate emgteach sEMG metrics.")
+    parser.add_argument(
+        "--edf",
+        type=str,
+        default=None,
+        help="Optional recorded EDF path to inspect alongside its .metrics.csv sidecar.",
+    )
+    parser.add_argument(
+        "--expect-freq",
+        type=float,
+        default=100.0,
+        help="Expected sine frequency (Hz) when --edf is provided (default: 100.0).",
+    )
+    parser.add_argument(
+        "--expect-amp",
+        type=float,
+        default=1.0,
+        help="Expected sine amplitude (mV) when --edf is provided (default: 1.0).",
+    )
+    args = parser.parse_args()
+
     run()
-    print(f"emgteach metric validation  (seed={SEED}, fs={FS:.0f} Hz)\n")
+    if args.edf:
+        csv_info = read_metrics_csv(args.edf)
+        if csv_info is not None and len(csv_info["time_s"][0]) >= 2:
+            valid_mask = csv_info["valid"][0]
+            # Skip first 1s filter warm-up window if possible
+            idx = -1
+            if np.any(valid_mask):
+                valid_indices = np.flatnonzero(valid_mask)
+                idx = int(valid_indices[-1])
+            ref_iemg = args.expect_amp * (2.0 / np.pi) * 1000.0
+            check(
+                "EDF .metrics",
+                "recorded iEMG vs bench ref",
+                float(csv_info["iemg_uv_s"][0][idx]),
+                ref_iemg,
+                0.05,
+                "uV*s",
+                rel=True,
+            )
+            check(
+                "EDF .metrics",
+                "recorded MPF vs bench ref",
+                float(csv_info["mpf_hz"][0][idx]),
+                args.expect_freq,
+                2.0,
+                "Hz",
+            )
+            check(
+                "EDF .metrics",
+                "recorded MF vs bench ref",
+                float(csv_info["mf_hz"][0][idx]),
+                args.expect_freq,
+                2.0,
+                "Hz",
+            )
+
+    print(f"emgteach metric validation  (seed={SEED}, fs={FS:.0f} Hz / LHE7904 4000 Hz)\n")
     hdr = (f"{'metric':<16}{'case':<32}{'emgteach':>11}{'reference':>11}"
            f"{'err':>9}{'tol':>7}   result")
     print(hdr)
@@ -140,7 +274,7 @@ def main():
     n_pass = 0
     for metric, case, got, ref, err, tol, kind, _unit, ok in _rows:
         n_pass += ok
-        tols = f"{tol * 100:.0f}%" if kind == "rel" else f"{tol:g}"
+        tols = f"{tol * 100:.1f}%" if kind == "rel" else f"{tol:g}"
         print(f"{metric:<16}{case:<32}{got:>11.3f}{ref:>11.3f}"
               f"{err:>9.3f}{tols:>7}   {'PASS' if ok else 'FAIL'}")
     print("-" * len(hdr))

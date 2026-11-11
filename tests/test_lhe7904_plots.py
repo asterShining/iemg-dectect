@@ -82,3 +82,77 @@ def test_invalid_sample_rate_is_rejected_without_changing_clock(plots, fs):
     with pytest.raises(ValueError, match="positive integer"):
         plots.set_sample_frequency(fs)
     assert plots._fs == 1000
+
+
+def test_four_plot_layout_and_slot2_iemg_envelope_switching(plots):
+    """Plot 1: Raw EMG, Plot 2: iEMG (default) / Envelope (switchable), Plot 3: MPF, Plot 4: MF."""
+    assert plots.second_plot_mode() == "iemg"
+    assert not plots._plot_raw.isHidden()
+    assert not plots._plot_iemg.isHidden()
+    assert plots._plot_env.isHidden()
+    assert not plots._plot_mpf.isHidden()
+    assert not plots._plot_mf.isHidden()
+    assert plots.all_emg_display_plots() == [
+        plots._plot_raw,
+        plots._plot_iemg,
+        plots._plot_mpf,
+        plots._plot_mf,
+    ]
+
+    plots.set_second_plot_mode("envelope")
+    assert plots.second_plot_mode() == "envelope"
+    assert plots._plot_iemg.isHidden()
+    assert not plots._plot_env.isHidden()
+    assert plots.all_emg_display_plots() == [
+        plots._plot_raw,
+        plots._plot_env,
+        plots._plot_mpf,
+        plots._plot_mf,
+    ]
+
+    plots.set_second_plot_mode("iemg")
+    assert plots.second_plot_mode() == "iemg"
+    assert not plots._plot_iemg.isHidden()
+    assert plots._plot_env.isHidden()
+
+
+def test_metric_60s_trend_titles_and_invalid_window_gap(plots):
+    """Three metrics update once per second, show latest value in title, and mark invalid windows."""
+    plots.set_sample_frequency(4000)
+    for sec in range(1, 66):
+        plots.append_metrics(
+            {
+                "time_s": float(sec),
+                "valid": [True],
+                "iemg": [636.6],
+                "mpf": [100.0],
+                "mf": [100.0],
+            }
+        )
+    # 60-second ring buffer caps at 60 points (6s..65s)
+    assert len(plots._buf_metric_t) == 60
+    x_iemg, y_iemg = plots._curves_iemg[0].getData()
+    assert len(x_iemg) == 60
+    assert x_iemg[0] == pytest.approx(6.0)
+    assert x_iemg[-1] == pytest.approx(65.0)
+    assert y_iemg[-1] == pytest.approx(636.6)
+    assert "636.6 µV·s" in plots._plot_iemg.plotItem.titleLabel.text
+    assert "100.0 Hz" in plots._plot_mpf.plotItem.titleLabel.text
+    assert "100.0 Hz" in plots._plot_mf.plotItem.titleLabel.text
+
+    # Push an invalid window -> title shows Invalid and curve stores NaN (not 0)
+    plots.append_metrics(
+        {
+            "time_s": 66.0,
+            "valid": [False],
+            "iemg": [float("nan")],
+            "mpf": [float("nan")],
+            "mf": [float("nan")],
+        }
+    )
+    _, y_after = plots._curves_iemg[0].getData()
+    assert np.isnan(y_after[-1])
+    assert "Invalid" in plots._plot_iemg.plotItem.titleLabel.text
+    assert "Invalid" in plots._plot_mpf.plotItem.titleLabel.text
+    assert "Invalid" in plots._plot_mf.plotItem.titleLabel.text
+

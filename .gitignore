@@ -90,3 +90,5 @@ secrets.toml
 # reference and deliberately out of the repository: its code is dead and its
 # own document claims a testing it never had.
 emgteach_work/
+.omx
+.omg

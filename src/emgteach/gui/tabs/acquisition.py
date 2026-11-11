@@ -765,7 +765,7 @@ class AcquisitionTab(QWidget):
         give_back_focus(self)
         # The live plots keep no focus, so a click in them leaves the M to
         # the tab (bench of 15 October 2026, on Windows).
-        hand_the_m_over(self._trazado.plot_widgets(), self._marcador)
+        hand_the_m_over(self._trazado.all_plot_widgets(), self._marcador)
 
     # ------------------------------------------------------------------
     # Log helpers — write to the local logger AND the shared one
@@ -1712,6 +1712,11 @@ class AcquisitionTab(QWidget):
         )
         worker_labels = [*labels, acc_label] if use_acc else list(labels)
 
+        worker_f_low: float | None = None
+        worker_f_high: float | None = None
+        worker_f_notch: float | None = None
+        worker_notch_enabled: bool = True
+        worker_notch_harmonics: bool = True
         if self._conexion.device_index() == 0:
             # The EMG channels take the first analogue inputs, skipping the one
             # the accelerometer is on (they must not collide). So with the ACC
@@ -1735,6 +1740,17 @@ class AcquisitionTab(QWidget):
                 acc_channel=acc_ch,
             )
         elif self._conexion.device_index() == 2:
+            dsp_err = self._conexion.validate_lhe7904_dsp()
+            if dsp_err is not None:
+                self._err(dsp_err)
+                self._btn_grabar.setChecked(False)
+                return
+            dsp_opts = self._conexion.lhe7904_dsp_options()
+            worker_f_low = float(dsp_opts["f_low"])
+            worker_f_high = float(dsp_opts["f_high"])
+            worker_f_notch = float(dsp_opts["f_notch"])
+            worker_notch_enabled = bool(dsp_opts["notch_enabled"])
+            worker_notch_harmonics = bool(dsp_opts["notch_harmonics"])
             device = create_device(
                 BACKEND_LHE7904_UART,
                 port=self._conexion.serial_port(),
@@ -1747,6 +1763,8 @@ class AcquisitionTab(QWidget):
                 fs=self._fs,
                 n_channels=n,
             )
+        self._fs = int(device.fs)
+        self._trazado.set_sample_frequency(self._fs)
         self._settings.setValue("adquisicion/auto_detect", self._chk_auto.isChecked())
         self._settings.setValue("adquisicion/onset_k", self._spin_k.value())
         metadata = RecordingMetadata(
@@ -1767,10 +1785,16 @@ class AcquisitionTab(QWidget):
             device=device,
             save_dir=save_dir,
             save_path=save_path,
+            n_per_read=max(1, int(device.fs // 10)),
+            f_low=worker_f_low,
+            f_high=worker_f_high,
+            f_notch=worker_f_notch,
             sensor_labels=worker_labels,
             auto_detect=self._chk_auto.isChecked(),
             onset_k=self._spin_k.value(),
             metadata=metadata,
+            notch_enabled=worker_notch_enabled,
+            notch_harmonics=worker_notch_harmonics,
         )
         self._worker.data_ready.connect(self._on_data_ready)
         self._worker.log.connect(self._log)
@@ -1953,7 +1977,7 @@ class AcquisitionTab(QWidget):
         # data_ready carries one array per channel; the plots keep their own.
         raw = data["raw_mv"]
         env = data["envelope"]
-        self._trazado.append(raw, env)
+        self._trazado.push_data(data)
         # During the wizard's contraction window, track the raw peak so the
         # plots can auto-scale to this subject once calibration finishes.
         if self._mvc_active and self._mvc_phase == "contract":

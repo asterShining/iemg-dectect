@@ -46,7 +46,11 @@ from emgteach.devices import (
     BACKEND_LHE7904_UART,
     device_class,
 )
-from emgteach.dsp import process_offline
+from emgteach.dsp import (
+    compute_recording_metrics_1s,
+    process_offline,
+    read_metrics_csv,
+)
 from emgteach.gui.acquisition.cycle_estimator import estimate_sine_frequency
 from emgteach.gui.widgets.help_button import add_help
 from emgteach.i18n import tr
@@ -70,13 +74,18 @@ __all__ = [
     "ENV_SIGUE_MARGEN",
     "GUIDED",
     "MAX_MARKER_LINES",
+    "MAX_METRIC_POINTS",
     "MAX_POINTS",
+    "METRIC_WINDOW_S",
     "LivePlots",
 ]
 
 # Number of samples in the ring buffer (= 30 s at 1000 Hz)
 # The visible window can be smaller thanks to the time-zoom control.
 MAX_POINTS = 30_000
+# 60-second sliding trend window for 1-second iEMG / MPF / MF metrics
+METRIC_WINDOW_S = 60.0
+MAX_METRIC_POINTS = 60
 MIN_WINDOW_S = 0.01
 MIN_AMPLITUDE_MV = 1e-6
 MIN_ACC_SPAN = 1e-6
@@ -176,6 +185,8 @@ class LivePlots(QGroupBox):
 
     #: A line for the event log.
     logged = Signal(str)
+    #: Emitted when the 2nd plot switches between ``"iemg"`` and ``"envelope"``.
+    second_plot_mode_changed = Signal(str)
 
     def __init__(
         self,
@@ -233,6 +244,21 @@ class LivePlots(QGroupBox):
             deque([0.0] * self._max_points, maxlen=self._max_points) for _ in range(self._n_max)
         ]
         self._buf_acc = deque([0.0] * self._max_points, maxlen=self._max_points)
+        # 60-second ring buffers for 1-second metrics (iEMG, MPF, MF)
+        self._second_plot_mode: str = "iemg"
+        self._buf_metric_t: deque[float] = deque(maxlen=MAX_METRIC_POINTS)
+        self._buf_iemg: list[deque[float]] = [
+            deque(maxlen=MAX_METRIC_POINTS) for _ in range(self._n_max)
+        ]
+        self._buf_mpf: list[deque[float]] = [
+            deque(maxlen=MAX_METRIC_POINTS) for _ in range(self._n_max)
+        ]
+        self._buf_mf: list[deque[float]] = [
+            deque(maxlen=MAX_METRIC_POINTS) for _ in range(self._n_max)
+        ]
+        self._buf_metric_valid: list[deque[bool]] = [
+            deque(maxlen=MAX_METRIC_POINTS) for _ in range(self._n_max)
+        ]
         # The live ACC plot has a stable ±1 g range (the accelerometer signal
         # uses the full normalised range); the ▲▼ buttons magnify around the
         # trace's current level. >1 zooms in.
@@ -357,6 +383,22 @@ class LivePlots(QGroupBox):
 
         row_tiempo.addStretch()
 
+        self._lbl_slot2_mode = QLabel(tr("Plot 2:"))
+        self._lbl_slot2_mode.setStyleSheet("font-size: 10px;")
+        row_tiempo.addWidget(self._lbl_slot2_mode)
+        self._combo_slot2_mode = QComboBox()
+        self._combo_slot2_mode.setFixedHeight(26)
+        self._combo_slot2_mode.addItem(tr("iEMG (µV·s)"), "iemg")
+        self._combo_slot2_mode.addItem(tr("Envelope (mV)"), "envelope")
+        self._combo_slot2_mode.setCurrentIndex(0)
+        self._combo_slot2_mode.setToolTip(
+            tr("Switch the second plot between 1 s integrated EMG (iEMG) and 5 Hz smoothed Envelope")
+        )
+        self._combo_slot2_mode.currentIndexChanged.connect(
+            self._on_slot2_combo_changed
+        )
+        row_tiempo.addWidget(self._combo_slot2_mode)
+
         # Kept as an attribute so the practicals can hide it with the ▲▼
         # sidebar: with the raw range on the device's own full scale and the
         # envelope auto-ranging, a student has nothing to reset.
@@ -399,8 +441,11 @@ class LivePlots(QGroupBox):
         # curves are allocated; those of inactive channels stay hidden.
         self._curves_raw: list = []
         self._curves_env: list = []
+        self._curves_iemg: list = []
+        self._curves_mpf: list = []
+        self._curves_mf: list = []
 
-        # Raw signal
+        # 1. Raw signal
         self._plot_raw = pg.PlotWidget(title=tr("Raw EMG signal (mV)"))
         # pyqtgraph rescales a small-valued axis by itself and labels it
         # «mV (x0.000)» with ticks 0–500 — what the envelope plot said on
@@ -418,16 +463,40 @@ class LivePlots(QGroupBox):
             self._curves_raw.append(
                 self._plot_raw.plot(pen=pg.mkPen(color=self._colours[c], width=1))
             )
-        # Equal stretch + a small minimum so the three plots share the height
-        # (the ACC plot is not squeezed to a sliver) and stay aligned with their
-        # ▲▼ sidebar slots, while still shrinking to fit the screen.
+        # Equal stretch + a small minimum so the four plots share the height
+        # and stay aligned with their ▲▼ sidebar slots, while still shrinking
+        # to fit the screen.
         self._plot_raw.setMinimumHeight(70)
         plots_col_vbox.addWidget(self._plot_raw, stretch=1)
 
-        # Envelope
-        # The title names what is drawn; how it is computed is a hover away.
-        # «Envelope (5 Hz low-pass filter, causal with continuous state)» put
-        # three terms the student has not met into the one line they read.
+        # 2a. iEMG (default in Plot-2 slot, 60 s trend of 1 s windows, µV·s)
+        self._plot_iemg = pg.PlotWidget(title=f"{tr('iEMG (µV·s)')} — --")
+        self._plot_iemg.setToolTip(
+            tr(
+                "Integrated EMG over each 1-second valid filtered window "
+                "(µV·s), updated once per second across the last 60 seconds."
+            )
+        )
+        self._plot_iemg.getAxis("left").enableAutoSIPrefix(False)
+        self._plot_iemg.setYRange(0.0, 1000.0, padding=0)
+        self._plot_iemg.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_iemg.setLabel("left", "µV·s")
+        self._plot_iemg.setLabel("bottom", "s")
+        self._plot_iemg.showGrid(x=True, y=True, alpha=0.3)
+        for c in range(self._n_max):
+            self._curves_iemg.append(
+                self._plot_iemg.plot(
+                    pen=pg.mkPen(color=self._colours[c], width=2),
+                    symbol="o",
+                    symbolSize=5,
+                    symbolBrush=self._colours[c],
+                    connect="finite",
+                )
+            )
+        self._plot_iemg.setMinimumHeight(70)
+        plots_col_vbox.addWidget(self._plot_iemg, stretch=1)
+
+        # 2b. Envelope (switchable option in Plot-2 slot, preserved intact)
         self._plot_env = pg.PlotWidget(title=tr("Envelope (mV)"))
         self._plot_env.setToolTip(tr(
             "The rectified signal smoothed with a 5 Hz low-pass filter, "
@@ -444,7 +513,62 @@ class LivePlots(QGroupBox):
                 self._plot_env.plot(pen=pg.mkPen(color=self._colours[c], width=2))
             )
         self._plot_env.setMinimumHeight(70)
+        self._plot_env.setVisible(False)
         plots_col_vbox.addWidget(self._plot_env, stretch=1)
+
+        # 3. MPF — Mean Power Frequency (Hz), 60 s trend of 1 s windows
+        self._plot_mpf = pg.PlotWidget(title=f"{tr('MPF (Hz)')} — --")
+        self._plot_mpf.setToolTip(
+            tr(
+                "Mean Power Frequency (MPF, Hz) of the filtered unrectified "
+                "EMG over each 1-second valid window across the last 60 seconds."
+            )
+        )
+        self._plot_mpf.getAxis("left").enableAutoSIPrefix(False)
+        self._plot_mpf.setYRange(0.0, 300.0, padding=0)
+        self._plot_mpf.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_mpf.setLabel("left", "Hz")
+        self._plot_mpf.setLabel("bottom", "s")
+        self._plot_mpf.showGrid(x=True, y=True, alpha=0.3)
+        for c in range(self._n_max):
+            self._curves_mpf.append(
+                self._plot_mpf.plot(
+                    pen=pg.mkPen(color=self._colours[c], width=2),
+                    symbol="o",
+                    symbolSize=5,
+                    symbolBrush=self._colours[c],
+                    connect="finite",
+                )
+            )
+        self._plot_mpf.setMinimumHeight(70)
+        plots_col_vbox.addWidget(self._plot_mpf, stretch=1)
+
+        # 4. MF — Median Frequency (Hz), 60 s trend of 1 s windows
+        self._plot_mf = pg.PlotWidget(title=f"{tr('MF (Hz)')} — --")
+        self._plot_mf.setToolTip(
+            tr(
+                "Median Frequency (MF, Hz) of the filtered unrectified "
+                "EMG over each 1-second valid window across the last 60 seconds."
+            )
+        )
+        self._plot_mf.getAxis("left").enableAutoSIPrefix(False)
+        self._plot_mf.setYRange(0.0, 300.0, padding=0)
+        self._plot_mf.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_mf.setLabel("left", "Hz")
+        self._plot_mf.setLabel("bottom", "s")
+        self._plot_mf.showGrid(x=True, y=True, alpha=0.3)
+        for c in range(self._n_max):
+            self._curves_mf.append(
+                self._plot_mf.plot(
+                    pen=pg.mkPen(color=self._colours[c], width=2),
+                    symbol="o",
+                    symbolSize=5,
+                    symbolBrush=self._colours[c],
+                    connect="finite",
+                )
+            )
+        self._plot_mf.setMinimumHeight(70)
+        plots_col_vbox.addWidget(self._plot_mf, stretch=1)
 
         # Accelerometer (A4) — an auto-scaled extra plot, shown only when the
         # ACC checkbox is on. It is deliberately kept out of the ▲▼ scale
@@ -587,6 +711,7 @@ class LivePlots(QGroupBox):
 
         # Establish the initial clock before layout can auto-fit an empty plot.
         self._set_shared_x(0.0, self._n_visible / self._fs)
+        self._update_metric_titles()
 
     # ------------------------------------------------------------------
     # What the tab tells the plots
@@ -600,6 +725,40 @@ class LivePlots(QGroupBox):
     def _acc_enabled(self) -> bool:
         return bool(self._acc_on())
 
+    def second_plot_mode(self) -> str:
+        """Return ``"iemg"`` (default) or ``"envelope"`` for the 2nd plot slot."""
+        return self._second_plot_mode
+
+    def active_second_plot(self) -> pg.PlotWidget:
+        """Return whichever plot widget is currently active in the 2nd slot."""
+        return (
+            self._plot_iemg
+            if self._second_plot_mode == "iemg"
+            else self._plot_env
+        )
+
+    def set_second_plot_mode(self, mode: str) -> None:
+        """Switch the 2nd plot slot between ``"iemg"`` (default) and ``"envelope"``."""
+        norm = str(mode).strip().lower()
+        if norm not in ("iemg", "envelope"):
+            raise ValueError(f"Unsupported second plot mode: {mode!r}")
+        show_iemg = norm == "iemg"
+        self._second_plot_mode = norm
+        self._plot_iemg.setVisible(show_iemg)
+        self._plot_env.setVisible(not show_iemg)
+        idx = 0 if show_iemg else 1
+        if self._combo_slot2_mode.currentIndex() != idx:
+            self._combo_slot2_mode.blockSignals(True)
+            self._combo_slot2_mode.setCurrentIndex(idx)
+            self._combo_slot2_mode.blockSignals(False)
+        self.second_plot_mode_changed.emit(norm)
+
+    @Slot(int)
+    def _on_slot2_combo_changed(self, index: int) -> None:
+        data = self._combo_slot2_mode.itemData(index)
+        if data in ("iemg", "envelope"):
+            self.set_second_plot_mode(str(data))
+
     def set_channels(self, n_channels: int) -> None:
         """How many channels are active: their curves are shown, the rest hidden."""
         self._btn_cycle_auto.setEnabled(n_channels == 1)
@@ -609,6 +768,10 @@ class LivePlots(QGroupBox):
             visible = c < n_channels
             self._curves_raw[c].setVisible(visible)
             self._curves_env[c].setVisible(visible)
+            self._curves_iemg[c].setVisible(visible)
+            self._curves_mpf[c].setVisible(visible)
+            self._curves_mf[c].setVisible(visible)
+        self._update_metric_titles()
 
     def restack(self) -> None:
         """The channel count changed: overlaid or stacked again, at gain 1."""
@@ -648,6 +811,139 @@ class LivePlots(QGroupBox):
         if raw:
             self._total_samples += len(raw[0])
         self._new_data = True
+
+    def append_metrics(self, snapshot: dict) -> None:
+        """Append one 1-second metric snapshot (``iEMG``, ``MPF``, ``MF``).
+
+        Invalid windows (``valid=False``) are stored as ``NaN`` so the curve
+        breaks cleanly (``connect="finite"``) and the title displays ``Invalid``
+        instead of faking ``0``.
+        """
+        time_s = float(snapshot.get("time_s", 0.0))
+        valid_list = snapshot.get("valid", [])
+        iemg_list = snapshot.get("iemg_uv_s", snapshot.get("iemg", []))
+        mpf_list = snapshot.get("mpf_hz", snapshot.get("mpf", []))
+        mf_list = snapshot.get("mf_hz", snapshot.get("mf", []))
+
+        self._buf_metric_t.append(time_s)
+        for c in range(self._n_max):
+            is_valid = bool(valid_list[c]) if c < len(valid_list) else False
+            self._buf_metric_valid[c].append(is_valid)
+            if is_valid:
+                iemg_v = float(iemg_list[c]) if c < len(iemg_list) else float("nan")
+                mpf_v = float(mpf_list[c]) if c < len(mpf_list) else float("nan")
+                mf_v = float(mf_list[c]) if c < len(mf_list) else float("nan")
+            else:
+                iemg_v = float("nan")
+                mpf_v = float("nan")
+                mf_v = float("nan")
+            self._buf_iemg[c].append(iemg_v)
+            self._buf_mpf[c].append(mpf_v)
+            self._buf_mf[c].append(mf_v)
+        self._refresh_metric_plots()
+
+    def push_data(self, payload: dict) -> None:
+        """Accept a full ``data_ready`` payload from :class:`AcquisitionWorker`."""
+        raw = payload.get("raw_mv", [])
+        env = payload.get("envelope", [])
+        if raw or env:
+            self.append(raw, env)
+        batch = payload.get("metrics_1s_batch")
+        if batch:
+            for snap in batch:
+                self.append_metrics(snap)
+        elif "metrics_1s" in payload and payload["metrics_1s"] is not None:
+            self.append_metrics(payload["metrics_1s"])
+
+    def _format_metric_title(
+        self,
+        base_title: str,
+        unit: str,
+        bufs: list[deque[float]],
+        valids: list[deque[bool]],
+    ) -> str:
+        if not self._buf_metric_t:
+            return f"{base_title} — --"
+        parts: list[str] = []
+        n_ch = max(1, min(self._n_channels, self._n_max))
+        for c in range(n_ch):
+            if not valids[c] or not bufs[c]:
+                parts.append("--")
+                continue
+            is_valid = bool(valids[c][-1])
+            val = float(bufs[c][-1])
+            if not is_valid or not np.isfinite(val):
+                parts.append(tr("Invalid"))
+            else:
+                parts.append(f"{val:.1f} {unit}")
+        return f"{base_title} — {' / '.join(parts)}"
+
+    def _update_metric_titles(self) -> None:
+        """Update the titles of the three metric plots with the latest values."""
+        if self._revisando:
+            return
+        self._plot_iemg.setTitle(
+            self._format_metric_title(
+                tr("iEMG (µV·s)"), "µV·s", self._buf_iemg, self._buf_metric_valid
+            )
+        )
+        self._plot_mpf.setTitle(
+            self._format_metric_title(
+                tr("MPF (Hz)"), "Hz", self._buf_mpf, self._buf_metric_valid
+            )
+        )
+        self._plot_mf.setTitle(
+            self._format_metric_title(
+                tr("MF (Hz)"), "Hz", self._buf_mf, self._buf_metric_valid
+            )
+        )
+
+    def _refresh_metric_plots(self) -> None:
+        """Redraw the 60-second trend curves for iEMG, MPF and MF."""
+        if self._revisando:
+            return
+        t_arr = np.asarray(list(self._buf_metric_t), dtype=np.float64)
+        n_ch = min(self._n_channels, self._n_max)
+        for c in range(n_ch):
+            iemg_arr = np.asarray(list(self._buf_iemg[c]), dtype=np.float64)
+            mpf_arr = np.asarray(list(self._buf_mpf[c]), dtype=np.float64)
+            mf_arr = np.asarray(list(self._buf_mf[c]), dtype=np.float64)
+            self._curves_iemg[c].setData(t_arr, iemg_arr)
+            self._curves_mpf[c].setData(t_arr, mpf_arr)
+            self._curves_mf[c].setData(t_arr, mf_arr)
+        for c in range(n_ch, self._n_max):
+            self._curves_iemg[c].setData([], [])
+            self._curves_mpf[c].setData([], [])
+            self._curves_mf[c].setData([], [])
+
+        if t_arr.size:
+            t_end = float(t_arr[-1])
+            left = max(0.0, t_end - METRIC_WINDOW_S)
+            right = max(METRIC_WINDOW_S, t_end)
+        else:
+            left, right = 0.0, METRIC_WINDOW_S
+
+        for pw, curves, default_hi in (
+            (self._plot_iemg, self._curves_iemg, 1000.0),
+            (self._plot_mpf, self._curves_mpf, 300.0),
+            (self._plot_mf, self._curves_mf, 300.0),
+        ):
+            pw.setXRange(left, right, padding=0)
+            finite_vals: list[np.ndarray] = []
+            for c in range(n_ch):
+                _, y = curves[c].getData()
+                if y is not None and len(y):
+                    fin = y[np.isfinite(y)]
+                    if fin.size:
+                        finite_vals.append(fin)
+            if finite_vals:
+                peak = float(np.max(np.concatenate(finite_vals)))
+                top = max(10.0, peak * 1.15)
+                pw.setYRange(0.0, top, padding=0)
+            else:
+                pw.setYRange(0.0, default_hi, padding=0)
+
+        self._update_metric_titles()
 
     def add_marker(self, time_s: float, label: str) -> None:
         """An event to draw as a line over the live plots, at its second."""
@@ -693,8 +989,32 @@ class LivePlots(QGroupBox):
         self.redraw()
 
     def plot_widgets(self) -> list[pg.PlotWidget]:
-        """The three plots: raw, envelope and accelerometer."""
+        """The three high-rate waveform plots: raw, envelope and accelerometer."""
         return [self._plot_raw, self._plot_env, self._plot_acc]
+
+    def metric_plot_widgets(self) -> list[pg.PlotWidget]:
+        """The three 1-second trend plots: iEMG, MPF and MF."""
+        return [self._plot_iemg, self._plot_mpf, self._plot_mf]
+
+    def all_emg_display_plots(self) -> list[pg.PlotWidget]:
+        """The four vertically stacked EMG plots currently active on screen."""
+        return [
+            self._plot_raw,
+            self.active_second_plot(),
+            self._plot_mpf,
+            self._plot_mf,
+        ]
+
+    def all_plot_widgets(self) -> list[pg.PlotWidget]:
+        """Every PlotWidget owned by LivePlots (waveform + metric + ACC)."""
+        return [
+            self._plot_raw,
+            self._plot_iemg,
+            self._plot_env,
+            self._plot_mpf,
+            self._plot_mf,
+            self._plot_acc,
+        ]
 
     def start_live(self) -> None:
         self._set_cycle_auto(self._cycle_auto_preference, remember=False)
@@ -839,6 +1159,22 @@ class LivePlots(QGroupBox):
         self._buf_acc.clear()
         self._buf_acc.extend([0.0] * self._max_points)
         self._plot_acc.setYRange(-1.0, 1.0, padding=0)
+        self._buf_metric_t.clear()
+        for c in range(self._n_max):
+            self._buf_iemg[c].clear()
+            self._buf_mpf[c].clear()
+            self._buf_mf[c].clear()
+            self._buf_metric_valid[c].clear()
+            self._curves_iemg[c].setData([], [])
+            self._curves_mpf[c].setData([], [])
+            self._curves_mf[c].setData([], [])
+        self._plot_iemg.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_mpf.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_mf.setXRange(0.0, METRIC_WINDOW_S, padding=0)
+        self._plot_iemg.setYRange(0.0, 1000.0, padding=0)
+        self._plot_mpf.setYRange(0.0, 300.0, padding=0)
+        self._plot_mf.setYRange(0.0, 300.0, padding=0)
+        self._update_metric_titles()
 
     def _refresh_plots(self, force: bool = False) -> None:
         """Called every 33 ms by _render_timer. Draws only if there is new data
@@ -1043,6 +1379,69 @@ class LivePlots(QGroupBox):
         for c in range(len(señales), self._n_max):
             self._curves_raw[c].setData([], [])
             self._curves_env[c].setData([], [])
+
+        # Populate the 1-second metric plots (iEMG, MPF, MF) from the saved
+        # companion `.metrics.csv` sidecar when present, or compute 1 s
+        # non-overlapping windows from the EDF raw signal otherwise.
+        metrics_data = read_metrics_csv(edf_path, n_channels=len(señales))
+        if metrics_data is None:
+            raw_for_metrics = [
+                np.asarray(d["emg_raw"], dtype=np.float64) for d in señales
+            ]
+            metrics_data = compute_recording_metrics_1s(raw_for_metrics, fs)
+
+        for c in range(len(señales)):
+            t_m = metrics_data["time_s"][c]
+            self._curves_iemg[c].setData(t_m, metrics_data["iemg_uv_s"][c])
+            self._curves_mpf[c].setData(t_m, metrics_data["mpf_hz"][c])
+            self._curves_mf[c].setData(t_m, metrics_data["mf_hz"][c])
+        for c in range(len(señales), self._n_max):
+            self._curves_iemg[c].setData([], [])
+            self._curves_mpf[c].setData([], [])
+            self._curves_mf[c].setData([], [])
+
+        for pw, curves, default_hi in (
+            (self._plot_iemg, self._curves_iemg, 1000.0),
+            (self._plot_mpf, self._curves_mpf, 300.0),
+            (self._plot_mf, self._curves_mf, 300.0),
+        ):
+            pw.setXRange(0.0, max(1.0, duracion), padding=0)
+            finite_vals: list[np.ndarray] = []
+            for c in range(len(señales)):
+                _, y_m = curves[c].getData()
+                if y_m is not None and len(y_m):
+                    fin = y_m[np.isfinite(y_m)]
+                    if fin.size:
+                        finite_vals.append(fin)
+            if finite_vals:
+                peak_m = float(np.max(np.concatenate(finite_vals)))
+                pw.setYRange(0.0, max(10.0, peak_m * 1.15), padding=0)
+            else:
+                pw.setYRange(0.0, default_hi, padding=0)
+
+        def _review_metric_title(base: str, unit: str, series_list: list) -> str:
+            parts: list[str] = []
+            for c in range(len(señales)):
+                arr = np.asarray(series_list[c], dtype=np.float64)
+                fin = arr[np.isfinite(arr)]
+                if fin.size:
+                    parts.append(f"{float(np.mean(fin)):.1f} {unit}")
+                else:
+                    parts.append(tr("Invalid"))
+            suffix = " / ".join(parts) if parts else "--"
+            return f"{base} — {suffix}"
+
+        self._plot_iemg.setTitle(
+            _review_metric_title(
+                tr("iEMG (µV·s)"), "µV·s", metrics_data["iemg_uv_s"]
+            )
+        )
+        self._plot_mpf.setTitle(
+            _review_metric_title(tr("MPF (Hz)"), "Hz", metrics_data["mpf_hz"])
+        )
+        self._plot_mf.setTitle(
+            _review_metric_title(tr("MF (Hz)"), "Hz", metrics_data["mf_hz"])
+        )
         # The lanes are named after the file being reviewed, not after the
         # label boxes: those still said «EMG1 / EMG2» while the shading beside
         # them read «FCR 1 … ECR 3», two names for the same muscle on one
@@ -1265,6 +1664,7 @@ class LivePlots(QGroupBox):
             pw.enableAutoRange(axis="x")
         self._plot_raw.setTitle(tr("Raw EMG signal (mV)"))
         self._plot_env.setTitle(tr("Envelope (mV)"))
+        self._refresh_metric_plots()
         self.reset_y_scales()
         self._n_visible = 5 * self._fs
         self._manual_envelope = False
@@ -1551,7 +1951,12 @@ class LivePlots(QGroupBox):
             right = left + width
         self._syncing_x = True
         try:
-            for plot in self.plot_widgets():
+            target_plots = (
+                [*self.plot_widgets(), *self.metric_plot_widgets()]
+                if self._revisando
+                else self.plot_widgets()
+            )
+            for plot in target_plots:
                 vb = plot.getViewBox()
                 current = vb.viewRange()[0]
                 if np.allclose(current, (left, right), rtol=0, atol=1e-10):

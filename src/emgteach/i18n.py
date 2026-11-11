@@ -2769,4 +2769,67 @@ _ES = {
         'Sesión guiada detenida; la grabación sigue.',
     'Guided session stopped with the recording.':
         'Sesión guiada detenida con la grabación.',
+    # -- LHE7904 UART and 4-plot real-time sEMG metrics --
+    'Match these settings to the LHE7904 firmware; they do not reconfigure the board. '
+    '500 Hz is below the EMG filter requirements; 8000 Hz and above exceed '
+    'the UART capacity at 1,000,000 baud.':
+        'Ajuste estos parámetros al firmware del LHE7904; no reconfiguran la placa. '
+        '500 Hz queda por debajo de los requisitos del filtro EMG; 8000 Hz o más '
+        'superan la capacidad UART a 1.000.000 baudios.',
+    'Firmware filter':
+        'Filtro en firmware',
+    'Software band-pass filter cut-offs for LHE7904 sEMG preprocessing':
+        'Frecuencias de corte del filtro paso banda por software para el preprocesado sEMG del LHE7904',
+    '50 Hz notch':
+        'Filtro ranura 50 Hz',
+    'Enable single-frequency 50 Hz mains notch (without harmonic cascade)':
+        'Activa el filtro ranura de red de 50 Hz de frecuencia única (sin cascada de armónicos)',
+    'Band-pass {low:g}–{high:g} Hz is invalid for {fs} Hz sampling rate '
+    '(requires f_high < {nyq:g} Hz). Select 2000/4000 Hz or 20–450 Hz.':
+        'El paso banda {low:g}–{high:g} Hz no es válido para una frecuencia de muestreo de {fs} Hz '
+        '(requiere f_high < {nyq:g} Hz). Seleccione 2000/4000 Hz o 20–450 Hz.',
+    'Select a serial port for the LHE7904 before connecting.':
+        'Seleccionar un puerto serie para el LHE7904 antes de conectar.',
+    'No data arrived from the LHE7904 in {s:.0f} s, so nothing is being '
+    'recorded. Check the serial port, UART wiring and firmware sampling '
+    'rate and frame settings, then try again.':
+        'No ha llegado ningún dato del LHE7904 en {s:.0f} s, así que no se '
+        'está grabando nada. Compruebe el puerto serie, el cableado UART y la '
+        'frecuencia de muestreo y formato de trama del firmware, y vuelva a intentarlo.',
+    'Follow about five sine cycles and fit the raw amplitude. '
+    'For periodic viewing only, not a precision frequency measurement. '
+    'Manual navigation turns Auto off. Single channel only.':
+        'Sigue unos cinco ciclos senoidales y ajusta la amplitud en bruto. '
+        'Solo para visualización periódica, no es una medida de frecuencia de precisión. '
+        'La navegación manual desactiva Auto. Solo para un canal.',
+    'Fit amplitude':
+        'Ajustar amplitud',
+    'Detecting cycles…':
+        'Detectando ciclos…',
+    'No stable cycle':
+        'Sin ciclo estable',
+    'Plot 2:':
+        'Gráfica 2:',
+    'iEMG (µV·s)':
+        'iEMG (µV·s)',
+    'Switch the second plot between 1 s integrated EMG (iEMG) and 5 Hz smoothed Envelope':
+        'Cambia la segunda gráfica entre la EMG integrada de 1 s (iEMG) y la envolvente suavizada a 5 Hz',
+    'Integrated EMG over each 1-second valid filtered window '
+    '(µV·s), updated once per second across the last 60 seconds.':
+        'EMG integrada en cada ventana filtrada válida de 1 segundo '
+        '(µV·s), actualizada una vez por segundo durante los últimos 60 segundos.',
+    'Mean Power Frequency (MPF, Hz) of the filtered unrectified '
+    'EMG over each 1-second valid window across the last 60 seconds.':
+        'Frecuencia media de potencia (MPF, Hz) de la EMG filtrada sin rectificar '
+        'en cada ventana válida de 1 segundo durante los últimos 60 segundos.',
+    'Median Frequency (MF, Hz) of the filtered unrectified '
+    'EMG over each 1-second valid window across the last 60 seconds.':
+        'Frecuencia mediana (MF, Hz) de la EMG filtrada sin rectificar '
+        'en cada ventana válida de 1 segundo durante los últimos 60 segundos.',
+    'Invalid':
+        'No válido',
+    'MPF (Hz)':
+        'MPF (Hz)',
+    'MF (Hz)':
+        'MF (Hz)',
 }

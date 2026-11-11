@@ -21,11 +21,16 @@ import os
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from PySide6.QtCore import QMutex, QThread, Signal, Slot
 
-from emgteach.dsp import OnsetDetector, RealtimeFilterState
+from emgteach.dsp import (
+    MetricsCsvWriter,
+    OnsetDetector,
+    RealtimeFilterState,
+    RealtimeMetricAccumulator,
+)
 from emgteach.i18n import tr
 from emgteach.io import (
     BufferedEdfWriter,
@@ -142,6 +147,8 @@ class AcquisitionWorker(QThread):
         auto_detect: bool = False,
         onset_k: float | None = None,
         metadata: RecordingMetadata | None = None,
+        notch_enabled: bool = True,
+        notch_harmonics: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -156,6 +163,8 @@ class AcquisitionWorker(QThread):
         self._f_high = float(f_high) if f_high is not None else profile.f_high
         self._f_notch = float(f_notch) if f_notch is not None else profile.f_notch
         self._f_env = float(f_env) if f_env is not None else profile.f_env
+        self._notch_enabled = bool(notch_enabled)
+        self._notch_harmonics = bool(notch_harmonics)
         self._auto_detect = bool(auto_detect)
         self._onset_k = float(onset_k) if onset_k is not None else profile.onset_k
 
@@ -268,17 +277,20 @@ class AcquisitionWorker(QThread):
         time_s = self._n_samples_total / self._device.fs
         self._record_marker(time_s, label)
 
-    def _note_lost_frames(self) -> None:
+    def _note_lost_frames(self) -> int:
         """Log and annotate a gap in the link, once per gap.
 
         The sample counter keeps counting what arrived, so after a gap every
         later time in the file is short by the frames that never came. The
         annotation is what lets a reader see that, and where. Devices that
         cannot tell (the Arduino) report no loss.
+
+        Returns the number of frames dropped during the most recent read
+        (``0`` when contiguous).
         """
         lost = int(getattr(self._device, "lost_frames", 0))
         if lost <= self._lost_seen:
-            return
+            return 0
         gap = lost - self._lost_seen
         self._lost_seen = lost
         time_s = self._n_samples_total / self._device.fs
@@ -288,6 +300,7 @@ class AcquisitionWorker(QThread):
                 n=gap, total=lost
             )
         )
+        return gap
 
     def _record_marker(self, time_s: float, label: str) -> None:
         """Append a marker and emit it (shared by manual and automatic).
@@ -411,6 +424,7 @@ class AcquisitionWorker(QThread):
         kinds = list(device.channel_kinds())
         edf_path = ""
         writer: BufferedEdfWriter | None = None
+        metrics_writer: MetricsCsvWriter | None = None
 
         try:
             self._opening = True
@@ -438,11 +452,20 @@ class AcquisitionWorker(QThread):
                     f_high=self._f_high,
                     f_notch=self._f_notch,
                     f_env=self._f_env,
+                    notch_enabled=self._notch_enabled,
+                    notch_harmonics=self._notch_harmonics,
                 )
                 if kinds[c] == "EMG"
                 else None
                 for c in range(n_ch)
             ]
+            metric_accumulator = RealtimeMetricAccumulator(
+                fs=fs,
+                n_channels=n_ch,
+                kinds=kinds,
+                f_low=self._f_low,
+                f_high=self._f_high,
+            )
 
             # Optional automatic onset detection on the envelope (EMG only).
             onset_detectors: list[OnsetDetector | None] | None = None
@@ -501,6 +524,16 @@ class AcquisitionWorker(QThread):
                 self.escritura_fallida.emit(mensaje)
                 raise OSError(mensaje) from exc
             self.log.emit(tr("Recording to: {path}").format(path=edf_path))
+            metrics_writer = MetricsCsvWriter(
+                edf_path,
+                fs=fs,
+                f_low=self._f_low,
+                f_high=self._f_high,
+                f_notch=self._f_notch,
+                notch_enabled=self._notch_enabled,
+                notch_harmonics=self._notch_harmonics,
+                labels=labels,
+            )
             # What the EDF+ identification block could not hold. Said here,
             # while the bench can still act on it, rather than discovered at
             # marking from a protocol that names half a practice.
@@ -543,7 +576,11 @@ class AcquisitionWorker(QThread):
                 if block.ndim == 1:
                     block = block.reshape(-1, 1)
                 self._n_samples_total += len(block)
-                self._note_lost_frames()
+                gap_frames = self._note_lost_frames()
+                if gap_frames > 0:
+                    for fstate in filter_states:
+                        if fstate is not None:
+                            fstate.reset()
 
                 # Process each channel through its own filter chain. Only
                 # the raw signal is written to the EDF (one channel per
@@ -587,6 +624,25 @@ class AcquisitionWorker(QThread):
                         for t_onset in detector.process(env_c):
                             self._record_marker(t_onset, auto_label)
 
+                if gap_frames > 0:
+                    # The frame gap occurred inside `block`. Discard both any
+                    # previously accumulated partial window and `block` itself
+                    # from 1-second metric windowing, emit an explicit invalid
+                    # point (valid=False, NaN), and reset filter states so the
+                    # next contiguous block starts cleanly.
+                    for fstate in filter_states:
+                        if fstate is not None:
+                            fstate.reset()
+                    metrics_1s_list = [
+                        metric_accumulator.discard_on_gap(len(block))
+                    ]
+                else:
+                    metrics_1s_list = metric_accumulator.push_block(filt_list)
+
+                if metrics_writer is not None:
+                    for snap in metrics_1s_list:
+                        metrics_writer.write_snapshot(snap)
+
                 # One raw block per sensor, in the same order as the EDF
                 # channels built from the profile. The buffered writer
                 # handles record alignment internally.
@@ -620,13 +676,15 @@ class AcquisitionWorker(QThread):
                     self.error.emit(mensaje)
                     break
 
-                self.data_ready.emit(
-                    {
-                        "raw_mv": raw_list,
-                        "filtered": filt_list,
-                        "envelope": env_list,
-                    }
-                )
+                payload: dict[str, Any] = {
+                    "raw_mv": raw_list,
+                    "filtered": filt_list,
+                    "envelope": env_list,
+                }
+                if metrics_1s_list:
+                    payload["metrics_1s"] = metrics_1s_list[-1]
+                    payload["metrics_1s_batch"] = metrics_1s_list
+                self.data_ready.emit(payload)
 
                 self.msleep(sleep_ms)
 
@@ -693,8 +751,15 @@ class AcquisitionWorker(QThread):
                     self.log.emit(tr("EDF file saved: {path}").format(path=edf_path))
                     saved = edf_path
                 self._close_sidecar(keep=bool(self._n_samples_total) and not saved)
+                if metrics_writer is not None:
+                    metrics_writer.close(remove=not bool(saved))
             elif not self.motivo_sin_archivo:
+                if metrics_writer is not None:
+                    metrics_writer.close(remove=True)
                 self.motivo_sin_archivo = tr(
                     "the recording ended before any file was written")
+            else:
+                if metrics_writer is not None:
+                    metrics_writer.close(remove=True)
 
             self.finished_ok.emit(saved)

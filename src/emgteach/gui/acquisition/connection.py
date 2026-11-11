@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from emgteach.devices import BACKEND_ARDUINO, BACKEND_LHE7904_UART, device_class
 from emgteach.devices.bitalino_sim import is_simulated_address
+from emgteach.dsp import validate_bandpass
 from emgteach.i18n import tr
 from emgteach.station import ADDRESS_FILE, read_station_address
 
@@ -206,9 +207,35 @@ class ConnectionBox(QWidget):
         gain_index = self._combo_lhe_gain.findData(gain)
         self._combo_lhe_gain.setCurrentIndex(max(0, gain_index))
         lhe_row.addWidget(self._combo_lhe_gain)
+
+        self._combo_lhe_bandpass = QComboBox()
+        self._combo_lhe_bandpass.addItem("10–500 Hz", (10.0, 500.0))
+        self._combo_lhe_bandpass.addItem("20–450 Hz", (20.0, 450.0))
+        saved_bp = str(
+            settings.value("adquisicion/lhe7904/bandpass", "10-500") or "10-500"
+        )
+        self._combo_lhe_bandpass.setCurrentIndex(
+            1 if saved_bp == "20-450" else 0
+        )
+        self._combo_lhe_bandpass.setToolTip(
+            tr("Software band-pass filter cut-offs for LHE7904 sEMG preprocessing")
+        )
+        lhe_row.addWidget(self._combo_lhe_bandpass)
+
+        self._chk_lhe_notch = QCheckBox(tr("50 Hz notch"))
+        self._chk_lhe_notch.setChecked(
+            bool(settings.value("adquisicion/lhe7904/notch_enabled", True, type=bool))
+        )
+        self._chk_lhe_notch.setToolTip(
+            tr("Enable single-frequency 50 Hz mains notch (without harmonic cascade)")
+        )
+        lhe_row.addWidget(self._chk_lhe_notch)
+
         self._combo_lhe_fs.currentIndexChanged.connect(self._save_lhe7904_options)
         self._chk_lhe_filtered.toggled.connect(self._save_lhe7904_options)
         self._combo_lhe_gain.currentIndexChanged.connect(self._save_lhe7904_options)
+        self._combo_lhe_bandpass.currentIndexChanged.connect(self._save_lhe7904_dsp_options)
+        self._chk_lhe_notch.toggled.connect(self._save_lhe7904_dsp_options)
         cfg_row1.addWidget(self._widget_lhe7904)
 
         # Container that switches between _widget_mac and _widget_arduino
@@ -295,10 +322,45 @@ class ConnectionBox(QWidget):
             "pga_gain": int(self._combo_lhe_gain.currentData()),
         }
 
+    def lhe7904_dsp_options(self) -> dict[str, float | bool]:
+        """Explicit software DSP configuration for LHE7904 acquisition."""
+        band = self._combo_lhe_bandpass.currentData() or (10.0, 500.0)
+        return {
+            "f_low": float(band[0]),
+            "f_high": float(band[1]),
+            "f_notch": 50.0,
+            "notch_enabled": bool(self._chk_lhe_notch.isChecked()),
+            "notch_harmonics": False,
+        }
+
+    def validate_lhe7904_dsp(self) -> str | None:
+        """Return an error message if the selected band-pass violates Nyquist, else ``None``."""
+        fs = int(self._combo_lhe_fs.currentData())
+        dsp = self.lhe7904_dsp_options()
+        f_low = float(dsp["f_low"])
+        f_high = float(dsp["f_high"])
+        try:
+            validate_bandpass(f_low, f_high, fs)
+        except ValueError:
+            return tr(
+                "Band-pass {low:g}–{high:g} Hz is invalid for {fs} Hz sampling rate "
+                "(requires f_high < {nyq:g} Hz). Select 2000/4000 Hz or 20–450 Hz."
+            ).format(low=f_low, high=f_high, fs=fs, nyq=fs / 2.0)
+        return None
+
     def _save_lhe7904_options(self) -> None:
         for key, value in self.lhe7904_options().items():
             self._settings.setValue(f"adquisicion/lhe7904/{key}", value)
         self.configuration_changed.emit()
+
+    def _save_lhe7904_dsp_options(self) -> None:
+        band = self._combo_lhe_bandpass.currentData() or (10.0, 500.0)
+        bp_key = "20-450" if int(band[0]) == 20 else "10-500"
+        self._settings.setValue("adquisicion/lhe7904/bandpass", bp_key)
+        self._settings.setValue(
+            "adquisicion/lhe7904/notch_enabled",
+            bool(self._chk_lhe_notch.isChecked()),
+        )
 
     def _save_lhe7904_port(self, text: str) -> None:
         if self.device_index() == 2:
@@ -443,6 +505,12 @@ class ConnectionBox(QWidget):
                 )
                 self.connect_button.setChecked(False)
                 return None
+            if device_idx == 2:
+                dsp_err = self.validate_lhe7904_dsp()
+                if dsp_err is not None:
+                    self.warned.emit(dsp_err)
+                    self.connect_button.setChecked(False)
+                    return None
             port_key = (
                 "adquisicion/lhe7904/port" if device_idx == 2 else "adquisicion/port"
             )

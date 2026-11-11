@@ -214,11 +214,11 @@ _DELIBERATELY_UNTRANSLATED = {
     # "Español" to "Spanish" would hide the option from the person who needs it.
     "English", "Español",
     # Product names.
-    "BITalino (Bluetooth)", "Arduino + MyoWare 2.0 (USB)",
+    "BITalino (Bluetooth)", "Arduino + MyoWare 2.0 (USB)", "LHE7904 (UART, 1,000,000 baud)",
     # An example of what to type; the words in it are the same in both.
     "98:D3:91:FE:44:E4   ·   COM5   ·   (auto)",
-    # Signal and channel names, and the abbreviation for the integrated EMG.
-    "EMG", "iEMG: —",
+    # Signal and channel names, electronics acronyms, and identical EN/ES labels.
+    "EMG", "iEMG: —", "PGA", "Auto",
 }
 
 

@@ -109,3 +109,34 @@ def test_lhe7904_requires_a_port_and_bit_only_practicals_still_switch(box):
     widget.set_practical(False)
     assert widget.device_index() == 0
     assert widget._widget_lhe7904.isHidden()
+
+
+def test_lhe7904_rejects_10_500_bandpass_at_1000_hz_and_allows_valid_configs(box):
+    """Mandatory Review #1 & #2: Reject 10-500 Hz at 1000 SPS in UI; keep explicit LHE7904 DSP config."""
+    widget, _settings, _calls = box
+    widget._combo_device_type.setCurrentIndex(2)
+    widget._combo_port.setEditText("/dev/ttyUSB0")
+    assert widget.lhe7904_dsp_options() == {
+        "f_low": 10.0,
+        "f_high": 500.0,
+        "f_notch": 50.0,
+        "notch_enabled": True,
+        "notch_harmonics": False,
+    }
+
+    # Select 1000 Hz while keeping 10-500 Hz bandpass -> must reject connection
+    widget._combo_lhe_fs.setCurrentIndex(0)  # 1000 Hz
+    warnings = []
+    widget.warned.connect(warnings.append)
+    widget.connect_button.setChecked(True)
+    assert widget.connect_device() is None
+    assert not widget.connect_button.isChecked()
+    assert len(warnings) == 1
+    assert "1000" in warnings[0] and "500" in warnings[0]
+
+    # Switching to 20-450 Hz at 1000 Hz succeeds
+    widget._combo_lhe_bandpass.setCurrentIndex(1)  # 20-450 Hz
+    widget.connect_button.setChecked(True)
+    assert widget.connect_device() == "/dev/ttyUSB0"
+    widget.disconnect_device()
+

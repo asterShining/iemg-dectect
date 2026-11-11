@@ -17,16 +17,24 @@ from scipy.signal import sosfilt, sosfilt_zi
 
 from emgteach.dsp import (
     LiveQualityMonitor,
+    MetricsCsvWriter,
     OnsetDetector,
     RealtimeFilterState,
+    RealtimeMetricAccumulator,
+    compute_iemg,
     compute_psd_mnf_mdf,
+    compute_realtime_window_metrics,
+    compute_recording_metrics_1s,
     compute_segments,
     design_bandpass,
     design_lowpass,
     design_notch,
     detect_acquisition_problems,
     detect_onsets,
+    metrics_csv_path,
     process_offline,
+    read_metrics_csv,
+    validate_bandpass,
 )
 from emgteach.fatigue import fit_mdf_vs_time, fit_rms_vs_mdf
 from emgteach.mvc import (
@@ -622,3 +630,259 @@ class TestMVC:
 
     def test_adaptive_ylim_survives_an_empty_window(self) -> None:
         assert adaptive_ylim(np.array([]), n_plot=0) == 110.0
+
+
+# ---------------------------------------------------------------------------
+# LHE7904 sEMG 3-metric real-time processing & mandatory review checks
+# ---------------------------------------------------------------------------
+
+
+class TestBandpassNyquistValidation:
+    """Mandatory Review #1: Do not silently clamp f_high to 0.499 * fs."""
+
+    def test_rejects_f_high_at_or_above_nyquist(self) -> None:
+        with pytest.raises(ValueError, match="Nyquist"):
+            validate_bandpass(10.0, 500.0, 1000)
+        with pytest.raises(ValueError, match="Nyquist"):
+            design_bandpass(10.0, 500.0, 1000)
+        with pytest.raises(ValueError, match="Nyquist"):
+            RealtimeFilterState(1000, f_low=10.0, f_high=500.0, notch_harmonics=False)
+
+    def test_rejects_invalid_cutoffs(self) -> None:
+        with pytest.raises(ValueError):
+            validate_bandpass(0.0, 200.0, 1000)
+        with pytest.raises(ValueError):
+            validate_bandpass(300.0, 200.0, 1000)
+
+    def test_accepts_10_500_at_2000_and_4000_hz(self) -> None:
+        validate_bandpass(10.0, 500.0, 2000)
+        validate_bandpass(10.0, 500.0, 4000)
+        sos_4k = design_bandpass(10.0, 500.0, 4000)
+        assert sos_4k.shape == (2, 6)
+
+
+class TestRealtimeFilterStateDefaultsAndLhe7904Config:
+    """Mandatory Review #2: Keep legacy defaults intact; pass LHE7904 config explicitly."""
+
+    def test_legacy_defaults_preserved(self) -> None:
+        filt = RealtimeFilterState(1000)
+        assert filt.f_low == 20.0
+        assert filt.f_high == 450.0
+        assert filt.f_notch == 50.0
+        assert filt.f_env == 5.0
+        assert filt.notch_enabled is True
+        assert filt.notch_harmonics is True
+        # Legacy harmonic comb at 1000 Hz suppresses 100 Hz harmonic
+        t = np.arange(2000) / 1000.0
+        sig_100 = np.sin(2.0 * np.pi * 100.0 * t)
+        filtered, _ = filt.process_block(sig_100)
+        assert _rms(filtered[500:]) < 0.1 * _rms(sig_100)
+
+    def test_explicit_lhe7904_config_suppresses_50hz_and_preserves_100hz(self) -> None:
+        fs = 4000
+        filt = RealtimeFilterState(
+            fs,
+            f_low=10.0,
+            f_high=500.0,
+            f_notch=50.0,
+            notch_enabled=True,
+            notch_harmonics=False,
+        )
+        t = np.arange(2 * fs) / float(fs)
+        sig_50 = np.sin(2.0 * np.pi * 50.0 * t)
+        sig_100 = np.sin(2.0 * np.pi * 100.0 * t)
+        out_50, _ = filt.process_block(sig_50)
+        filt.reset()
+        out_100, _ = filt.process_block(sig_100)
+        # 50 Hz mains is attenuated by > 90%, while 100 Hz sEMG is preserved near unity
+        assert _rms(out_50[fs:]) < 0.1 * _rms(sig_50)
+        assert _rms(out_100[fs:]) > 0.95 * _rms(sig_100)
+
+    def test_reset_restores_zero_initial_state(self) -> None:
+        filt = RealtimeFilterState(4000, f_low=10.0, f_high=500.0, notch_harmonics=False)
+        t = np.arange(400) / 4000.0
+        filt.process_block(np.sin(2.0 * np.pi * 100.0 * t))
+        assert np.any(filt.zi_band != 0.0)
+        filt.reset()
+        assert np.all(filt.zi_band == 0.0)
+        assert np.all(filt.zi_env == 0.0)
+        assert filt.zi_notch is not None and np.all(filt.zi_notch == 0.0)
+
+
+class TestRealtimeMetricsAccuracy:
+    """Accuracy verification for iEMG, MPF, MF at 4000 SPS (including 100 Hz 1 mV bench signal)."""
+
+    def test_100hz_1mv_bench_signal_metrics(self) -> None:
+        fs = 4000
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        # User's fixed bench signal: 100 Hz, 1.0 mV amplitude, 0 offset
+        sig = 1.0 * np.sin(2.0 * np.pi * 100.0 * t)
+        iemg = compute_iemg(sig, fs)
+        expected_iemg = (2.0 / np.pi) * 1000.0  # 636.61977 µV·s (discrete 40 samp/cycle = 635.31)
+        assert iemg == pytest.approx(expected_iemg, rel=3e-3)
+
+        metrics = compute_realtime_window_metrics(sig, fs, f_low=10.0, f_high=500.0)
+        assert metrics["valid"] is True
+        assert metrics["iemg"] == pytest.approx(expected_iemg, rel=3e-3)
+        assert metrics["mpf"] == pytest.approx(100.0, abs=0.5)
+        assert metrics["mf"] == pytest.approx(100.0, abs=0.5)
+
+    def test_200hz_2mv_signal_metrics(self) -> None:
+        fs = 4000
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        sig = 2.0 * np.sin(2.0 * np.pi * 200.0 * t)
+        expected_iemg = 2.0 * (2.0 / np.pi) * 1000.0  # 1273.2395 µV·s
+        metrics = compute_realtime_window_metrics(sig, fs, f_low=10.0, f_high=500.0)
+        assert metrics["valid"] is True
+        assert metrics["iemg"] == pytest.approx(expected_iemg, rel=1e-2)
+        assert metrics["mpf"] == pytest.approx(200.0, abs=0.5)
+        assert metrics["mf"] == pytest.approx(200.0, abs=0.5)
+
+    def test_dual_tone_and_three_tone_mpf_mf_semantics(self) -> None:
+        """Mandatory Review #3: Equal-amplitude 2-tone has MPF=150 Hz but a flat 50% plateau
+        between 100 and 200 Hz (so MF lands at a lobe edge, not 150 Hz), whereas 3-tone
+        (100 + 150 + 200 Hz) has both MPF=150 Hz and MF=150 Hz."""
+        fs = 4000
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        two_tone = np.sin(2.0 * np.pi * 100.0 * t) + np.sin(2.0 * np.pi * 200.0 * t)
+        res_2 = compute_realtime_window_metrics(two_tone, fs, f_low=10.0, f_high=500.0)
+        assert res_2["mpf"] == pytest.approx(150.0, abs=1.0)
+        # For a two-delta spectrum with 50% power at 100 Hz and 50% at 200 Hz,
+        # cumulative power plateaus at ~50% between the two lobes and never equals 150 Hz.
+        assert abs(res_2["mf"] - 150.0) > 40.0
+
+        three_tone = (
+            np.sin(2.0 * np.pi * 100.0 * t)
+            + np.sin(2.0 * np.pi * 150.0 * t)
+            + np.sin(2.0 * np.pi * 200.0 * t)
+        )
+        res_3 = compute_realtime_window_metrics(three_tone, fs, f_low=10.0, f_high=500.0)
+        assert res_3["mpf"] == pytest.approx(150.0, abs=1.0)
+        assert res_3["mf"] == pytest.approx(150.0, abs=1.0)
+
+    def test_iemg_is_independent_of_5hz_envelope_transient(self) -> None:
+        fs = 4000
+        filt = RealtimeFilterState(
+            fs, f_low=10.0, f_high=500.0, notch_enabled=False, notch_harmonics=False
+        )
+        # Warm up band-pass then feed a 0.2 s burst inside a 1 s window
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        burst = np.zeros(fs, dtype=np.float64)
+        burst[:800] = 1.0 * np.sin(2.0 * np.pi * 100.0 * t[:800])
+        filtered, envelope = filt.process_block(burst)
+        iemg_direct = compute_iemg(filtered, fs)
+        # 5 Hz low-pass envelope has phase lag and tail across the zero region,
+        # so its direct integral differs from the un-smoothed rectified integral
+        assert iemg_direct > 0.0
+        assert not np.isclose(np.max( np.abs(filtered) ), np.max(envelope), rtol=0.1)
+
+
+class TestRealtimeMetricAccumulatorAndGapHandling:
+    """Mandatory Review #4 & #5: Chunked accumulation, gap discard, and CSV persistence."""
+
+    def test_chunked_400_sample_blocks_emit_once_per_second(self) -> None:
+        fs = 4000
+        acc = RealtimeMetricAccumulator(fs=fs, n_channels=1, f_low=10.0, f_high=500.0)
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        sig = (1.0 * np.sin(2.0 * np.pi * 100.0 * t)).reshape(-1, 1)
+
+        emitted_all = []
+        for i in range(10):
+            block = sig[i * 400 : (i + 1) * 400]
+            out = acc.push_block(block)
+            if i < 9:
+                assert out == []
+            else:
+                assert len(out) == 1
+                emitted_all.extend(out)
+
+        snap = emitted_all[0]
+        assert snap["time_s"] == pytest.approx(1.0)
+        assert snap["valid"] == [True]
+        assert snap["iemg"][0] == pytest.approx((2.0 / np.pi) * 1000.0, rel=1e-2)
+        assert snap["mpf"][0] == pytest.approx(100.0, abs=0.5)
+        assert snap["mf"][0] == pytest.approx(100.0, abs=0.5)
+
+    def test_discard_on_gap_drops_partial_and_discontinuous_block(self) -> None:
+        """Mandatory Review #4: When lost_frames increases during device.read(), both the
+        partial accumulated window and the discontinuous block itself are discarded."""
+        fs = 4000
+        acc = RealtimeMetricAccumulator(fs=fs, n_channels=1, f_low=10.0, f_high=500.0)
+        t = np.arange(fs, dtype=np.float64) / float(fs)
+        clean_1s = (1.0 * np.sin(2.0 * np.pi * 100.0 * t)).reshape(-1, 1)
+
+        # Feed 5 blocks (0.5 s = 2000 samples)
+        for i in range(5):
+            assert acc.push_block(clean_1s[i * 400 : (i + 1) * 400]) == []
+
+        # Block 6 has a UART frame drop inside it (400 samples)
+        invalid_snap = acc.discard_on_gap(400)
+        assert invalid_snap["valid"] == [False]
+        assert np.isnan(invalid_snap["iemg"][0])
+        assert np.isnan(invalid_snap["mpf"][0])
+        assert np.isnan(invalid_snap["mf"][0])
+        assert invalid_snap["time_s"] == pytest.approx(0.6)
+
+        # Now feed 9 blocks (3600 samples) -> still not a full 1 s window because
+        # the partial 2000 samples and the 400-sample gapped block were discarded!
+        for i in range(9):
+            assert acc.push_block(clean_1s[i * 400 : (i + 1) * 400]) == []
+        # The 10th clean block completes the new 1 s window at t = 0.6 + 1.0 = 1.6 s
+        valid_out = acc.push_block(clean_1s[9 * 400 : 10 * 400])
+        assert len(valid_out) == 1
+        assert valid_out[0]["valid"] == [True]
+        assert valid_out[0]["time_s"] == pytest.approx(1.6)
+        assert valid_out[0]["mpf"][0] == pytest.approx(100.0, abs=0.5)
+
+    def test_metrics_csv_round_trip_and_fallback(self, tmp_path) -> None:
+        edf_file = tmp_path / "session.edf"
+        csv_file = metrics_csv_path(edf_file)
+        assert csv_file.name == "session.edf.metrics.csv"
+
+        with MetricsCsvWriter(
+            edf_file,
+            channel_labels=["Biceps"],
+            fs=4000,
+            f_low=10.0,
+            f_high=500.0,
+            notch_enabled=True,
+            notch_harmonics=False,
+        ) as writer:
+            writer.write_snapshot(
+                {
+                    "time_s": 1.0,
+                    "valid": [True],
+                    "iemg": [636.62],
+                    "mpf": [100.0],
+                    "mf": [100.0],
+                }
+            )
+            writer.write_snapshot(
+                {
+                    "time_s": 1.5,
+                    "valid": [False],
+                    "iemg": [float("nan")],
+                    "mpf": [float("nan")],
+                    "mf": [float("nan")],
+                }
+            )
+
+        loaded = read_metrics_csv(edf_file)
+        assert loaded is not None
+        assert loaded["n_channels"] == 1
+        assert loaded["metadata"]["fs"] == "4000"
+        np.testing.assert_allclose(loaded["time_s"][0], [1.0, 1.5])
+        assert list(loaded["valid"][0]) == [True, False]
+        assert loaded["iemg"][0][0] == pytest.approx(636.62)
+        assert np.isnan(loaded["iemg"][0][1])
+
+        # Also check fallback computation from raw 2 s recording
+        fs = 4000
+        t = np.arange(2 * fs, dtype=np.float64) / float(fs)
+        raw_2s = (1.0 * np.sin(2.0 * np.pi * 100.0 * t)).reshape(-1, 1)
+        fallback = compute_recording_metrics_1s(
+            raw_2s, fs, f_low=10.0, f_high=500.0, notch_harmonics=False
+        )
+        assert len(fallback["time_s"][0]) == 2
+        assert fallback["mpf"][0][1] == pytest.approx(100.0, abs=0.5)
+
